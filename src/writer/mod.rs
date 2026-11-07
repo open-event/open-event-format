@@ -1,0 +1,26 @@
+//! The write side: taking accepted events all the way from the durable journal to a published, queryable column file.
+//!
+//! It covers appending to the journal, each worker's independent commit discipline, safe retry of in-flight events,
+//! building and publishing the file, and the policy that decides when to roll to a new file. This runs only on the
+//! leader (behind the `write` feature) and is not reachable from a read-only binary.
+
+pub mod audit;
+pub mod build;
+pub mod compaction;
+pub mod constant;
+pub mod error;
+pub mod graph;
+pub mod graph_seal;
+pub mod pipeline;
+pub mod projection;
+pub mod publish;
+pub mod queue;
+pub mod reserve;
+pub mod retire;
+pub mod retry;
+pub mod rewrite;
+pub mod sim;
+pub(crate) mod source_form;
+pub mod state_gc;
+pub mod subject_seal;
+pub mod upload;

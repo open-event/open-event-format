@@ -1,0 +1,546 @@
+//! Retires replaced files: publishes a compaction's output in place of the files it merged, and later deletes those
+//! files once no query can still be reading them.
+//!
+//! The application drives the whole cycle; nothing here runs on its own. The expected call pattern is:
+//!
+//! 1. While a file is open for new journal data, check [`should_roll`](super::publish::should_roll) after each flush
+//!    and, when it fires, publish the range with [`OePublisher::publish_range`].
+//! 2. Each compaction cycle, read the head generation and call
+//!    [`plan_compaction_cycle`](crate::lifecycle::plan_compaction_cycle) for each tenant. For every job, build one file
+//!    from the rows of the job's input files and hand it to [`OePublisher::publish_compaction`], which publishes one
+//!    generation where the output is `Active` and every input is `Outdated`.
+//! 3. Periodically - not continuously - call [`sweep_retired_files`] with the oldest generation any running query
+//!    still reads. It moves `Outdated` files no query can still select to `DeleteOnDestroy`, and deletes the objects
+//!    of `DeleteOnDestroy` files that have waited out the safety window, dropping them from the catalogue.
+//!
+//! Inbox files leave by acknowledgement instead of compaction: open each `Active` inbox file's footer, keep the ones
+//! [`OeFile::fully_acked`](crate::layout::reader::OeFile::fully_acked) confirms, and hand them to
+//! [`retire_acked_inbox_files`], which moves them to `Outdated`; step 3 then deletes them like any replaced file.
+//!
+//! See: oe-file-lifecycle/spec.md
+
+use super::build::{BuiltOe, OeBuildConfig};
+use super::constant::{AUDIT_COMPACTION_REFUSED, LINEAR_LOOKUP_MAX_ENTRIES};
+use super::publish::{MAX_REBASE_ATTEMPTS, OePublisher, PeerNotices, PublishFailure, Published};
+use super::upload::upload_oe;
+use crate::clock::Clock;
+use crate::error::PublishError;
+use crate::events::{SequenceRange, TenantId};
+use crate::invariants::PublishedSet;
+use crate::layout::{Profile, decode_header};
+use crate::lifecycle::{FileType, GraphFileSummary, ManifestGeneration, OeFileEntry, PartState, Retirement};
+use crate::object_store::{ObjectStore, constant::MIN_MULTIPART_PART_BYTES, oe_object_key};
+use hashbrown::{HashMap, HashSet};
+
+/// How long a replaced file waits at each step before the sweeper moves it on.
+///
+/// Both values are operator configuration with no default: the file-lifecycle spec requires concrete values before
+/// general availability.
+///
+/// See: oe-file-lifecycle/spec.md
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SweepPolicy {
+    /// Nanoseconds a file stays `Outdated` after it was replaced before it may become `DeleteOnDestroy`. Set it to at
+    /// least the longest a query is allowed to run.
+    pub in_flight_query_horizon_nanos: u64,
+    /// Nanoseconds a `DeleteOnDestroy` file waits before its object is deleted. A value below the in-flight-query
+    /// horizon is raised to it.
+    pub safety_window_nanos: u64,
+}
+
+/// What one sweep did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SweepReport {
+    /// Files whose objects were deleted and whose entries left the catalogue (`DeleteOnDestroy -> Deleted`).
+    pub deleted: Vec<u128>,
+    /// The generation the sweep published, or `None` when nothing was due.
+    pub generation: Option<u64>,
+    /// Files no live query can still read, moved `Outdated -> DeleteOnDestroy`.
+    pub unreferenced: Vec<u128>,
+}
+
+impl OePublisher {
+    /// Publishes `built` - one file merged from the files named in `inputs` - as a single new generation in which the
+    /// output is `Active` and every input is `Outdated`, so new queries read the output while queries already reading
+    /// the inputs can finish.
+    ///
+    /// The inputs must be `Active` files of `config`'s tenant whose coverage joins into one contiguous range; the
+    /// output covers exactly that range and must pass the same checks as a fresh publication. The output is uploaded
+    /// and checked before the generation is written, and peers are told about it once the generation wins. A lost race
+    /// rebases and retries; if an input was meanwhile replaced by someone else, the publication is refused and the
+    /// uploaded object is left unreferenced. An audit file is never compacted: an audit input or output is refused
+    /// before anything is uploaded.
+    ///
+    /// The output must also hold every row of its inputs: before anything is uploaded, each input's stored header is
+    /// read from `objects`, and the output must hold as many rows as the inputs together, from the same first to the
+    /// same last `(epoch, sequence)`. Sequences an input covers without rows (void records) count on neither side, so
+    /// an input whose coverage ends in a void merges normally. An output that drops rows is refused.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the compaction publish wires every interface exactly once"
+    )]
+    pub fn publish_compaction(
+        &mut self,
+        built: BuiltOe,
+        config: &OeBuildConfig,
+        inputs: &[u128],
+        published: &mut dyn PublishedSet,
+        objects: &dyn ObjectStore,
+        notices: &mut dyn PeerNotices,
+        clock: &dyn Clock,
+    ) -> Result<Published, PublishFailure> {
+        if built.footer.profile == Profile::Audit {
+            return Err(PublishFailure::Verification(AUDIT_COMPACTION_REFUSED));
+        }
+        let (_, head) = published.head().map_err(PublishFailure::Publish)?;
+        let coverage = merged_coverage(&head, inputs, config.tenant_id)?;
+        self.verify_staged(&built, config, &coverage)?;
+        verify_rows_preserved(&built, inputs, config.tenant_id, objects)?;
+        publish_in_place_of(
+            built,
+            config,
+            coverage,
+            |_| Ok(inputs.to_vec()),
+            published,
+            objects,
+            notices,
+            clock,
+        )
+    }
+
+    /// Publishes `built`, a snapshot file holding one epoch's whole keyed state, as the one `Active` file of
+    /// `published`, in a single new generation that moves the previous epoch's file to `Outdated` so queries already
+    /// reading it can finish. [`sweep_retired_files`] later deletes the replaced file.
+    ///
+    /// `published` is the catalogue of this one snapshot (one per partition, say), holding nothing but its files:
+    /// a snapshot's epoch and sequences number its rows, not journal positions, so it never shares a catalogue with
+    /// event files. The new file must hold a later epoch than every file there. A lost race rebases and retries; if a
+    /// rival meanwhile published the same or a later epoch, the publication is refused and the uploaded object is left
+    /// unreferenced.
+    pub fn publish_snapshot(
+        &mut self,
+        built: BuiltOe,
+        config: &OeBuildConfig,
+        published: &mut dyn PublishedSet,
+        objects: &dyn ObjectStore,
+        notices: &mut dyn PeerNotices,
+        clock: &dyn Clock,
+    ) -> Result<Published, PublishFailure> {
+        if built.footer.profile != Profile::Snapshot {
+            return Err(PublishFailure::Verification("not a snapshot file"));
+        }
+        let coverage = SequenceRange {
+            epoch: built.header.min_epoch,
+            first_sequence: built.header.min_sequence,
+            last_sequence: built.header.max_sequence,
+        };
+        self.verify_staged(&built, config, &coverage)?;
+        let tenant_id = config.tenant_id;
+        let replaced = |head: &ManifestGeneration| {
+            if head
+                .files
+                .iter()
+                .any(|entry| entry.profile != Profile::Snapshot || entry.tenant_id != tenant_id)
+            {
+                return Err(PublishFailure::Verification(
+                    "a snapshot catalogue holds only that snapshot's files",
+                ));
+            }
+            let active: Vec<&OeFileEntry> = head
+                .files
+                .iter()
+                .filter(|entry| entry.part_state == PartState::Active)
+                .collect();
+            if active.iter().any(|entry| entry.coverage.epoch >= coverage.epoch) {
+                return Err(PublishFailure::Verification(
+                    "a snapshot replaces only an earlier epoch",
+                ));
+            }
+            Ok(active.iter().map(|entry| entry.file_id).collect())
+        };
+        publish_in_place_of(built, config, coverage, replaced, published, objects, notices, clock)
+    }
+}
+
+/// Uploads `built` and publishes it as an `Active` file covering `coverage`, in one new generation that also moves
+/// the `Active` files `replaced` names in the head to `Outdated`. A lost race rebases onto the new head and asks
+/// `replaced` again.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the replacing publish wires every interface exactly once"
+)]
+fn publish_in_place_of(
+    built: BuiltOe,
+    config: &OeBuildConfig,
+    coverage: SequenceRange,
+    replaced: impl Fn(&ManifestGeneration) -> Result<Vec<u128>, PublishFailure>,
+    published: &mut dyn PublishedSet,
+    objects: &dyn ObjectStore,
+    notices: &mut dyn PeerNotices,
+    clock: &dyn Clock,
+) -> Result<Published, PublishFailure> {
+    upload_oe(
+        objects,
+        &oe_object_key(config.tenant_id, built.file_id),
+        &built,
+        MIN_MULTIPART_PART_BYTES,
+    )?;
+    let output = OeFileEntry {
+        coverage,
+        feature_metadata: None,
+        file_seal: built.file_seal,
+        file_id: built.file_id,
+        file_type: FileType::OeFile,
+        footer_len: Some(built.footer_len),
+        graph_event_id_filter: built
+            .footer
+            .graph
+            .as_ref()
+            .and_then(|graph| graph.event_ids.as_ref())
+            .map(|index| index.filter.clone()),
+        graph_summary: GraphFileSummary::of(&built.footer),
+        optional_feature_flags: built.footer.optional_feature_flags,
+        part_index: 0,
+        part_state: PartState::Active,
+        profile: built.footer.profile,
+        required_feature_flags: built.footer.required_feature_flags,
+        size_bytes: built.bytes.len() as u64,
+        tenant_id: config.tenant_id,
+        tree_len: built.tree_len,
+    };
+
+    let mut head_id = 0;
+    for _ in 0..=MAX_REBASE_ATTEMPTS {
+        let (current_id, head) = published.head().map_err(PublishFailure::Publish)?;
+        head_id = current_id;
+        if head.files.contains(&output) {
+            // This publication already won: a rival helped this attempt's generation onto the head after it saw
+            // its own head advance fail.
+            return Ok(Published {
+                entry: output,
+                file_bytes: built.bytes,
+                generation: head_id,
+            });
+        }
+        let inputs = replaced(&head)?;
+        let next_id = head_id + 1;
+        let now = clock.now_nanos();
+        // The file set changes, so any footer mirror of the previous generation no longer covers it.
+        let mut next = ManifestGeneration {
+            footer_mirror: None,
+            generation: next_id,
+            ..head
+        };
+        for input in &inputs {
+            let entry = next
+                .files
+                .iter_mut()
+                .find(|entry| entry.file_id == *input && entry.part_state == PartState::Active)
+                .ok_or(PublishFailure::Verification(
+                    "a compaction input is no longer an active file",
+                ))?;
+            debug_assert!(entry.part_state.can_transition_to(PartState::Outdated));
+            entry.part_state = PartState::Outdated;
+            next.retirements.push(Retirement {
+                file_id: *input,
+                generation: next_id,
+                since_nanos: now,
+            });
+        }
+        next.files.push(output.clone());
+        if commit(published, head_id, next)? {
+            notices.oe_published(&output);
+            return Ok(Published {
+                entry: output,
+                file_bytes: built.bytes,
+                generation: next_id,
+            });
+        }
+    }
+    Err(PublishFailure::Publish(PublishError::CasLost {
+        current_generation: head_id,
+    }))
+}
+
+/// Retires inbox files every recipient has acknowledged in full: publishes one generation in which each file named in
+/// `file_ids` that is still an `Active` inbox file becomes `Outdated`, so new queries stop selecting it and
+/// [`sweep_retired_files`] later deletes it once no query can still be reading it.
+///
+/// Name only files [`OeFile::fully_acked`](crate::layout::reader::OeFile::fully_acked) confirmed. A named file that
+/// is no longer `Active`, or no longer in the catalogue, is skipped, since another call already retired it; a named
+/// file that is not an inbox file is refused. Returns the generation published, or `None` when nothing was left to
+/// retire.
+pub fn retire_acked_inbox_files(
+    published: &mut dyn PublishedSet,
+    file_ids: &[u128],
+    clock: &dyn Clock,
+) -> Result<Option<u64>, PublishFailure> {
+    let mut head_id = 0;
+    for _ in 0..=MAX_REBASE_ATTEMPTS {
+        let (current_id, head) = published.head().map_err(PublishFailure::Publish)?;
+        head_id = current_id;
+        let next_id = head_id + 1;
+        let now = clock.now_nanos();
+        let mut next = ManifestGeneration {
+            footer_mirror: None,
+            generation: next_id,
+            ..head
+        };
+        let mut retired = Vec::new();
+        for entry in next.files.iter_mut().filter(|entry| file_ids.contains(&entry.file_id)) {
+            if entry.profile != Profile::Inbox {
+                return Err(PublishFailure::Verification(
+                    "only inbox files retire by acknowledgement",
+                ));
+            }
+            if entry.part_state != PartState::Active {
+                continue;
+            }
+            debug_assert!(entry.part_state.can_transition_to(PartState::Outdated));
+            entry.part_state = PartState::Outdated;
+            retired.push(Retirement {
+                file_id: entry.file_id,
+                generation: next_id,
+                since_nanos: now,
+            });
+        }
+        if retired.is_empty() {
+            return Ok(None);
+        }
+        next.retirements.extend(retired);
+        if commit(published, head_id, next)? {
+            return Ok(Some(next_id));
+        }
+    }
+    Err(PublishFailure::Publish(PublishError::CasLost {
+        current_generation: head_id,
+    }))
+}
+
+/// Moves replaced files toward deletion, and deletes the ones that have waited long enough, in one new generation.
+///
+/// `oldest_live_snapshot` is the oldest catalogue generation any running query opened its snapshot at (the head
+/// generation when no query is running); the application tracks it. An `Outdated` file becomes `DeleteOnDestroy` only
+/// when every live snapshot was opened at or after the generation that outdated it - so no running query selected it -
+/// and it has been `Outdated` for at least the in-flight-query horizon. A `DeleteOnDestroy` file is deleted from
+/// `objects` once it has waited the safety window, and its entry then leaves the catalogue. A file whose object key is
+/// still named by an `Active` or `Outdated` entry is never deleted.
+///
+/// Objects are deleted before the catalogue forgets them, so a crash in between leaves the entries for the next sweep,
+/// whose repeat delete is harmless. A retired file with no retirement record (written before records existed) gets one
+/// starting now. Returns what changed; a sweep with nothing due publishes no generation.
+pub fn sweep_retired_files(
+    published: &mut dyn PublishedSet,
+    objects: &dyn ObjectStore,
+    policy: &SweepPolicy,
+    oldest_live_snapshot: u64,
+    clock: &dyn Clock,
+) -> Result<SweepReport, PublishFailure> {
+    let safety_window = policy.safety_window_nanos.max(policy.in_flight_query_horizon_nanos);
+    let mut head_id = 0;
+    for _ in 0..=MAX_REBASE_ATTEMPTS {
+        let (current_id, head) = published.head().map_err(PublishFailure::Publish)?;
+        head_id = current_id;
+        let next_id = head_id + 1;
+        let now = clock.now_nanos();
+        let mut next = ManifestGeneration {
+            footer_mirror: None,
+            generation: next_id,
+            ..head
+        };
+        let mut report = SweepReport::default();
+        let mut started_clocks = Vec::new();
+        let mut retirement_positions: Option<HashMap<u128, usize>> = None;
+        for entry in &mut next.files {
+            if !matches!(entry.part_state, PartState::Outdated | PartState::DeleteOnDestroy) {
+                continue;
+            }
+            // The first record for a file id wins, matching a front-to-back search.
+            let position = if next.retirements.len() <= LINEAR_LOOKUP_MAX_ENTRIES {
+                next.retirements
+                    .iter()
+                    .position(|retirement| retirement.file_id == entry.file_id)
+            } else {
+                retirement_positions
+                    .get_or_insert_with(|| {
+                        let mut positions = HashMap::with_capacity(next.retirements.len());
+                        for (position, retirement) in next.retirements.iter().enumerate() {
+                            positions.entry(retirement.file_id).or_insert(position);
+                        }
+                        positions
+                    })
+                    .get(&entry.file_id)
+                    .copied()
+            };
+            let Some(retirement) = position.and_then(|position| next.retirements.get_mut(position)) else {
+                started_clocks.push(Retirement {
+                    file_id: entry.file_id,
+                    generation: next_id,
+                    since_nanos: now,
+                });
+                continue;
+            };
+            let waited = u64::try_from(now.saturating_sub(retirement.since_nanos)).unwrap_or(0);
+            match entry.part_state {
+                PartState::Outdated
+                    if retirement.generation <= oldest_live_snapshot
+                        && waited >= policy.in_flight_query_horizon_nanos =>
+                {
+                    debug_assert!(entry.part_state.can_transition_to(PartState::DeleteOnDestroy));
+                    entry.part_state = PartState::DeleteOnDestroy;
+                    *retirement = Retirement {
+                        file_id: entry.file_id,
+                        generation: next_id,
+                        since_nanos: now,
+                    };
+                    report.unreferenced.push(entry.file_id);
+                }
+                PartState::DeleteOnDestroy if waited >= safety_window => report.deleted.push(entry.file_id),
+                _ => {}
+            }
+        }
+        if started_clocks.is_empty() && report.unreferenced.is_empty() && report.deleted.is_empty() {
+            return Ok(report);
+        }
+        next.retirements.extend(started_clocks);
+
+        let still_readable: HashSet<u128> = next
+            .files
+            .iter()
+            .filter(|entry| matches!(entry.part_state, PartState::Active | PartState::Outdated))
+            .map(|entry| entry.file_id)
+            .collect();
+        report.deleted.retain(|file_id| !still_readable.contains(file_id));
+        if !report.deleted.is_empty() {
+            let deleted_set: Option<HashSet<u128>> =
+                (report.deleted.len() > LINEAR_LOOKUP_MAX_ENTRIES).then(|| report.deleted.iter().copied().collect());
+            let is_deleted = |file_id: &u128| match &deleted_set {
+                Some(set) => set.contains(file_id),
+                None => report.deleted.contains(file_id),
+            };
+            for entry in next.files.iter().filter(|entry| is_deleted(&entry.file_id)) {
+                debug_assert!(entry.part_state.can_transition_to(PartState::Deleted));
+                objects
+                    .delete(&oe_object_key(entry.tenant_id, entry.file_id))
+                    .map_err(PublishFailure::Storage)?;
+            }
+            next.files.retain(|entry| !is_deleted(&entry.file_id));
+            next.retirements.retain(|retirement| !is_deleted(&retirement.file_id));
+        }
+
+        if commit(published, head_id, next)? {
+            report.generation = Some(next_id);
+            return Ok(report);
+        }
+    }
+    Err(PublishFailure::Publish(PublishError::CasLost {
+        current_generation: head_id,
+    }))
+}
+
+/// The one contiguous range the `inputs` cover together: each must be an `Active` file of `tenant_id`, and sorted by
+/// sequence each must start right after the previous one ends.
+fn merged_coverage(
+    head: &ManifestGeneration,
+    inputs: &[u128],
+    tenant_id: TenantId,
+) -> Result<SequenceRange, PublishFailure> {
+    let mut ranges = inputs
+        .iter()
+        .map(|input| {
+            head.files
+                .iter()
+                .find(|entry| {
+                    entry.file_id == *input && entry.tenant_id == tenant_id && entry.part_state == PartState::Active
+                })
+                .ok_or(PublishFailure::Verification(
+                    "a compaction input is not an active file of this tenant",
+                ))
+                .and_then(|entry| match entry.profile {
+                    Profile::Audit => Err(PublishFailure::Verification(AUDIT_COMPACTION_REFUSED)),
+                    _ => Ok(entry.coverage),
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    ranges.sort();
+    let (first, rest) = ranges
+        .split_first()
+        .ok_or(PublishFailure::Verification("a compaction needs at least one input"))?;
+    let mut merged = *first;
+    for range in rest {
+        if range.epoch != merged.epoch || merged.last_sequence.checked_add(1) != Some(range.first_sequence) {
+            return Err(PublishFailure::Verification(
+                "compaction inputs do not cover one contiguous range",
+            ));
+        }
+        merged.last_sequence = range.last_sequence;
+    }
+    Ok(merged)
+}
+
+/// Checks that `built` holds every row of the `inputs`, read from each input's stored header: as many rows as the
+/// inputs hold together, from the same first to the same last `(epoch, sequence)`. Sequences covered only by void
+/// records carry no rows on either side, so they never make a faithful merge look short.
+fn verify_rows_preserved(
+    built: &BuiltOe,
+    inputs: &[u128],
+    tenant_id: TenantId,
+    objects: &dyn ObjectStore,
+) -> Result<(), PublishFailure> {
+    let mut row_count = 0u64;
+    let mut bounds: Option<((u64, u64), (u64, u64))> = None;
+    for input in inputs {
+        let stored = objects
+            .get(&oe_object_key(tenant_id, *input))
+            .map_err(PublishFailure::Storage)?
+            .ok_or(PublishFailure::Verification(
+                "a compaction input's stored file is missing",
+            ))?;
+        let header = decode_header(&stored.bytes).map_err(PublishFailure::Format)?;
+        if header.file_id != *input || header.tenant_id != tenant_id {
+            return Err(PublishFailure::Verification(
+                "a compaction input's stored file is a different file",
+            ));
+        }
+        let first = (header.min_epoch, header.min_sequence);
+        let last = (header.max_epoch, header.max_sequence);
+        row_count = row_count.saturating_add(header.row_count);
+        bounds = Some(bounds.map_or((first, last), |(low, high)| (low.min(first), high.max(last))));
+    }
+    let output_bounds = (
+        (built.header.min_epoch, built.header.min_sequence),
+        (built.header.max_epoch, built.header.max_sequence),
+    );
+    if built.header.row_count != row_count || bounds != Some(output_bounds) {
+        return Err(PublishFailure::Verification(
+            "the compaction output does not hold every row of its inputs",
+        ));
+    }
+    Ok(())
+}
+
+/// Writes `next` and moves the head to it from `head_id`. `Ok(true)` when this call published it; `Ok(false)` when the
+/// head moved first and the caller must rebase. A generation id someone else already wrote - a crashed publisher's
+/// stalled generation - is helped onto the head first, so it can never wedge this caller.
+fn commit(published: &mut dyn PublishedSet, head_id: u64, next: ManifestGeneration) -> Result<bool, PublishFailure> {
+    let next_id = next.generation;
+    match published.put_generation(next) {
+        Ok(()) => {}
+        Err(PublishError::GenerationExists) => {
+            return match published.advance_head(head_id, next_id) {
+                Ok(()) | Err(PublishError::CasLost { .. }) => Ok(false),
+                Err(error) => Err(PublishFailure::Publish(error)),
+            };
+        }
+        Err(error) => return Err(PublishFailure::Publish(error)),
+    }
+    match published.advance_head(head_id, next_id) {
+        Ok(()) => Ok(true),
+        Err(PublishError::CasLost { .. }) => Ok(false),
+        Err(error) => Err(PublishFailure::Publish(error)),
+    }
+}
+
+#[cfg(test)]
+#[path = "test/retire.rs"]
+mod tests;

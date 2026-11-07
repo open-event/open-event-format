@@ -1,0 +1,707 @@
+//! One worker's path from accepting an event to acknowledging it, all the way through making it durable.
+//!
+//! The stages are: validate (a retry already committed inside the replay-guard window is answered with its original
+//! receipt and goes no further) → serialize into the worker's lock-free queue (READY) → reach the flush target (16 KiB
+//! default; 4 KiB force-commit) → claim and reserve a contiguous `(epoch, sequence)` range → submit an aligned OEJ
+//! frame → verify CRC-64/NVME + BLAKE3 → HARDENED → record safe-retry metadata → COMMITTED (append-only: immediately;
+//! no GSN/RFA/barrier machinery) → decode into LiveOverlay → acknowledge per the route contract. A flush that finds
+//! more than one flush target's worth of records pending commits them as several frames behind one sync.
+//!
+//! There is no global group-commit writer and no global acknowledgement thread: each pipeline instance is one worker
+//! flushing autonomously.
+
+use super::error::{FlushError, LeaseError, QueueError};
+use super::queue::{CommitQueue, PendingRecord, QueueRegion, peek_steal_raw};
+use super::reserve::{FORCE_COMMIT_IDLE_NANOS, SequenceAllocator};
+use super::retry::{RetryReceipt, SafeRetryStore, StatusClass};
+use crate::artifacts::batch::{EventInput, build_batch, decode_batch};
+use crate::artifacts::frame::{FLAG_VOID_RECORD, FrameBuildInput, build_frame, decode_frame};
+use crate::artifacts::overlay::{LiveOverlayStore, convert_frame};
+use crate::artifacts::watermark::WatermarkTracker;
+use crate::error::FormatError;
+use crate::events::{SequencePoint, SequenceRange, TenantId};
+use crate::invariants::{JournalStorage, MonotonicClock, ShardId};
+
+/// How long an acknowledgement guard stays valid, chosen to comfortably outlast any realistic replay window so a
+/// replay can never land after the guard protecting it has expired.
+const ACK_REPLAY_GUARD_NANOS: i64 = 60_000_000_000;
+
+/// The force-commit idle jitter is this fraction of the idle target — enough to keep workers from synchronizing into
+/// periodic bursts without meaningfully delaying the flush.
+const FORCE_COMMIT_JITTER_DIVISOR: u64 = 4;
+
+/// Commit states of the autonomous-commit model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitState {
+    /// Acknowledgeable. For ordinary append-only ingest HARDENED and COMMITTED are the same state.
+    Committed,
+    /// The containing frame is durable under the selected policy.
+    Hardened,
+    /// Validated and serialized into the worker queue; not durable, no public visibility.
+    Ready,
+}
+
+/// Route dependency classes. Ordinary append-only ingest pays no extra coordination overhead; that machinery is
+/// permitted only for routes with real transactional dependencies (this is the hook, kept off the ordinary record
+/// path).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteDependency {
+    AppendOnly,
+    /// Acknowledgement additionally waits for the route's autonomous dependency acknowledgement.
+    Transactional,
+}
+
+/// Read-after-ack visibility contract of the acknowledging route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AckVisibility {
+    /// Acknowledge on durability (OEJ completion).
+    Durability,
+    /// Acknowledge only once the event is included in `visibility_watermark` (or fresh queries block until replay).
+    ReadAfterAck,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlushReason {
+    /// Low-load force commit: trickle traffic must not wait indefinitely.
+    ForceCommit,
+    /// Pending bytes reached the flush target.
+    Target,
+}
+
+/// What happened to one submitted event.
+///
+/// See: oe-write-path/spec.md
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Submission {
+    /// The same tenant already committed an event with this dedupe identity inside the replay-guard window, so nothing
+    /// was queued. Carries the original commit's receipt, to answer the retry with.
+    Duplicate(RetryReceipt),
+    /// Validated and queued (READY); not yet durable.
+    Ready,
+    /// An earlier attempt of this same delivery was appended to the journal, but whether it became durable is still
+    /// unknown, so nothing was queued: a second copy could land next to the first. Carries that attempt's receipt.
+    /// Retry later; the delivery is answered as a duplicate once replay finds the frame in the journal, and is queued
+    /// again once the receipt's guard window has passed.
+    Unresolved(RetryReceipt),
+}
+
+/// The outcome of one flush: the frames it committed and the sequence range they cover.
+#[derive(Debug)]
+pub struct FlushResult {
+    /// Bytes of every frame the flush wrote, which it appended back to back from `frame_offset`.
+    pub frame_len: u32,
+    /// Where the flush's first frame starts in the journal.
+    pub frame_offset: u64,
+    pub range: SequenceRange,
+    pub reason: FlushReason,
+    pub receipts: Vec<RetryReceipt>,
+    pub state: CommitState,
+}
+
+/// One frame a flush has appended but not yet made durable: the queue region and lease it holds, its events, and
+/// where its bytes went.
+///
+/// See: oe-write-path/spec.md
+struct StagedFrame {
+    bytes: Vec<u8>,
+    events: Vec<EventInput>,
+    lease_id: u64,
+    offset: u64,
+    range: SequenceRange,
+    region: QueueRegion,
+}
+
+/// One worker's autonomous commit pipeline over the interfaces.
+#[derive(Debug)]
+pub struct WorkerCommitPipeline {
+    /// Replay-guard window for safe-retry receipts.
+    ack_guard_nanos: i64,
+    durable_batch_counter: u64,
+    flush_target_bytes: u64,
+    last_activity_monotonic: u64,
+    queue: CommitQueue,
+    pub route: RouteDependency,
+    schema_generation: u64,
+    pub shard: ShardId,
+    pub tenant_id: TenantId,
+    pub worker_id: u32,
+    writer_local_batch_counter: u64,
+}
+
+impl WorkerCommitPipeline {
+    /// A fresh pipeline for one worker, bound to its shard and tenant, with an empty queue of the given capacity.
+    pub fn new(
+        worker_id: u32,
+        shard: ShardId,
+        tenant_id: TenantId,
+        route: RouteDependency,
+        queue_capacity: usize,
+    ) -> Self {
+        Self {
+            worker_id,
+            shard,
+            tenant_id,
+            route,
+            queue: CommitQueue::new(queue_capacity),
+            flush_target_bytes: u64::from(super::super::artifacts::DEFAULT_FLUSH_TARGET),
+            last_activity_monotonic: 0,
+            durable_batch_counter: 0,
+            writer_local_batch_counter: 0,
+            schema_generation: 1,
+            ack_guard_nanos: ACK_REPLAY_GUARD_NANOS,
+        }
+    }
+
+    /// This worker's commit queue, read-only.
+    pub fn queue(&self) -> &CommitQueue {
+        &self.queue
+    }
+
+    /// This worker's commit queue, for a topology-local peer to steal pending records from — claiming a region
+    /// advances the source queue's clean cursor, which needs mutable access.
+    pub fn queue_mut(&mut self) -> &mut CommitQueue {
+        &mut self.queue
+    }
+
+    /// Queues one event (READY): no durability, no visibility, no final sequence yet. A retry of an event this tenant
+    /// already committed inside the replay-guard window (same dedupe identity) is not queued again; you get
+    /// `Submission::Duplicate` with the original receipt to answer the client with. A retry of a delivery whose earlier
+    /// attempt may or may not have become durable is not queued either; you get `Submission::Unresolved`.
+    pub fn submit(
+        &mut self,
+        event: EventInput,
+        epoch: u64,
+        retry: &mut dyn SafeRetryStore,
+        clock: &dyn MonotonicClock,
+    ) -> Result<Submission, QueueError> {
+        if event.envelope.tenant_id != self.tenant_id {
+            return Err(QueueError::TenantMismatch);
+        }
+        if let Some(submission) = self.earlier_attempt(&event, retry, clock) {
+            return Ok(submission);
+        }
+        self.queue.push(&PendingRecord {
+            tenant_id: self.tenant_id,
+            epoch,
+            event,
+        })?;
+        self.last_activity_monotonic = clock.monotonic_nanos();
+        Ok(Submission::Ready)
+    }
+
+    /// Queues a whole caller batch, or nothing: validates every event and queues the batch only when the queue can
+    /// hold all of it. A refused batch leaves nothing queued and the queue's cursors untouched, so the caller retries
+    /// the same batch as one unit once there is room — never a duplicated prefix, never a lost suffix. Admitted events
+    /// keep their submission order, so the flush that claims them commits one contiguous sequence sub-range with one
+    /// receipt per event.
+    ///
+    /// Returns one `Submission` per event, in order. Events this tenant already committed inside the replay-guard
+    /// window come back as `Submission::Duplicate` with their original receipt, and deliveries whose earlier attempt
+    /// may or may not have become durable come back as `Submission::Unresolved`; both are left out of the batch.
+    pub fn submit_batch(
+        &mut self,
+        events: Vec<EventInput>,
+        epoch: u64,
+        retry: &mut dyn SafeRetryStore,
+        clock: &dyn MonotonicClock,
+    ) -> Result<Vec<Submission>, QueueError> {
+        if events.iter().any(|event| event.envelope.tenant_id != self.tenant_id) {
+            return Err(QueueError::TenantMismatch);
+        }
+        let mut submissions = Vec::with_capacity(events.len());
+        let mut records = Vec::with_capacity(events.len());
+        for event in events {
+            match self.earlier_attempt(&event, retry, clock) {
+                Some(submission) => submissions.push(submission),
+                None => {
+                    submissions.push(Submission::Ready);
+                    records.push(PendingRecord {
+                        tenant_id: self.tenant_id,
+                        epoch,
+                        event,
+                    });
+                }
+            }
+        }
+        if records.is_empty() {
+            return Ok(submissions);
+        }
+        // Reclaim storage peers have stolen before measuring room, as `push` does, so a drained queue is not refused
+        // on stale accounting.
+        self.queue.release_hardened();
+        let Some(admission) = self.queue.admit(&records)? else {
+            return Err(QueueError::Full);
+        };
+        self.queue.push_admitted(&admission)?;
+        self.last_activity_monotonic = clock.monotonic_nanos();
+        Ok(submissions)
+    }
+
+    /// The answer for `event` when an earlier attempt means it must not be queued: `Duplicate` when this tenant already
+    /// committed an event with its dedupe identity inside the replay-guard window, `Unresolved` when an earlier attempt
+    /// of its delivery holds an unexpired `Indeterminate` receipt. `None` means the event may be queued.
+    fn earlier_attempt(
+        &self,
+        event: &EventInput,
+        retry: &mut dyn SafeRetryStore,
+        clock: &dyn MonotonicClock,
+    ) -> Option<Submission> {
+        let now = clock.now_nanos();
+        let dedupe = (event.envelope.dedupe_hash_low, event.envelope.dedupe_hash_high);
+        if let Some(receipt) = retry.acknowledged_within_guard(self.tenant_id, dedupe, now) {
+            return Some(Submission::Duplicate(receipt));
+        }
+        let delivery_identity = (event.connector_delivery_hash_low, event.connector_delivery_hash_high);
+        retry
+            .lookup(self.tenant_id, delivery_identity)
+            .filter(|receipt| receipt.status_class == StatusClass::Indeterminate && receipt.expiry_physical_nanos > now)
+            .map(Submission::Unresolved)
+    }
+
+    /// Steals same-tenant/same-epoch pending records from a topology-local peer queue into this worker's queue. The peer
+    /// region is claimed only after this queue confirms it has room for every record, so a claimed record is never
+    /// dropped between the two queues, and the source reclaims the stolen storage once the claim lands.
+    pub fn steal_from(
+        &mut self,
+        peer: &mut CommitQueue,
+        epoch: u64,
+        same_steal_group: bool,
+    ) -> Result<usize, QueueError> {
+        let Some((region, records)) = peek_steal_raw(peer, self.tenant_id, epoch, same_steal_group) else {
+            return Ok(0);
+        };
+        // Confirm room before taking ownership: a steal must not claim records this queue cannot hold, or they would
+        // vanish from the source without ever landing here. The stolen bytes are already in this queue's own wire
+        // format (peer and thief encode records identically), so they are copied in rather than decoded and
+        // re-encoded. `records` borrows from `peer`, so it is not touched again past this call — the source is
+        // claimed from immediately below.
+        let Some((admission, count)) = self.queue.admit_raw(records)? else {
+            return Ok(0);
+        };
+        // Claim the region on the source. A failed claim means another worker took it first; discard the copy and
+        // take nothing. Only after a won claim — with room already guaranteed — do the pushes run.
+        if !peer.commit_claim(region) {
+            return Ok(0);
+        }
+        self.queue.push_admitted(&admission)?;
+        Ok(count)
+    }
+
+    /// Decides whether to flush now. The force-commit trigger is jittered (probabilistic) so workers do not synchronize
+    /// into periodic bursts; the idle target is an internal runtime policy, not an operator knob.
+    pub fn should_flush(&self, clock: &dyn MonotonicClock) -> Option<FlushReason> {
+        let pending = self.queue.pending_bytes();
+        if pending == 0 {
+            return None;
+        }
+        if pending >= self.flush_target_bytes {
+            return Some(FlushReason::Target);
+        }
+        let jitter = clock.jitter(FORCE_COMMIT_IDLE_NANOS / FORCE_COMMIT_JITTER_DIVISOR);
+        let idle_threshold = FORCE_COMMIT_IDLE_NANOS - jitter;
+        let idle = clock.monotonic_nanos().saturating_sub(self.last_activity_monotonic);
+        if idle >= idle_threshold {
+            return Some(FlushReason::ForceCommit);
+        }
+        None
+    }
+
+    /// Claims the pending records that match this worker's tenant and the allocator's epoch — a queue spanning an
+    /// epoch roll is split at the boundary, claiming only the matching prefix and leaving the rest pending — and
+    /// commits them as aligned OEJ frames of up to the flush target each, every frame under its own contiguous
+    /// `(epoch, sequence)` range. All the frames are appended and then made durable by one sync, so a burst costs one
+    /// durability barrier however many frames it fills; each is then read back to verify what landed on media, and
+    /// recorded with durability plus safe-retry receipts. Append-only routes are COMMITTED on durability;
+    /// transactional routes stay HARDENED for the dependency hook.
+    ///
+    /// COMMITTED frames are also published to `overlay` before this returns, so their events are readable through
+    /// `LiveOverlayStore::fresh_read` as soon as the flush succeeds.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a flush wires every store it commits into exactly once"
+    )]
+    pub fn flush(
+        &mut self,
+        reason: FlushReason,
+        allocator: &mut SequenceAllocator,
+        storage: &mut dyn JournalStorage,
+        watermarks: &mut WatermarkTracker,
+        retry: &mut dyn SafeRetryStore,
+        overlay: &mut LiveOverlayStore,
+        clock: &dyn MonotonicClock,
+    ) -> Result<FlushResult, FlushError> {
+        let now = clock.now_nanos();
+        let mut frames = Vec::new();
+        if let Err(error) = self.append_frames(allocator, storage, clock, now, &mut frames) {
+            // The frames appended before the failure are unsynced, but a later sync can still persist them.
+            self.abandon_possibly_durable(&frames, allocator, now, retry);
+            return Err(error);
+        }
+        let (Some(first), Some(last)) = (frames.first(), frames.last()) else {
+            return Err(FlushError::NothingToFlush);
+        };
+        let range = SequenceRange {
+            epoch: first.range.epoch,
+            first_sequence: first.range.first_sequence,
+            last_sequence: last.range.last_sequence,
+        };
+        let frame_offset = first.offset;
+
+        // Durability barrier per the selected policy (direct-I/O completion or buffered fdatasync-equivalent), once for
+        // every frame. A sync failure leaves each frame's appended bytes in one of two states, and which one it is
+        // decides whether its range may be voided, so each offset is read back to tell them apart: bytes that are not
+        // there cannot become durable, and the frame's region is released with its lease left to expire into a void
+        // record; bytes that are there may still be persisted by a later sync, so the frame is abandoned as possibly
+        // durable. Only a read that succeeds and returns *other* bytes proves a frame absent; a failed read proves
+        // nothing, so an unreadable offset counts as present. Either way the failure is reported so the caller does not
+        // acknowledge.
+        if let Err(error) = storage.sync(self.shard) {
+            let (absent, present): (Vec<StagedFrame>, Vec<StagedFrame>) = frames.into_iter().partition(|frame| {
+                storage
+                    .read(self.shard, frame.offset, frame.bytes.len() as u32)
+                    .is_ok_and(|stored| stored != frame.bytes)
+            });
+            for frame in &absent {
+                self.queue.abort_flush(frame.region);
+            }
+            self.abandon_possibly_durable(&present, allocator, now, retry);
+            return Err(FlushError::Storage(error));
+        }
+        self.durable_batch_counter += frames.len() as u64;
+        self.writer_local_batch_counter += frames.len() as u64;
+
+        // Verification against what actually landed on media, not the in-memory buffers just built: read each frame
+        // back and require it to be byte-identical to the frame appended, before anything is receipted or acknowledged.
+        // Decoding alone is not enough — a stale or misdirected read can return some *other* valid frame of the same
+        // size, and accepting it would acknowledge events replay will not find. A failed read-back or a mismatch is
+        // handled like a failed durability barrier: the appended bytes may be durable, so every frame's lease is
+        // consumed as potentially-durable — never closed by a void — and the failure is reported so the caller does not
+        // acknowledge. `sync` is the durability barrier and it succeeded, so the frames can already be durable with only
+        // the verification read at fault; `Indeterminate` receipts are recorded for the same reason as the failed-sync
+        // branch, so a client retry of the same delivery is recognised instead of appending a second copy.
+        for frame in &frames {
+            let verified = storage
+                .read(self.shard, frame.offset, frame.bytes.len() as u32)
+                .map_err(FlushError::Storage)
+                .and_then(|stored| {
+                    if stored == frame.bytes {
+                        Ok(())
+                    } else {
+                        Err(FlushError::Format(FormatError::Structural {
+                            rule: "frame read back after sync differs from the frame appended",
+                        }))
+                    }
+                });
+            if let Err(error) = verified {
+                self.abandon_possibly_durable(&frames, allocator, now, retry);
+                return Err(error);
+            }
+        }
+
+        // Durable and verified: only now consume the leases, then advance the durable watermark and release the queue.
+        // A deadline crossed by the durability barrier itself (append + sync routinely outlasts the lease window) does
+        // not mean anything raced ahead of us — this call has held `allocator` exclusively since `reserve`, so nobody
+        // could have voided these ranges yet. Accept the already-durable frames rather than voiding ranges that already
+        // hold real event frames.
+        for frame in &frames {
+            if let Err(error) = allocator.harden(frame.lease_id, clock.monotonic_nanos())
+                && (error != LeaseError::Expired || allocator.accept_late(frame.lease_id).is_err())
+            {
+                for claimed in &frames {
+                    self.queue.abort_flush(claimed.region);
+                }
+                return Err(FlushError::Lease(error));
+            }
+        }
+        for frame in &frames {
+            watermarks.record_durable(frame.range);
+            self.queue.mark_hardened(frame.region);
+        }
+        self.queue.release_hardened();
+
+        // Safe-retry receipts: reconstructable indexes pointing at OEJ.
+        let mut receipts = Vec::new();
+        for frame in &frames {
+            receipts.extend(self.record_receipts(
+                &frame.events,
+                frame.range,
+                frame.offset,
+                now,
+                StatusClass::Acknowledged,
+                retry,
+            ));
+        }
+
+        // Append-only: HARDENED becomes COMMITTED immediately — no dependency machinery on the ordinary ingest path.
+        let state = match self.route {
+            RouteDependency::AppendOnly => CommitState::Committed,
+            RouteDependency::Transactional => CommitState::Hardened,
+        };
+        if state == CommitState::Committed {
+            for frame in &frames {
+                self.publish_to_overlay(&frame.bytes, overlay)?;
+            }
+        }
+        Ok(FlushResult {
+            range,
+            frame_offset,
+            frame_len: frames.iter().map(|frame| frame.bytes.len() as u32).sum(),
+            state,
+            receipts,
+            reason,
+        })
+    }
+
+    /// Claims, reserves, builds and appends one frame per flush target's worth of matching pending records until none
+    /// is left, adding each to `frames`; nothing is synced. A frame that fails to build or append has its region
+    /// released and its lease left outstanding, so the range is closed by a void record instead of leaving a permanent
+    /// gap; the frames appended before it stay in `frames` for the caller to settle.
+    fn append_frames(
+        &mut self,
+        allocator: &mut SequenceAllocator,
+        storage: &mut dyn JournalStorage,
+        clock: &dyn MonotonicClock,
+        now: i64,
+        frames: &mut Vec<StagedFrame>,
+    ) -> Result<(), FlushError> {
+        let epoch = allocator.epoch();
+        loop {
+            let (region, records) = self
+                .queue
+                .copy_matching_prefix(self.tenant_id, epoch, self.flush_target_bytes)
+                .map_err(FlushError::Queue)?;
+            if records.is_empty() {
+                if !frames.is_empty() {
+                    return Ok(());
+                }
+                // An empty prefix with records still pending means the queue front belongs to another tenant or epoch.
+                // Nothing was claimed, so those records stay queued for a matching flush instead of being dropped.
+                if self.queue.pending_bytes() > 0 {
+                    return Err(FlushError::MixedTenantOrEpoch);
+                }
+                return Err(FlushError::NothingToFlush);
+            }
+            if !self.queue.claim_for_flush(region) {
+                // Lost the claim to a stealer: the copied bytes are discarded.
+                return if frames.is_empty() {
+                    Err(FlushError::NothingToFlush)
+                } else {
+                    Ok(())
+                };
+            }
+
+            // Reserve the final (epoch, sequence) range under a lease, but do NOT consume the lease yet: the range is
+            // used to build the frame while the lease stays outstanding, so if any step fails before the frame is
+            // durable, the lease is left to expire into a void record (closing the sequence hole) instead of leaving a
+            // permanent gap.
+            let lease = allocator.reserve(records.len() as u64, clock.monotonic_nanos());
+            let events: Vec<EventInput> = records.into_iter().map(|record| record.event).collect();
+            let batch_number = frames.len() as u64 + 1;
+            match self.build_and_append(&events, lease.range, now, batch_number, storage) {
+                Ok((bytes, offset)) => frames.push(StagedFrame {
+                    bytes,
+                    events,
+                    lease_id: lease.lease_id,
+                    offset,
+                    range: lease.range,
+                    region,
+                }),
+                Err(error) => {
+                    self.queue.abort_flush(region);
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    /// Gives up on `frames`, whose bytes were appended but never verified durable: each lease is consumed as
+    /// possibly durable, so its range is never voided under a frame that may yet land; each event gets an
+    /// `Indeterminate` receipt, never an acknowledgement, so a client retry of the same delivery is recognised
+    /// instead of appending a second copy; and each claimed region is released.
+    fn abandon_possibly_durable(
+        &mut self,
+        frames: &[StagedFrame],
+        allocator: &mut SequenceAllocator,
+        now: i64,
+        retry: &mut dyn SafeRetryStore,
+    ) {
+        for frame in frames {
+            let _ = allocator.accept_late(frame.lease_id);
+            self.record_receipts(
+                &frame.events,
+                frame.range,
+                frame.offset,
+                now,
+                StatusClass::Indeterminate,
+                retry,
+            );
+            self.queue.abort_flush(frame.region);
+        }
+    }
+
+    /// Records one safe-retry receipt per event — pointers into OEJ at `frame_offset`, one sequence per row — under
+    /// `status_class`, and returns them. `Acknowledged` is the durable-and-verified path; `Indeterminate` is the path
+    /// where the append may or may not have persisted, and the receipt exists only so a client retry of the same
+    /// delivery is recognised rather than appended twice.
+    fn record_receipts(
+        &self,
+        events: &[EventInput],
+        range: SequenceRange,
+        frame_offset: u64,
+        now: i64,
+        status_class: StatusClass,
+        retry: &mut dyn SafeRetryStore,
+    ) -> Vec<RetryReceipt> {
+        let mut receipts = Vec::with_capacity(events.len());
+        for (row, event) in events.iter().enumerate() {
+            let receipt = RetryReceipt {
+                delivery_identity: (event.connector_delivery_hash_low, event.connector_delivery_hash_high),
+                tenant_id: self.tenant_id,
+                commit: SequencePoint {
+                    epoch: range.epoch,
+                    sequence: range.first_sequence + row as u64,
+                },
+                shard: self.shard,
+                frame_offset,
+                status_class,
+                expiry_physical_nanos: now + self.ack_guard_nanos,
+                dedupe: (event.envelope.dedupe_hash_low, event.envelope.dedupe_hash_high),
+            };
+            retry.record(receipt.clone());
+            receipts.push(receipt);
+        }
+        // Record-heavy flushes must not grow the retry store without bound; sweep receipts whose guard window has
+        // already passed even when no replay ever consults them.
+        retry.evict_expired(now);
+        receipts
+    }
+
+    /// Decodes a just-committed frame and publishes its events to `overlay`. The segment names this worker's shard as
+    /// its source and carries no segment chain anchor: the chain is a property of a replayed journal segment, and a
+    /// replay rebuild recomputes it. A frame this writer just built is never covered by a published file yet.
+    fn publish_to_overlay(&self, frame_bytes: &[u8], overlay: &mut LiveOverlayStore) -> Result<(), FlushError> {
+        let (header, payload) = decode_frame(frame_bytes).map_err(FlushError::Format)?;
+        let decoded = decode_batch(payload, header.event_count).map_err(FlushError::Format)?;
+        let segment = convert_frame(&header, &decoded, u64::from(self.shard.0), 0, None, |_, _| false)
+            .map_err(FlushError::Format)?;
+        if let Some(segment) = segment {
+            overlay.publish(segment);
+        }
+        Ok(())
+    }
+
+    /// Builds the batch payload and OEJ frame for `events` under the leased `range`, as this flush's `batch_number`th
+    /// frame, and appends it without syncing. Returns the frame bytes and their storage offset. The batch-id counters
+    /// advance only once the flush's sync succeeds, so a failed, aborted flush leaves no numbering gap.
+    fn build_and_append(
+        &self,
+        events: &[EventInput],
+        range: SequenceRange,
+        now: i64,
+        batch_number: u64,
+        storage: &mut dyn JournalStorage,
+    ) -> Result<(Vec<u8>, u64), FlushError> {
+        let payload = build_batch(events, self.schema_generation, 0).map_err(FlushError::Format)?;
+        let frame_bytes = build_frame(
+            &FrameBuildInput {
+                flags: 0,
+                tenant_id: self.tenant_id,
+                writer_id: self.worker_id,
+                epoch: range.epoch,
+                first_sequence: range.first_sequence,
+                last_sequence: range.last_sequence,
+                event_count: events.len() as u32,
+                durable_batch_id: self.durable_batch_counter + batch_number,
+                writer_local_batch_id: self.writer_local_batch_counter + batch_number,
+                schema_generation: self.schema_generation,
+                dictionary_generation_hint: 0,
+                created_at_physical: now,
+                committed_at_physical: now,
+            },
+            &payload,
+        )
+        .map_err(FlushError::Format)?;
+        let frame_offset = storage.append(self.shard, &frame_bytes).map_err(FlushError::Storage)?;
+        Ok((frame_bytes, frame_offset))
+    }
+
+    /// Closes expired reservation leases with internal void records: zero events, the void flag, the abandoned range;
+    /// in the hash chain like any frame, never a user event or public output. A lease is retired only after its void
+    /// record is durable, so a failed append or sync leaves that lease and every later one still outstanding for a
+    /// subsequent pass to close rather than dropping their ranges uncovered. Each durable void is also recorded in
+    /// `overlay`, so a fresh read passes over its sequences. Returns the ranges durably voided.
+    pub fn commit_voids(
+        &mut self,
+        allocator: &mut SequenceAllocator,
+        storage: &mut dyn JournalStorage,
+        watermarks: &mut WatermarkTracker,
+        overlay: &mut LiveOverlayStore,
+        clock: &dyn MonotonicClock,
+    ) -> Result<Vec<SequenceRange>, FlushError> {
+        let now = clock.now_nanos();
+        let mut voided = Vec::new();
+        let cutoff = clock.monotonic_nanos();
+        let mut cursor = None;
+        while let Some((lease_id, range)) = allocator.next_expired_after(cutoff, cursor) {
+            cursor = Some(lease_id);
+            let durable_batch_id = self.durable_batch_counter + 1;
+            let writer_local_batch_id = self.writer_local_batch_counter + 1;
+            let frame_bytes = build_frame(
+                &FrameBuildInput {
+                    flags: FLAG_VOID_RECORD,
+                    tenant_id: self.tenant_id,
+                    writer_id: self.worker_id,
+                    epoch: range.epoch,
+                    first_sequence: range.first_sequence,
+                    last_sequence: range.last_sequence,
+                    event_count: 0,
+                    durable_batch_id,
+                    writer_local_batch_id,
+                    schema_generation: self.schema_generation,
+                    dictionary_generation_hint: 0,
+                    created_at_physical: now,
+                    committed_at_physical: now,
+                },
+                &[],
+            )
+            .map_err(FlushError::Format)?;
+            storage.append(self.shard, &frame_bytes).map_err(FlushError::Storage)?;
+            storage.sync(self.shard).map_err(FlushError::Storage)?;
+            // Durable void record written: only now retire the lease. A failure above returns before this line, so the
+            // lease stays outstanding and its range remains expirable on a later pass.
+            allocator.close_voided(lease_id);
+            self.durable_batch_counter = durable_batch_id;
+            self.writer_local_batch_counter = writer_local_batch_id;
+            // Voided sequences are permanently skipped: durable and visible coverage advance (they publish zero rows).
+            watermarks.record_durable(range);
+            watermarks.record_visible(range);
+            overlay.publish_void(self.tenant_id, range);
+            voided.push(range);
+        }
+        Ok(voided)
+    }
+
+    /// The acknowledgement gate for a committed receipt under the route's visibility contract. Acknowledged OEJ events
+    /// not yet OE-covered are never silently omitted: under `ReadAfterAck`, acknowledgement waits for
+    /// `visibility_watermark` to include the event instead.
+    pub fn ack_ready(
+        receipt: &RetryReceipt,
+        state: CommitState,
+        visibility: AckVisibility,
+        watermarks: &WatermarkTracker,
+    ) -> bool {
+        if state != CommitState::Committed {
+            return false;
+        }
+        match visibility {
+            AckVisibility::Durability => true,
+            // Coverage is answered within the receipt's own epoch, so an event published in an earlier epoch stays
+            // acknowledgeable after later epochs begin.
+            AckVisibility::ReadAfterAck => watermarks.visibly_covers(receipt.commit),
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "test/pipeline.rs"]
+mod tests;
