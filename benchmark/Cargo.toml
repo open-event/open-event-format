@@ -1,0 +1,25 @@
+[package]
+name = "oe-benchmark"
+description = "Compares OE with Parquet, Vortex and JSON on the same events: file size, write speed, scans, filters and lookups."
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+publish = false
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+arrow = { version = "59", default-features = false }
+bytes = "1"
+futures = "0.3"
+oe = { path = "..", features = ["write"] }
+parquet = { version = "59", default-features = false, features = ["arrow", "zstd"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+zstd = "0.13"
+vortex = { version = "0.93.0", features = ["tokio"] }
+
+[profile.release]
+debug = false
+lto = "thin"
