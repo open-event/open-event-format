@@ -2166,7 +2166,10 @@ fn large_string_in_lists_agree_with_the_per_value_reference() {
             check(&values, &predicate, random_access);
         }
     }
-    assert!(check(&high_cardinality(256), &predicate, true), "FSST answers the set from compressed bytes");
+    assert!(
+        check(&high_cardinality(256), &predicate, true),
+        "FSST answers the set from compressed bytes"
+    );
 }
 
 /// An integer `IN` list naming every value of a contiguous span, in any order and with repeats, is translated into one

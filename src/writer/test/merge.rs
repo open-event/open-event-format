@@ -843,3 +843,34 @@ fn graph_renumbering_refuses_an_output_with_no_surviving_event() {
     );
     assert!(matches!(result, Err(PublishFailure::Format(_))), "{result:?}");
 }
+
+#[test]
+fn elided_external_ids_round_trip_through_read_build_rows() {
+    use crate::layout::required_features;
+    use crate::writer::build::BuildRow;
+    let mut rows: Vec<BuildRow> = OeRow::into_build_rows((1..=8).map(rich_row).collect());
+    for (index, row) in rows.iter_mut().enumerate() {
+        let event_id = row.envelope.event_id.uuid().as_u128();
+        row.external_id = match index % 3 {
+            0 => Some(event_id.to_be_bytes().to_vec()),
+            1 => Some(format!("{event_id:032x}").into_bytes()),
+            _ => Some(format!("${index}:example.org").into_bytes()),
+        };
+    }
+    let built = build_oe_file(rows.clone(), &lineage_config()).unwrap();
+    assert_ne!(
+        built.footer.required_feature_flags & required_features::EXTERNAL_ID_EVENT_ID_ELISION,
+        0
+    );
+    let read = read_build_rows(&open_built(&built)).unwrap();
+    assert_eq!(read, rows, "merge reads expand every sentinel");
+
+    let rebuilt = build_oe_file(read, &lineage_config()).unwrap();
+    assert_eq!(read_build_rows(&open_built(&rebuilt)).unwrap(), rows);
+    assert_eq!(rebuilt.footer.external_ids, built.footer.external_ids);
+    assert_ne!(
+        rebuilt.footer.required_feature_flags & required_features::EXTERNAL_ID_EVENT_ID_ELISION,
+        0,
+        "the rewrite elides the same ids again"
+    );
+}

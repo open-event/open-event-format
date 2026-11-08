@@ -504,11 +504,20 @@ fn numeric_decode_rejects_stats_that_disagree_with_their_row_counts() {
     assert!(NumericMinMax::decode(&bounded_all_null.encode()).is_err());
 
     let zone_map = NumericMinMax::build(&[Some(3), None, Some(-7), Some(12)]);
-    assert_eq!((zone_map.min, zone_map.max, zone_map.null_count), (Some(-7), Some(12), 1));
+    assert_eq!(
+        (zone_map.min, zone_map.max, zone_map.null_count),
+        (Some(-7), Some(12), 1)
+    );
     let bytes = zone_map.encode();
     assert_eq!(NumericMinMax::decode_for_granule(&bytes, 4).unwrap(), zone_map);
-    assert!(NumericMinMax::decode_for_granule(&bytes, 3).is_err(), "overruns the granule");
-    assert!(NumericMinMax::decode_for_granule(&bytes, 5).is_err(), "misses granule rows");
+    assert!(
+        NumericMinMax::decode_for_granule(&bytes, 3).is_err(),
+        "overruns the granule"
+    );
+    assert!(
+        NumericMinMax::decode_for_granule(&bytes, 5).is_err(),
+        "misses granule rows"
+    );
 }
 
 /// The one-pass build agrees with separate min and max folds, including at the i128 extremes it seeds from.
@@ -520,6 +529,9 @@ fn numeric_build_matches_separate_min_and_max_folds() {
         let zone_map = NumericMinMax::build(slice);
         assert_eq!(zone_map.min, slice.iter().flatten().copied().min());
         assert_eq!(zone_map.max, slice.iter().flatten().copied().max());
-        assert_eq!(zone_map.null_count as usize, slice.iter().filter(|v| v.is_none()).count());
+        assert_eq!(
+            zone_map.null_count as usize,
+            slice.iter().filter(|v| v.is_none()).count()
+        );
     }
 }

@@ -19,6 +19,8 @@ use crate::events::relationships::RelationshipKind;
 use crate::indexes::probabilistic::SplitBlockBloomFilter;
 use crate::indexes::stable_hash;
 use crate::layout::footer::{ExternalIdEntry, Footer, ReferenceFilterEntry};
+use crate::layout::required_features;
+use crate::layout::source_form::external_id_sentinel;
 
 /// One granule's block of one source-form column: the column id, a presence bitmap with one bit per row, and the
 /// present rows' values in row order.
@@ -31,6 +33,9 @@ pub(crate) type SourceFormBlock = (u32, Vec<u8>, ColumnData);
 pub(crate) struct SourceFormIndexes {
     pub(crate) external_ids: Vec<ExternalIdEntry>,
     pub(crate) reference_filters: Option<Vec<ReferenceFilterEntry>>,
+    /// Whether some row's external id is stored as an event-id sentinel, so the file must declare
+    /// [`required_features::EXTERNAL_ID_EVENT_ID_ELISION`].
+    pub(crate) elides_event_ids: bool,
 }
 
 impl SourceFormIndexes {
@@ -40,6 +45,7 @@ impl SourceFormIndexes {
         Self {
             external_ids: footer.external_ids.clone(),
             reference_filters: footer.reference_filters.clone(),
+            elides_event_ids: footer.required_feature_flags & required_features::EXTERNAL_ID_EVENT_ID_ELISION != 0,
         }
     }
 }
@@ -97,6 +103,13 @@ pub(crate) fn build(
     let indexes = SourceFormIndexes {
         external_ids: external_id_index(rows),
         reference_filters: reference_filters(rows, granule_row_ranges),
+        elides_event_ids: carried.iter().any(|spec| spec.column_id == column_ids::EXTERNAL_ID)
+            && rows.iter().any(|row| {
+                row.external_id
+                    .as_deref()
+                    .and_then(|id| external_id_sentinel(id, row.envelope.event_id.uuid().as_u128()))
+                    .is_some()
+            }),
     };
     Ok((blocks, indexes))
 }
@@ -153,11 +166,16 @@ fn column_block(rows: &[BuildRow], column_id: u32) -> Result<SourceFormBlock, Fo
                     rule: "an external id is 1 to 255 bytes",
                 });
             }
-            scratch.clear();
-            hex_lower_into(id, &mut scratch);
             if let Some(byte) = presence.get_mut(index / 8) {
                 *byte |= 1 << (index % 8);
             }
+            // An id that only repeats the row's event id stores a one-letter sentinel the reader expands.
+            if let Some(sentinel) = external_id_sentinel(id, row.envelope.event_id.uuid().as_u128()) {
+                values.push(Some(sentinel));
+                continue;
+            }
+            scratch.clear();
+            hex_lower_into(id, &mut scratch);
             values.push(Some(&scratch));
         }
         return Ok((column_id, presence, ColumnData::Strings(values)));

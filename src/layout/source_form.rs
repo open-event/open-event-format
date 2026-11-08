@@ -6,6 +6,7 @@
 
 use super::footer::{Footer, GranuleEntry};
 use super::reader::{ColumnRead, OeFile};
+use super::required_features;
 use crate::columns::column_ids;
 use crate::encoding::ColumnData;
 use crate::error::FormatError;
@@ -28,13 +29,16 @@ impl OeFile {
 
     /// The event's external protocol id (a protocol `$...` id, say), or `None` when the row carries none.
     pub fn external_id(&self, row_ordinal: u64) -> Result<Option<Vec<u8>>, FormatError> {
-        self.source_form_text(column_ids::EXTERNAL_ID, row_ordinal)?
-            .map(|hex| {
-                hex_simd::decode_to_vec(hex.as_bytes()).map_err(|_| FormatError::Structural {
-                    rule: "a stored external id is lowercase hex",
+        let elision = self.external_id_elision_declared();
+        self.with_source_form_text(column_ids::EXTERNAL_ID, row_ordinal, |stored| {
+            stored
+                .map(|stored| {
+                    let mut id = Vec::new();
+                    expand_external_id(stored, elision, || self.cached_event_id(row_ordinal), &mut id)?;
+                    Ok(id)
                 })
-            })
-            .transpose()
+                .transpose()
+        })?
     }
 
     /// The row that holds the event with `external_id`, found through the file's external-id index without scanning
@@ -59,6 +63,7 @@ impl OeFile {
         let id_hash = stable_hash(external_id);
         let entries = &self.footer().external_ids;
         let first = entries.partition_point(|entry| entry.id_hash < id_hash);
+        let elision = self.external_id_elision_declared();
         let mut decoded = Vec::new();
         for entry in entries
             .get(first..)
@@ -67,16 +72,17 @@ impl OeFile {
             .take_while(|entry| entry.id_hash == id_hash)
         {
             // Two ids can share a hash, so every candidate is confirmed against the stored id.
-            let matches = self.with_source_form_text(column_ids::EXTERNAL_ID, entry.row_ordinal, |hex| {
-                let Some(hex) = hex else {
+            let matches = self.with_source_form_text(column_ids::EXTERNAL_ID, entry.row_ordinal, |stored| {
+                let Some(stored) = stored else {
                     return Ok(false);
                 };
-                decoded.resize(hex.len() / 2, 0);
-                hex_simd::decode(hex.as_bytes(), hex_simd::Out::from_slice(&mut decoded))
-                    .map(|id| &*id == external_id)
-                    .map_err(|_| FormatError::Structural {
-                        rule: "a stored external id is lowercase hex",
-                    })
+                expand_external_id(
+                    stored,
+                    elision,
+                    || self.cached_event_id(entry.row_ordinal),
+                    &mut decoded,
+                )?;
+                Ok::<_, FormatError>(decoded == external_id)
             })??;
             if matches {
                 found(entry.row_ordinal);
@@ -91,17 +97,49 @@ impl OeFile {
         if !has_column(self.footer(), column_ids::EXTERNAL_ID) {
             return Ok(ids);
         }
+        let elision = self.external_id_elision_declared();
         for granule in &self.footer().granules {
             let read = self.read_column(column_ids::EXTERNAL_ID, granule.granule_id)?;
-            for_each_present_string(&read, granule.row_count as usize, |row, hex| {
-                let id = hex_simd::decode_to_vec(hex.as_bytes()).map_err(|_| FormatError::Structural {
-                    rule: "a stored external id is lowercase hex",
-                })?;
+            // The event-id block is read only when some row of the granule elides its id.
+            let mut event_ids: Option<ColumnRead> = None;
+            for_each_present_string(&read, granule.row_count as usize, |row, stored| {
+                let mut id = Vec::new();
+                expand_external_id(
+                    stored,
+                    elision,
+                    || {
+                        if event_ids.is_none() {
+                            event_ids = Some(self.read_column(column_ids::EVENT_ID, granule.granule_id)?);
+                        }
+                        match event_ids.as_ref().map(|read| &read.data) {
+                            Some(ColumnData::U128(values)) => values.get(row).copied().ok_or(MISSING_EVENT_ID),
+                            _ => Err(MISSING_EVENT_ID),
+                        }
+                    },
+                    &mut id,
+                )?;
                 ids.push((granule.first_row_ordinal + row as u64, id));
                 Ok(())
             })?;
         }
         Ok(ids)
+    }
+
+    /// Whether the file declares that some external id is stored as an event-id sentinel.
+    fn external_id_elision_declared(&self) -> bool {
+        self.footer().required_feature_flags & required_features::EXTERNAL_ID_EVENT_ID_ELISION != 0
+    }
+
+    /// One row's event id, read through the decoded-block cache so a run of point reads decodes each granule's
+    /// event-id block once.
+    pub(crate) fn cached_event_id(&self, row_ordinal: u64) -> Result<u128, FormatError> {
+        let granule = granule_holding(self.footer(), row_ordinal)?;
+        self.with_cached_u128_at(
+            column_ids::EVENT_ID,
+            granule.granule_id,
+            row_ordinal - granule.first_row_ordinal,
+        )?
+        .ok_or(MISSING_EVENT_ID)
     }
 
     /// One row's text in a source-form column, or `None` when the file has no such column or the row has no value.
@@ -130,6 +168,70 @@ impl OeFile {
             row_ordinal - granule.first_row_ordinal,
             visit,
         )
+    }
+}
+
+/// The stored text of an external id that is its row's event id as 16 raw big-endian bytes. Stored ids are otherwise
+/// lowercase hex of even length, so a one-letter non-hex sentinel cannot be mistaken for one.
+pub(crate) const EXTERNAL_ID_IS_RAW_EVENT_ID: &str = "r";
+/// The stored text of an external id that is its row's event id as 32-character lowercase hex text.
+pub(crate) const EXTERNAL_ID_IS_HEX_EVENT_ID: &str = "h";
+
+const MISSING_EVENT_ID: FormatError = FormatError::Structural {
+    rule: "an elided external id's row has an event id",
+};
+
+/// The sentinel to store instead of `id` when it only repeats the row's event id, or `None` when it must be stored.
+pub(crate) fn external_id_sentinel(id: &[u8], event_id: u128) -> Option<&'static str> {
+    if id == event_id.to_be_bytes() {
+        return Some(EXTERNAL_ID_IS_RAW_EVENT_ID);
+    }
+    (id.len() == 32 && id == event_id_hex(event_id)).then_some(EXTERNAL_ID_IS_HEX_EVENT_ID)
+}
+
+/// The event id's 32-character lowercase hex text, as ASCII bytes.
+fn event_id_hex(event_id: u128) -> [u8; 32] {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = [0u8; 32];
+    for (slot, shift) in out.iter_mut().zip((0..32u32).rev()) {
+        let nibble = (event_id >> (shift * 4)) as usize & 0xf;
+        *slot = DIGITS.get(nibble).copied().unwrap_or(b'0');
+    }
+    out
+}
+
+/// Expands one stored external id into `out`: lowercase hex decodes to its bytes, and a sentinel - honoured only when
+/// the file declares [`required_features::EXTERNAL_ID_EVENT_ID_ELISION`] - rebuilds the id from the row's event id,
+/// which `event_id` reads only then.
+pub(crate) fn expand_external_id(
+    stored: &str,
+    elision_declared: bool,
+    event_id: impl FnOnce() -> Result<u128, FormatError>,
+    out: &mut Vec<u8>,
+) -> Result<(), FormatError> {
+    out.clear();
+    match stored {
+        EXTERNAL_ID_IS_RAW_EVENT_ID | EXTERNAL_ID_IS_HEX_EVENT_ID if !elision_declared => {
+            Err(FormatError::Structural {
+                rule: "an elided external id appears only in a file that declares external-id elision",
+            })
+        }
+        EXTERNAL_ID_IS_RAW_EVENT_ID => {
+            out.extend_from_slice(&event_id()?.to_be_bytes());
+            Ok(())
+        }
+        EXTERNAL_ID_IS_HEX_EVENT_ID => {
+            out.extend_from_slice(&event_id_hex(event_id()?));
+            Ok(())
+        }
+        hex => {
+            out.resize(hex.len() / 2, 0);
+            hex_simd::decode(hex.as_bytes(), hex_simd::Out::from_slice(out))
+                .map(|_| ())
+                .map_err(|_| FormatError::Structural {
+                    rule: "a stored external id is lowercase hex",
+                })
+        }
     }
 }
 

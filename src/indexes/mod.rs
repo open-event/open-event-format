@@ -14,8 +14,8 @@
 //! keep/drop decision).
 
 pub mod artifact;
-pub mod bool_pruning;
 pub mod bitmap;
+pub mod bool_pruning;
 pub mod constant_flags;
 pub mod entity_summary;
 pub mod external_id;

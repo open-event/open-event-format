@@ -24,6 +24,7 @@ use super::constant::{
 use super::footer::{Footer, StripeEntry};
 use super::graph::{ChainLabel, ChainLink, EdgeKind, GranuleEdges};
 use super::reader::{DECODED_CACHE_BUDGET_BYTES, HeaderCommitment, OeFile, OeFooter, VerifiedStripeRead};
+use super::required_features;
 use super::{LayoutClass, OeHeader};
 use crate::artifacts::state_chunk::{self, StateChange, StateChunkStore, StateKey, StateRoot};
 use crate::clock::Clock;
@@ -826,16 +827,24 @@ impl RemoteGraph {
             })
             .collect();
         self.prefetch(remote, &marks)?;
-        let mut blocks = Vec::with_capacity(granules.len());
+        // A file that elides external ids repeating the event id also needs the event-id block to expand them.
+        let columns: &[u32] = if footer.required_feature_flags & required_features::EXTERNAL_ID_EVENT_ID_ELISION != 0 {
+            &[column_ids::EXTERNAL_ID, column_ids::EVENT_ID]
+        } else {
+            &[column_ids::EXTERNAL_ID]
+        };
+        let mut blocks = Vec::with_capacity(granules.len() * columns.len());
         for &granule_id in &granules {
-            let Some(mark) = file.mark(column_ids::EXTERNAL_ID, 0, granule_id)? else {
-                continue;
-            };
-            if mark.page_count > 1 || mark.compressed_size == 0 {
-                continue;
+            for &column_id in columns {
+                let Some(mark) = file.mark(column_id, 0, granule_id)? else {
+                    continue;
+                };
+                if mark.page_count > 1 || mark.compressed_size == 0 {
+                    continue;
+                }
+                let start = file.file_position(granule_id, mark.compressed_offset)? as u64;
+                blocks.push((start, start.saturating_add(mark.compressed_size)));
             }
-            let start = file.file_position(granule_id, mark.compressed_offset)? as u64;
-            blocks.push((start, start.saturating_add(mark.compressed_size)));
         }
         self.prefetch(remote, &blocks)
     }

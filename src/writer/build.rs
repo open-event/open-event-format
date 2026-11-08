@@ -5291,6 +5291,9 @@ fn build_oe_file_sealed_in_order(
     if !state_roots.is_empty() {
         required_feature_flags |= required_features::GRAPH_STATE_ROOTS;
     }
+    if source_form_indexes.elides_event_ids {
+        required_feature_flags |= required_features::EXTERNAL_ID_EVENT_ID_ELISION;
+    }
     let footer = Footer {
         audit,
         clustering,

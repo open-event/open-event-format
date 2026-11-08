@@ -36,6 +36,8 @@ use crate::invariants::PublishedSet;
 use crate::layout::Profile;
 use crate::layout::graph::EdgeKind;
 use crate::layout::reader::{OeFile, PayloadRead};
+use crate::layout::required_features;
+use crate::layout::source_form::expand_external_id;
 use crate::lifecycle::{CompactionJob, OeFileEntry, PartState};
 use crate::object_store::{ObjectStore, oe_object_key};
 
@@ -115,12 +117,6 @@ impl ColumnValue {
             }),
         }
     }
-}
-
-fn hex_of(text: &str) -> Result<Vec<u8>, FormatError> {
-    hex_simd::decode_to_vec(text.as_bytes()).map_err(|_| FormatError::Structural {
-        rule: "a stored id is lowercase hex",
-    })
 }
 
 /// The provenance one row stores across the provenance family, or `None` when the row is unsigned.
@@ -233,6 +229,8 @@ fn read_stored_rows(file: &OeFile, redactions: Option<&FieldRedactions>) -> Resu
             .collect::<Result<Vec<_>, FormatError>>()?;
         let mut raw_payloads = optional(column_ids::RAW_PAYLOAD)?;
         let mut external_ids = optional(column_ids::EXTERNAL_ID)?;
+        let elides_event_ids =
+            file.footer().required_feature_flags & required_features::EXTERNAL_ID_EVENT_ID_ELISION != 0;
         let mut source_schemas = optional(column_ids::SOURCE_SCHEMA)?;
         let mut source_deliveries = optional(column_ids::SOURCE_DELIVERY)?;
         let mut delivery_hashes = optional(column_ids::CONNECTOR_DELIVERY_HASH)?;
@@ -322,7 +320,12 @@ fn read_stored_rows(file: &OeFile, redactions: Option<&FieldRedactions>) -> Resu
                 None => (0, 0),
             };
             rows.push(StoredRow {
-                external_id: next_text(&mut external_ids)?.map(|hex| hex_of(&hex)).transpose()?,
+                external_id: next_text(&mut external_ids)?
+                    .map(|stored| {
+                        let mut id = Vec::new();
+                        expand_external_id(&stored, elides_event_ids, || Ok(event_id), &mut id).map(|()| id)
+                    })
+                    .transpose()?,
                 raw_payload: next_text(&mut raw_payloads)?
                     .filter(|_| !redacted)
                     .map(String::into_bytes),
