@@ -14,8 +14,10 @@
 use super::*;
 use crate::deletes::{DeletionVector, RowSelection};
 use crate::encoding::predicate::scan_in_parallel;
+use crate::field_deletion_store::FieldRedactions;
 use crate::layout::constant::SCAN_WINDOW_BYTES;
 use crate::layout::footer::ColumnKind;
+use arrow_array::Array;
 
 /// One granule's slice of a projected scan: its decoded columns in the order the scan asked for them.
 #[derive(Debug)]
@@ -134,6 +136,103 @@ impl OeFile {
         sink: impl FnMut(ScanBatch, RowSelection) -> Result<(), FormatError>,
     ) -> Result<(), FormatError> {
         self.scan_live_inner(column_ids, granule_ids, deleted, false, sink)
+    }
+
+    /// [`Self::scan_projected`] with `redactions` applied: in each batch, every projected column that holds one of a
+    /// row's redacted fields (see [`FieldRedactions::redacted_column_ids`]) reads as null at that row, so a column scan
+    /// serves exactly what a redacted payload read would. Unredacted rows and columns come back as they are stored.
+    pub fn scan_projected_redacted(
+        &self,
+        column_ids: &[u32],
+        granule_ids: &[u32],
+        redactions: Option<&FieldRedactions>,
+        mut sink: impl FnMut(ScanBatch) -> Result<(), FormatError>,
+    ) -> Result<(), FormatError> {
+        self.scan_projected_inner(column_ids, granule_ids, true, SCAN_WINDOW_BYTES, |mut batch| {
+            self.mask_redacted(&mut batch, column_ids, redactions)?;
+            sink(batch)
+        })
+    }
+
+    /// [`Self::scan_projected_redacted`] kept on the calling thread, as [`Self::scan_projected_serial`] is.
+    pub fn scan_projected_serial_redacted(
+        &self,
+        column_ids: &[u32],
+        granule_ids: &[u32],
+        redactions: Option<&FieldRedactions>,
+        mut sink: impl FnMut(ScanBatch) -> Result<(), FormatError>,
+    ) -> Result<(), FormatError> {
+        self.scan_projected_inner(column_ids, granule_ids, false, SCAN_WINDOW_BYTES, |mut batch| {
+            self.mask_redacted(&mut batch, column_ids, redactions)?;
+            sink(batch)
+        })
+    }
+
+    /// [`Self::scan_projected_live`] with `redactions` applied to each batch, as [`Self::scan_projected_redacted`]
+    /// applies them.
+    pub fn scan_projected_live_redacted(
+        &self,
+        column_ids: &[u32],
+        granule_ids: &[u32],
+        deleted: &DeletionVector,
+        redactions: Option<&FieldRedactions>,
+        mut sink: impl FnMut(ScanBatch, RowSelection) -> Result<(), FormatError>,
+    ) -> Result<(), FormatError> {
+        self.scan_live_inner(column_ids, granule_ids, deleted, true, |mut batch, selection| {
+            self.mask_redacted(&mut batch, column_ids, redactions)?;
+            sink(batch, selection)
+        })
+    }
+
+    /// [`Self::scan_projected_live_redacted`] kept on the calling thread, as [`Self::scan_projected_serial`] is.
+    pub fn scan_projected_serial_live_redacted(
+        &self,
+        column_ids: &[u32],
+        granule_ids: &[u32],
+        deleted: &DeletionVector,
+        redactions: Option<&FieldRedactions>,
+        mut sink: impl FnMut(ScanBatch, RowSelection) -> Result<(), FormatError>,
+    ) -> Result<(), FormatError> {
+        self.scan_live_inner(column_ids, granule_ids, deleted, false, |mut batch, selection| {
+            self.mask_redacted(&mut batch, column_ids, redactions)?;
+            sink(batch, selection)
+        })
+    }
+
+    /// Nulls, in `batch` (whose columns are `column_ids`, in order), every value `redactions` hides: for each row of
+    /// the batch's granule with a redacted field, each projected column [`FieldRedactions::redacted_column_ids`] names
+    /// for that row reads as null. A dense block gains a presence bitmap; a string block keeps its presence and stores
+    /// a null value instead. `None` or empty redactions leave the batch as it is.
+    pub fn mask_redacted(
+        &self,
+        batch: &mut ScanBatch,
+        column_ids: &[u32],
+        redactions: Option<&FieldRedactions>,
+    ) -> Result<(), FormatError> {
+        let Some(redactions) = redactions.filter(|redactions| !redactions.is_empty()) else {
+            return Ok(());
+        };
+        let entry = self.granule_entry(batch.granule_id).ok_or(OUT_OF_STEP)?;
+        let first = entry.first_row_ordinal;
+        let mut masked: Vec<Vec<u32>> = vec![Vec::new(); column_ids.len()];
+        for row in 0..batch.row_count {
+            let ordinal = first + u64::from(row);
+            if !redactions.withholds_raw_payload(ordinal) {
+                continue;
+            }
+            let ids = redactions.redacted_column_ids(self, ordinal);
+            for (rows, column_id) in masked.iter_mut().zip(column_ids) {
+                if ids.binary_search(column_id).is_ok() {
+                    rows.push(row);
+                }
+            }
+        }
+        for (column, rows) in batch.columns.iter_mut().zip(&masked) {
+            if !rows.is_empty() {
+                mask_column(column, batch.row_count, rows)?;
+            }
+        }
+        Ok(())
     }
 
     fn scan_live_inner(
@@ -331,3 +430,96 @@ impl OeFile {
 #[cfg(test)]
 #[path = "test/scan.rs"]
 mod tests;
+
+fn bit_set(presence: &[u8], row: u32) -> bool {
+    presence
+        .get(row as usize / 8)
+        .is_some_and(|byte| byte & (1 << (row % 8)) != 0)
+}
+
+/// The dense value index of row `row` behind `presence` (every row when it is empty), or `None` when the row holds no
+/// value.
+fn value_index(presence: &[u8], row: u32) -> Option<usize> {
+    if presence.is_empty() {
+        return Some(row as usize);
+    }
+    if !bit_set(presence, row) {
+        return None;
+    }
+    let whole = row as usize / 8;
+    let before: u32 = presence
+        .get(..whole)
+        .map_or(0, |bytes| bytes.iter().map(|b| b.count_ones()).sum());
+    let partial = presence
+        .get(whole)
+        .map_or(0, |byte| (byte & ((1u8 << (row % 8)) - 1)).count_ones());
+    Some((before + partial) as usize)
+}
+
+/// Makes `rows` (granule-local, ascending) of `column` read as null.
+fn mask_column(column: &mut ScanColumn, row_count: u32, rows: &[u32]) -> Result<(), FormatError> {
+    match column {
+        ScanColumn::Views { presence, views } => {
+            let hidden: Vec<usize> = rows.iter().filter_map(|&row| value_index(presence, row)).collect();
+            if hidden.is_empty() {
+                return Ok(());
+            }
+            *views = views
+                .iter()
+                .enumerate()
+                .map(|(index, value)| if hidden.contains(&index) { None } else { value })
+                .collect();
+        }
+        ScanColumn::Materialized(read) => {
+            if read.presence.is_empty() {
+                let mut dense = vec![0u8; (row_count as usize).div_ceil(8)];
+                for row in 0..row_count {
+                    if let Some(byte) = dense.get_mut(row as usize / 8) {
+                        *byte |= 1 << (row % 8);
+                    }
+                }
+                read.presence = dense;
+            }
+            let mut dropped: Vec<usize> = rows
+                .iter()
+                .filter_map(|&row| value_index(&read.presence, row))
+                .collect();
+            if dropped.is_empty() {
+                return Ok(());
+            }
+            dropped.sort_unstable();
+            for &row in rows {
+                if let Some(byte) = read.presence.get_mut(row as usize / 8) {
+                    *byte &= !(1 << (row % 8));
+                }
+            }
+            let keep = |index: usize| dropped.binary_search(&index).is_err();
+            fn retain_indexed<T>(values: &mut Vec<T>, keep: impl Fn(usize) -> bool) {
+                let mut index = 0;
+                values.retain(|_| {
+                    let kept = keep(index);
+                    index += 1;
+                    kept
+                });
+            }
+            match &mut read.data {
+                ColumnData::Decimal { values, .. } => retain_indexed(values, keep),
+                ColumnData::F64(values) => retain_indexed(values, keep),
+                ColumnData::I64(values) => retain_indexed(values, keep),
+                ColumnData::U128(values) => retain_indexed(values, keep),
+                ColumnData::U64(values) => retain_indexed(values, keep),
+                ColumnData::Strings(values) => {
+                    let mut rebuilt = crate::encoding::StringColumn::with_capacity(values.len(), values.text_len());
+                    for (index, value) in values.iter().enumerate() {
+                        if keep(index) {
+                            rebuilt.push(value);
+                        }
+                    }
+                    *values = rebuilt;
+                }
+            }
+            validate_block_counts(&read.presence, read.data.row_count(), row_count as usize)?;
+        }
+    }
+    Ok(())
+}

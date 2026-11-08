@@ -154,10 +154,11 @@ fn read_rows(
         column_ids::ENTITY_ID_HASH_LOW,
         column_ids::ENTITY_ID_HASH_HIGH,
     ];
-    file.scan_projected_serial_live(
+    file.scan_projected_serial_live_redacted(
         &columns,
         &granule_ids,
         deleted.unwrap_or(&no_deletes),
+        redactions,
         |batch, selection| {
             let rows = batch.row_count as usize;
             let first_row_ordinal = file

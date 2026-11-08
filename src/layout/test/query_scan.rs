@@ -596,3 +596,183 @@ fn in_list_query_prunes_gaps_and_matches_naive() {
     )));
     assert!(gaps < envelope, "{gaps} vs {envelope}");
 }
+
+// --- Field redactions mask the columns that hold a redacted field -----------------------------------------------------
+
+use crate::field_deletion_store::FieldRedactions;
+
+fn redactions(paths: &[&str], ordinals: &[u64]) -> FieldRedactions {
+    let mut vector = crate::deletes::FieldDeletionVector::new(paths.iter().map(|path| (*path).to_owned()).collect());
+    ordinals.iter().for_each(|&ordinal| vector.mark_affected(ordinal));
+    FieldRedactions { vectors: vec![vector] }
+}
+
+/// The stored column a top-level payload field `path` was shredded into.
+fn shredded_column(file: &OeFile, path: &str) -> u32 {
+    file.footer()
+        .shredded
+        .iter()
+        .find(|entry| entry.path == path)
+        .map(|entry| entry.column_id)
+        .unwrap_or_else(|| panic!("{path} is shredded"))
+}
+
+/// Whether `column` holds a non-null value at granule-local `row`.
+fn holds_value(column: &ScanColumn, row: u32) -> bool {
+    let index = |presence: &[u8]| -> Option<usize> {
+        if presence.is_empty() {
+            return Some(row as usize);
+        }
+        let bit = |r: u32| presence.get(r as usize / 8).is_some_and(|b| b & (1 << (r % 8)) != 0);
+        bit(row).then(|| (0..row).filter(|&r| bit(r)).count())
+    };
+    match column {
+        ScanColumn::Materialized(read) => index(&read.presence).is_some_and(|i| match &read.data {
+            ColumnData::Strings(values) => values.get(i).flatten().is_some(),
+            _ => true,
+        }),
+        ScanColumn::Views { presence, views } => {
+            use arrow_array::Array;
+            index(presence).is_some_and(|i| i < views.len() && !views.is_null(i))
+        }
+    }
+}
+
+/// `(row ordinal, holds value per column)` for every row of a scan of `columns`.
+fn presence_rows(file: &OeFile, batch: &ScanBatch, out: &mut Vec<(u64, Vec<bool>)>) {
+    let first = file
+        .footer()
+        .granules
+        .iter()
+        .find(|g| g.granule_id == batch.granule_id)
+        .unwrap()
+        .first_row_ordinal;
+    for row in 0..batch.row_count {
+        out.push((
+            first + u64::from(row),
+            batch.columns.iter().map(|column| holds_value(column, row)).collect(),
+        ));
+    }
+}
+
+#[test]
+fn redacted_scans_read_redacted_columns_as_null_at_affected_rows_only() {
+    let file = file(40, 16);
+    let columns = [
+        column_ids::OCCURRED_AT,
+        shredded_column(&file, "region"),
+        shredded_column(&file, "amount"),
+    ];
+    let hidden = redactions(&["region", "amount"], &[3, 20, 39]);
+    let mut plain = Vec::new();
+    file.scan_projected(&columns, &all_granules(&file), |batch| {
+        presence_rows(&file, &batch, &mut plain);
+        Ok(())
+    })
+    .unwrap();
+    assert!(
+        plain.iter().all(|(_, held)| held.iter().all(|&h| h)),
+        "every row holds every column"
+    );
+    let mut redacted = Vec::new();
+    file.scan_projected_redacted(&columns, &all_granules(&file), Some(&hidden), |batch| {
+        presence_rows(&file, &batch, &mut redacted);
+        Ok(())
+    })
+    .unwrap();
+    let mut serial = Vec::new();
+    file.scan_projected_serial_live_redacted(
+        &columns,
+        &all_granules(&file),
+        &crate::deletes::DeletionVector::new(),
+        Some(&hidden),
+        |batch, _| {
+            presence_rows(&file, &batch, &mut serial);
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(redacted, serial);
+    assert_eq!(redacted.len(), 40);
+    for (ordinal, held) in &redacted {
+        let masked = [3, 20, 39].contains(ordinal);
+        assert_eq!(held, &vec![true, !masked, !masked], "row {ordinal}");
+    }
+    // A redaction of another field leaves these columns alone, and `None` is a plain scan.
+    let other = redactions(&["note"], &[3]);
+    let mut untouched = Vec::new();
+    file.scan_projected_redacted(&columns, &all_granules(&file), Some(&other), |batch| {
+        presence_rows(&file, &batch, &mut untouched);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(untouched, plain);
+}
+
+#[test]
+fn selective_scans_and_queries_never_match_or_return_a_redacted_value() {
+    let file = file(40, 16);
+    let amount = shredded_column(&file, "amount");
+    let columns = [column_ids::OCCURRED_AT, amount];
+    let hidden = redactions(&["amount"], &[5, 30]);
+    // Keep rows whose amount is present: the redacted rows read as null, so the filter drops them.
+    let run = |redactions: Option<&FieldRedactions>| {
+        let request = ScanRequest {
+            redactions,
+            ..ScanRequest::default()
+        };
+        let mut rows = Vec::new();
+        file.scan_selective(
+            &columns,
+            &all_granules(&file),
+            &request,
+            |batch, row| batch.columns.get(1).is_some_and(|column| holds_value(column, row)),
+            |selected| {
+                rows.extend(
+                    selected
+                        .rows
+                        .iter()
+                        .map(|row| selected.first_row_ordinal + u64::from(row)),
+                );
+                Ok(())
+            },
+        )
+        .unwrap();
+        rows
+    };
+    assert_eq!(run(None), (0..40).collect::<Vec<u64>>());
+    assert_eq!(
+        run(Some(&hidden)),
+        (0..40).filter(|row| ![5, 30].contains(row)).collect::<Vec<u64>>()
+    );
+
+    // A planned query hands its sink batches with the redacted values already nulled.
+    let everything = plan_query(
+        ExprQuery::from(Query {
+            answerable_from_aggregate: false,
+            filter: Filter::default(),
+        }),
+        &GranuleStatistics::default(),
+    );
+    let inputs = QueryInputs {
+        redactions: Some(&hidden),
+        ..QueryInputs::default()
+    };
+    let mut seen = Vec::new();
+    file.execute_query(
+        &everything,
+        &columns,
+        &all_granules(&file),
+        &inputs,
+        |_, _, _| true,
+        |selected| {
+            presence_rows(&file, &selected.batch, &mut seen);
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(seen.len(), 40);
+    for (ordinal, held) in seen {
+        assert_eq!(held[1], ![5, 30].contains(&ordinal), "row {ordinal}");
+    }
+}
