@@ -4,7 +4,7 @@ Compares OE with Parquet, Vortex and JSON on the same events, including the thin
 store (latest messages in a room, threads, lookup by event id, redaction, durable ingest). Results are in
 `results/results.md` (tables) and `results/results.json` (raw numbers).
 
-Run it from this directory:
+Run it with `just bench-compare` from the repository root (see the `Justfile`), or from this directory:
 
 ```bash
 cargo run --release -- --sizes 10000,100000,1000000 --reps 5 --write-reps 3 --out results
