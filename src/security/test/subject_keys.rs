@@ -141,3 +141,44 @@ fn the_backlog_tracks_unresolved_resolved_and_rekeyed_events() {
     reopened.mark_rekeyed(b).unwrap();
     assert_eq!(backlog.pending().unwrap().len(), 1);
 }
+
+#[test]
+fn retargeting_the_backlog_moves_a_replaced_files_entries_and_keeps_their_subjects() {
+    let dir = tempfile::tempdir().unwrap();
+    let backlog = FileErasureBacklog::open(dir.path().join("backlog.log"));
+    let (a, b, c) = (
+        EventId::new_test_id(1),
+        EventId::new_test_id(2),
+        EventId::new_test_id(3),
+    );
+    let subject = SubjectId::new_test_id(9);
+    backlog.record_unresolved(10, a).unwrap();
+    backlog.record_unresolved(11, b).unwrap();
+    backlog.resolve(a, subject).unwrap();
+    backlog.retarget(10, 20).unwrap();
+    // An entry recorded after the retarget is not moved by it.
+    backlog.record_unresolved(10, c).unwrap();
+    let pending = FileErasureBacklog::open(dir.path().join("backlog.log"))
+        .pending()
+        .unwrap();
+    assert_eq!(
+        pending,
+        vec![
+            BacklogEntry {
+                event_id: a,
+                file_id: 20,
+                subject: Some(subject)
+            },
+            BacklogEntry {
+                event_id: b,
+                file_id: 11,
+                subject: None
+            },
+            BacklogEntry {
+                event_id: c,
+                file_id: 10,
+                subject: None
+            },
+        ]
+    );
+}

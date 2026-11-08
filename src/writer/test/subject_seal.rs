@@ -68,6 +68,7 @@ fn config() -> OeBuildConfig {
         targets: LayoutTargets::default(),
         tenant_id: tenant(),
         time_series_bucket_nanos: None,
+        delivery_lineage: false,
     }
 }
 

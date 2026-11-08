@@ -86,6 +86,7 @@ pub(crate) fn build_config() -> OeBuildConfig {
         targets: LayoutTargets::default(),
         tenant_id: tenant(),
         time_series_bucket_nanos: None,
+        delivery_lineage: false,
     }
 }
 
@@ -281,11 +282,19 @@ fn compaction_drops_rows_removed_by_saved_deletion_vectors() {
     let (head_id, mut head) = published.head().unwrap();
     head.generation = head_id + 1;
     head.footer_mirror = None;
-    assert!(head.publish_deletions(first.file_id, &{
-        let mut vector = crate::deletes::DeletionVector::new();
-        vector.mark_deleted(1);
-        vector
-    }, None).unwrap().is_some());
+    assert!(
+        head.publish_deletions(
+            first.file_id,
+            &{
+                let mut vector = crate::deletes::DeletionVector::new();
+                vector.mark_deleted(1);
+                vector
+            },
+            None
+        )
+        .unwrap()
+        .is_some()
+    );
     published.put_generation(head).unwrap();
     published.advance_head(head_id, head_id + 1).unwrap();
 
@@ -305,4 +314,161 @@ fn compaction_drops_rows_removed_by_saved_deletion_vectors() {
     .unwrap();
     let merged = OeFile::open(output.file_bytes.clone(), Some(&output.entry.file_seal)).unwrap();
     assert_eq!(read_event_rows(&merged).unwrap(), rows_of([1, 3, 4, 5]));
+}
+
+// --- Every column kind the builder writes from a row reads back and rebuilds identically -----------------------------
+
+use crate::events::provenance::{SignatureScheme, SignedEventProvenance};
+use crate::events::relationships::{EventRelationships, RelationshipKind, RelationshipRef};
+
+/// Row `i` carrying every optional column family: provenance on even rows, relationships of every kind on rows
+/// divisible by three (declared in the order the file stores them), and delivery lineage on all but every fourth row.
+pub(crate) fn rich_row(i: u64) -> OeRow {
+    let mut row = rows_of([i]).remove(0);
+    if i.is_multiple_of(2) {
+        row.event.provenance = Some(SignedEventProvenance {
+            author_pubkey: [i as u8; 32],
+            claimed_at: TimestampValue::from_physical_nanos(5_000 + i as i64),
+            protocol_event_id: [0xA0 ^ i as u8; 32],
+            protocol_kind: 1 + i as u32,
+            scheme: if i.is_multiple_of(4) {
+                SignatureScheme::Ed25519
+            } else {
+                SignatureScheme::Bip340SchnorrSecp256k1
+            },
+            signature: [0x5A ^ i as u8; 64],
+        });
+    }
+    if i.is_multiple_of(3) {
+        let refs = RelationshipKind::ALL
+            .into_iter()
+            .flat_map(|kind| {
+                let repeat = if matches!(kind, RelationshipKind::Parent | RelationshipKind::Root) {
+                    1
+                } else {
+                    2
+                };
+                (0..repeat).map(move |n| RelationshipRef::to_event(kind, 0x1000 + u128::from(i) * 10 + n))
+            })
+            .collect();
+        row.event.relationships = Some(EventRelationships::new(refs).unwrap());
+    }
+    if !i.is_multiple_of(4) {
+        row.event.connector_delivery_hash_high = 0xFEED_0000 + i;
+        row.event.connector_delivery_hash_low = u64::MAX - i;
+        row.event.source_schema = (i % 2 == 1).then(|| format!("protobuf:sha256:{i:04x}"));
+        row.event.source_delivery = Some(format!("delivery-{i}"));
+    } else {
+        row.event.connector_delivery_hash_low = 0;
+        row.event.connector_delivery_hash_high = 0;
+    }
+    row
+}
+
+fn lineage_config() -> OeBuildConfig {
+    OeBuildConfig {
+        delivery_lineage: true,
+        targets: LayoutTargets {
+            index_granularity: 3,
+            ..LayoutTargets::default()
+        },
+        ..build_config()
+    }
+}
+
+fn open_built(built: &BuiltOe) -> OeFile {
+    OeFile::open(built.bytes.clone(), Some(&built.file_seal)).unwrap()
+}
+
+#[test]
+fn every_event_column_kind_round_trips_through_read_event_rows_and_a_rebuild() {
+    let rows: Vec<OeRow> = (1..=13).map(rich_row).collect();
+    let built = build_oe_file(rows.clone(), &lineage_config()).unwrap();
+    assert!(built.footer.granules.len() > 1, "rows span several granules");
+    assert_ne!(
+        built.footer.optional_feature_flags & crate::layout::optional_features::DELIVERY_LINEAGE,
+        0
+    );
+    let read = read_event_rows(&open_built(&built)).unwrap();
+    assert_eq!(read, rows);
+
+    let rebuilt = build_oe_file(read, &lineage_config()).unwrap();
+    assert_eq!(read_event_rows(&open_built(&rebuilt)).unwrap(), rows);
+    assert_eq!(rebuilt.footer.columns, built.footer.columns);
+}
+
+#[test]
+fn delivery_lineage_is_stored_only_when_the_build_opts_in() {
+    let rows: Vec<OeRow> = (1..=5).map(rich_row).collect();
+    let built = build_oe_file(rows.clone(), &build_config()).unwrap();
+    assert_eq!(
+        built.footer.optional_feature_flags & crate::layout::optional_features::DELIVERY_LINEAGE,
+        0
+    );
+    assert!(
+        !built
+            .footer
+            .columns
+            .iter()
+            .any(|column| { crate::writer::source_form::is_lineage_column(column.column_id) })
+    );
+    let read = read_event_rows(&open_built(&built)).unwrap();
+    for (read, original) in read.iter().zip(&rows) {
+        assert_eq!(read.event.connector_delivery_hash_low, 0);
+        assert_eq!(read.event.source_delivery, None);
+        assert_eq!(read.event.provenance, original.event.provenance);
+        assert_eq!(read.event.relationships, original.event.relationships);
+    }
+}
+
+#[test]
+fn source_form_round_trips_through_read_build_rows_and_is_refused_as_event_rows() {
+    use crate::writer::build::{BuildInput, BuildRow};
+    let mut rows: Vec<BuildRow> = OeRow::into_build_rows((1..=7).map(rich_row).collect());
+    for (index, row) in rows.iter_mut().enumerate() {
+        if index % 2 == 0 {
+            row.external_id = Some(format!("${index}:example.org").into_bytes());
+        }
+        if index % 3 == 0 {
+            row.raw_payload = Some(format!("{{\"n\":{index}}}").into_bytes());
+        }
+    }
+    let built = build_oe_file(rows.clone(), &lineage_config()).unwrap();
+    let file = open_built(&built);
+    let read = read_build_rows(&file).unwrap();
+    assert_eq!(read, rows);
+    assert!(matches!(read_event_rows(&file), Err(FormatError::Structural { .. })));
+
+    let rebuilt = build_oe_file(read, &lineage_config()).unwrap();
+    assert_eq!(read_build_rows(&open_built(&rebuilt)).unwrap(), rows);
+    assert_eq!(rebuilt.footer.external_ids, built.footer.external_ids);
+}
+
+#[test]
+fn compaction_carries_provenance_relationships_and_lineage_over() {
+    let objects = SimObjectStore::new();
+    let mut published = SimulatedPublishedSet::new();
+    let first = build_oe_file((1..=4).map(rich_row).collect::<Vec<_>>(), &lineage_config()).unwrap();
+    let second = build_oe_file((5..=9).map(rich_row).collect::<Vec<_>>(), &lineage_config()).unwrap();
+    publish_built(&first, 1, 4, &mut published, &objects);
+    publish_built(&second, 5, 9, &mut published, &objects);
+    let job = CompactionJob {
+        expected_output_bytes: 0,
+        file_ids: vec![first.file_id, second.file_id],
+    };
+    let output = execute_compaction(
+        &mut OePublisher::default(),
+        &job,
+        &lineage_config(),
+        &mut published,
+        &objects,
+        &mut NoopPeerNotices::default(),
+        &FixedClock::at(START_NANOS),
+    )
+    .unwrap();
+    let merged = OeFile::open(output.file_bytes, Some(&output.entry.file_seal)).unwrap();
+    assert_eq!(
+        read_event_rows(&merged).unwrap(),
+        (1..=9).map(rich_row).collect::<Vec<_>>()
+    );
 }

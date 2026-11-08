@@ -99,6 +99,7 @@ fn config(index_granularity: usize) -> OeBuildConfig {
         },
         tenant_id: TenantId::new_test_id(TENANT),
         time_series_bucket_nanos: None,
+        delivery_lineage: false,
     }
 }
 

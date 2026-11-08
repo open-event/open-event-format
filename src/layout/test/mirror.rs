@@ -31,6 +31,7 @@ fn config(tenant: u128) -> OeBuildConfig {
         targets: LayoutTargets::default(),
         tenant_id: TenantId::new_test_id(tenant),
         time_series_bucket_nanos: None,
+        delivery_lineage: false,
     }
 }
 

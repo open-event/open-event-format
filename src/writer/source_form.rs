@@ -46,14 +46,31 @@ impl SourceFormIndexes {
 
 /// The source-form columns a file declares: for a fresh build, each column some row carries a value for; for a sparse
 /// update, the ones its source declares, since the update borrows those blocks unchanged.
-pub(crate) fn carried_columns(source: Option<&Footer>, rows: &[BuildRow]) -> Vec<&'static ColumnSpec> {
+///
+/// The delivery-lineage columns count only when `delivery_lineage` is set: a build that does not opt in stores none.
+pub(crate) fn carried_columns(
+    source: Option<&Footer>,
+    rows: &[BuildRow],
+    delivery_lineage: bool,
+) -> Vec<&'static ColumnSpec> {
     SOURCE_FORM_COLUMNS
         .iter()
         .filter(|spec| match source {
             Some(footer) => footer.columns.iter().any(|column| column.column_id == spec.column_id),
-            None => rows.iter().any(|row| carries(row, spec.column_id)),
+            None => {
+                (delivery_lineage || !is_lineage_column(spec.column_id))
+                    && rows.iter().any(|row| carries(row, spec.column_id))
+            }
         })
         .collect()
+}
+
+/// Whether `column_id` is one of the delivery-lineage columns.
+pub(crate) fn is_lineage_column(column_id: u32) -> bool {
+    matches!(
+        column_id,
+        column_ids::SOURCE_SCHEMA | column_ids::SOURCE_DELIVERY | column_ids::CONNECTOR_DELIVERY_HASH
+    )
 }
 
 /// Everything a fresh build stores for the events' original form: each granule's blocks of the `carried` columns, in
@@ -88,6 +105,17 @@ fn carries(row: &BuildRow, column_id: u32) -> bool {
     match column_id {
         column_ids::EXTERNAL_ID => row.external_id.is_some(),
         column_ids::RAW_PAYLOAD => row.raw_payload.is_some(),
+        column_ids::SOURCE_SCHEMA => row
+            .delivery
+            .as_ref()
+            .is_some_and(|lineage| lineage.source_schema.is_some()),
+        column_ids::SOURCE_DELIVERY => row
+            .delivery
+            .as_ref()
+            .is_some_and(|lineage| lineage.source_delivery.is_some()),
+        column_ids::CONNECTOR_DELIVERY_HASH => row.delivery.as_ref().is_some_and(|lineage| {
+            lineage.connector_delivery_hash_high != 0 || lineage.connector_delivery_hash_low != 0
+        }),
         _ => false,
     }
 }
@@ -101,6 +129,14 @@ fn stored_text(row: &BuildRow, column_id: u32) -> Result<Option<&str>, FormatErr
             }
             None => None,
         },
+        column_ids::SOURCE_SCHEMA => row
+            .delivery
+            .as_ref()
+            .and_then(|lineage| lineage.source_schema.as_deref()),
+        column_ids::SOURCE_DELIVERY => row
+            .delivery
+            .as_ref()
+            .and_then(|lineage| lineage.source_delivery.as_deref()),
         _ => None,
     })
 }
@@ -123,6 +159,22 @@ fn column_block(rows: &[BuildRow], column_id: u32) -> Result<SourceFormBlock, Fo
                 *byte |= 1 << (index % 8);
             }
             values.push(Some(&scratch));
+        }
+        return Ok((column_id, presence, ColumnData::Strings(values)));
+    }
+    if column_id == column_ids::CONNECTOR_DELIVERY_HASH {
+        for (index, row) in rows.iter().enumerate() {
+            let Some(lineage) = row.delivery.as_ref().filter(|_| carries(row, column_id)) else {
+                continue;
+            };
+            if let Some(byte) = presence.get_mut(index / 8) {
+                *byte |= 1 << (index % 8);
+            }
+            let hex = format!(
+                "{:016x}{:016x}",
+                lineage.connector_delivery_hash_high, lineage.connector_delivery_hash_low
+            );
+            values.push(Some(&hex));
         }
         return Ok((column_id, presence, ColumnData::Strings(values)));
     }

@@ -97,6 +97,7 @@ fn file(rows: u64, rows_per_granule: usize) -> OeFile {
         },
         tenant_id: TenantId::new_test_id(3),
         time_series_bucket_nanos: None,
+        delivery_lineage: false,
     };
     let built = build_oe_file((0..rows).map(row).collect(), &config).unwrap();
     OeFile::open(built.bytes, Some(&built.file_seal)).unwrap()

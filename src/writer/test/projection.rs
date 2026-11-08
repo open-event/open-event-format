@@ -101,6 +101,7 @@ fn config(generation_id: u64) -> OeBuildConfig {
         },
         tenant_id: tenant(),
         time_series_bucket_nanos: None,
+        delivery_lineage: false,
     }
 }
 

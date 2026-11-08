@@ -247,6 +247,9 @@ pub struct BuildEnvelope {
 /// A caller producing rows in this shape hands the build nothing to convert; [`OeRow`]s are converted on the way in.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BuildRow {
+    /// The connector delivery lineage the journal carried for this event, or `None` when it carried none. Stored only
+    /// by a build whose [`OeBuildConfig::delivery_lineage`] is set; ignored otherwise.
+    pub delivery: Option<Box<DeliveryLineage>>,
     pub envelope: BuildEnvelope,
     pub epoch: u64,
     /// The event's own protocol id (a protocol `$...` id, say), 1 to 255 bytes, for streams whose tenant declares one.
@@ -267,6 +270,29 @@ pub struct BuildRow {
     /// [`seal_subject_rows`](crate::writer::subject_seal::seal_subject_rows) before the build, which refuses it
     /// otherwise.
     pub subject: Option<SubjectId>,
+}
+
+/// The connector delivery lineage of one event: journal metadata no query reads, kept in a file only when its build
+/// opts in with [`OeBuildConfig::delivery_lineage`], so a compaction can carry it over byte for byte.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeliveryLineage {
+    pub connector_delivery_hash_high: u64,
+    pub connector_delivery_hash_low: u64,
+    pub source_delivery: Option<String>,
+    pub source_schema: Option<String>,
+}
+
+impl DeliveryLineage {
+    /// The lineage `event` carries, or `None` when it carries none (a zero hash and no strings).
+    pub fn of(event: &EventInput) -> Option<Box<Self>> {
+        let lineage = Self {
+            connector_delivery_hash_high: event.connector_delivery_hash_high,
+            connector_delivery_hash_low: event.connector_delivery_hash_low,
+            source_delivery: event.source_delivery.clone(),
+            source_schema: event.source_schema.clone(),
+        };
+        (lineage != Self::default()).then(|| Box::new(lineage))
+    }
 }
 
 /// A row shape a build takes: [`BuildRow`] as it is, or [`OeRow`] converted on the way in.
@@ -332,6 +358,7 @@ impl SharedStrings {
     /// One event row in the writer's shape, its strings shared through this set.
     pub fn build_row(&mut self, row: OeRow) -> BuildRow {
         let OeRow { epoch, event, sequence } = row;
+        let delivery = DeliveryLineage::of(&event);
         let EventInput {
             envelope,
             payload,
@@ -340,6 +367,7 @@ impl SharedStrings {
             ..
         } = event;
         BuildRow {
+            delivery,
             envelope: BuildEnvelope {
                 account_id: envelope.account_id,
                 account_id_hash_low: envelope.account_id_hash_low,
@@ -490,6 +518,11 @@ pub struct OeBuildConfig {
     /// The width of a [`Profile::TimeSeries`] file's rollup buckets, in nanoseconds of `occurred_at`; `None` uses
     /// [`DEFAULT_TIME_SERIES_BUCKET_NANOS`]. Refused with any other profile, and when not positive.
     pub time_series_bucket_nanos: Option<i64>,
+    /// Keep each row's connector delivery lineage (source schema, source delivery, connector delivery hash) in
+    /// internal source-form columns and declare
+    /// [`DELIVERY_LINEAGE`](crate::layout::optional_features::DELIVERY_LINEAGE), so a compaction reads it back. Off by
+    /// default: the lineage is journal metadata, and a file that does not keep it stores nothing for it.
+    pub delivery_lineage: bool,
 }
 
 /// Granules per replay segment: the first granule of each segment runs full encoding selection and later granules of
@@ -2346,6 +2379,7 @@ fn plan_source_update<'a>(
                 rule: "a stored schema version fits in u32",
             })?;
             rows.push(BuildRow {
+                delivery: None,
                 envelope: BuildEnvelope {
                     account_id: None,
                     account_id_hash_low: 0,
@@ -3233,7 +3267,8 @@ fn build_oe_file_sealed_in_order(
         }
     }
     // The original-form columns follow the same absence rule, column by column.
-    let source_form_columns = source_form::carried_columns(source.map(|source| &source.footer), &rows);
+    let source_form_columns =
+        source_form::carried_columns(source.map(|source| &source.footer), &rows, config.delivery_lineage);
     columns.extend(source_form_columns.iter().map(|spec| ColumnDescriptor {
         column_id: spec.column_id,
         name: spec.name.to_owned(),
@@ -5169,6 +5204,12 @@ fn build_oe_file_sealed_in_order(
     }
     if time_series_rollups.is_some() {
         optional_flags |= optional_features::TIME_SERIES_ROLLUPS;
+    }
+    if columns
+        .iter()
+        .any(|column| source_form::is_lineage_column(column.column_id))
+    {
+        optional_flags |= optional_features::DELIVERY_LINEAGE;
     }
 
     // Schema fingerprint over the column directory.

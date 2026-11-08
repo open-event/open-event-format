@@ -70,6 +70,7 @@ fn build_config() -> OeBuildConfig {
         targets: LayoutTargets::default(),
         tenant_id: TenantId::new_test_id(9),
         time_series_bucket_nanos: None,
+        delivery_lineage: false,
     }
 }
 

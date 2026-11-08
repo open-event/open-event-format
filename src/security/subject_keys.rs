@@ -49,6 +49,7 @@ const BACKLOG_RECORD_LEN: usize = 33;
 const BACKLOG_PENDING: u8 = 1;
 const BACKLOG_RESOLVED: u8 = 2;
 const BACKLOG_REKEYED: u8 = 3;
+const BACKLOG_RETARGETED: u8 = 4;
 
 fn io(op: &'static str) -> impl Fn(std::io::Error) -> StorageError {
     move |error| StorageError::Io {
@@ -491,6 +492,13 @@ impl FileErasureBacklog {
         self.append(BACKLOG_REKEYED, event_id.uuid().as_u128(), 0)
     }
 
+    /// Records that file `from_file` was replaced by `to_file` (a compaction merged it, say), so every event still
+    /// waiting in `from_file` is now found in `to_file`. Entries keep their resolved subjects; entries recorded later
+    /// are not affected.
+    pub fn retarget(&self, from_file: u128, to_file: u128) -> Result<(), StorageError> {
+        self.append(BACKLOG_RETARGETED, from_file, to_file)
+    }
+
     /// Every event still waiting, in the order it was recorded.
     pub fn pending(&self) -> Result<Vec<BacklogEntry>, StorageError> {
         let mut order = Vec::new();
@@ -522,6 +530,11 @@ impl FileErasureBacklog {
                 }
                 BACKLOG_REKEYED => {
                     entries.remove(&first);
+                }
+                BACKLOG_RETARGETED => {
+                    for entry in entries.values_mut().filter(|entry| entry.file_id == first) {
+                        entry.file_id = second;
+                    }
                 }
                 _ => return Err(corrupt("read erasure backlog", "unknown record tag")),
             }

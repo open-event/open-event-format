@@ -599,6 +599,7 @@ fn indexed_config() -> OeBuildConfig {
         },
         tenant_id: TenantId::new_test_id(7),
         time_series_bucket_nanos: None,
+        delivery_lineage: false,
     }
 }
 
