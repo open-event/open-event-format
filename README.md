@@ -23,32 +23,18 @@ OE is the storage engine for events. Events first land in **OEJ**, an append-onl
 - **Integrity end to end**: CRC-64/NVMe and BLAKE3 checksums, optional proof trees, and authenticated (sealed) footers. A reader verifies on open, or opens lazily and verifies what it touches.
 - **Erasure and isolation**: Crypto-shredding, subject-sealed payloads, and encrypted footers for data that has to be forgettable.
 
-### Use cases
+## Use cases
 
 - **Chat and messaging history**: busy rooms, threads, edits, reactions and redactions in one file
 - **Audit logs**: tamper-evident, append-only records with sealed footers
 - **Telemetry and product analytics**: numeric and text payloads scanned column by column
 - **Agent and session transcripts**: one durable stream per session, queryable after the fact
 
-### Why a new format?
+## Why a new format?
 
 Parquet and Vortex are excellent general analytical formats, but an event store asks for more than scans: append with a durable acknowledgement, find one event by its id, follow a thread, remove a single message for a GDPR request, and prove the file was not tampered with. General formats cannot append, cannot remove rows in place, and do not verify content on open.
 
 OE keeps the columnar layout and modern encodings (FSST, bit-packing, dictionaries, RLE, XOR floats, zstd and LZ4) and adds the envelope, indexes, deletion vectors and integrity an event stream needs. The cost is size: OE stores every envelope column, skip index and checksum, so its files are larger than Parquet's.
-
-
-## Getting Started
-
-```bash
-# It is not yet published to crates.io
-git clone https://github.com/open-event/open-event-format.git
-
-# Run tests
-cd open-event-format && cargo test --all-features
-
-# Run benchmarks
-cd benchmark && cargo run --release -- --sizes 10000,100000,1000000 --reps 5 --write-reps 3 --out results
-```
 
 ## How OE compares
 
@@ -76,6 +62,19 @@ cd benchmark && cargo run --release -- --sizes 10000,100000,1000000 --reps 5 --w
 - **Security**: Encrypted footers, subject-sealed payloads and crypto-shredding with ChaCha20-Poly1305 and AES-GCM.
 - **Arrow-friendly**: Column data maps onto Arrow arrays for the query engine that embeds OE.
 - **Hardened**: `unsafe` is denied outside one documented FSST call site, `unwrap`/`panic`/indexing are denied by Clippy, and every file structure has a fuzz target.
+
+## Getting Started
+
+```bash
+# It is not yet published to crates.io
+git clone https://github.com/open-event/open-event-format.git
+
+# Run tests
+cd open-event-format && cargo test --all-features
+
+# Run benchmarks
+cd benchmark && cargo run --release -- --sizes 10000,100000,1000000 --reps 5 --write-reps 3 --out results
+```
 
 ## FAQ
 
