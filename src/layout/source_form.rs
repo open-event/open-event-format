@@ -8,7 +8,7 @@ use super::footer::{Footer, GranuleEntry};
 use super::reader::{ColumnRead, OeFile};
 use crate::columns::column_ids;
 use crate::encoding::ColumnData;
-use crate::error::{FormatError, ProvenanceError};
+use crate::error::FormatError;
 use crate::indexes::probabilistic::SplitBlockBloomFilter;
 use crate::indexes::stable_hash;
 use std::borrow::Cow;

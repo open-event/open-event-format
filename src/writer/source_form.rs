@@ -14,7 +14,7 @@ use crate::columns::{ColumnSpec, SOURCE_FORM_COLUMNS, column_ids};
 use crate::encoding::{ColumnData, StringColumn};
 use crate::error::FormatError;
 use crate::events::constant::EXTERNAL_ID_MAX_BYTES;
-use crate::events::provenance::{SignerSignature, hex_lower_into};
+use crate::events::provenance::hex_lower_into;
 use crate::events::relationships::RelationshipKind;
 use crate::indexes::probabilistic::SplitBlockBloomFilter;
 use crate::indexes::stable_hash;
