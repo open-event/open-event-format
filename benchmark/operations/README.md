@@ -13,7 +13,7 @@ The generated rows are chat traffic: messages, edits, reactions and joins in roo
 conversations, each carrying a message kind, the sending client, a character count, a reaction count (absent on some
 rows) and the message text.
 
-Run it from this directory:
+Run it with `just bench-ops` from the repository root (see the `Justfile`), or from this directory:
 
 ```sh
 cargo run --release --bin oe-vs-parquet -- /tmp/oe-vs-parquet

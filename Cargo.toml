@@ -6,6 +6,10 @@ edition = "2024"
 rust-version = "1.96"
 publish = false
 
+[lib]
+# The library has no benchmarks of its own; without this `cargo bench` builds its unit tests, which need `write`.
+bench = false
+
 [features]
 write = []
 
