@@ -34,6 +34,7 @@ use crate::file::bytes::{Reader, slice};
 use aho_corasick::{AhoCorasick, MatchKind};
 use memchr::memmem::Finder;
 use multiversion::multiversion;
+use std::borrow::Cow;
 use std::sync::Arc;
 
 /// One end of a range filter: the value to compare against, and whether a row equal to that value is itself a match
@@ -626,6 +627,49 @@ fn filter_dictionary(body: &[u8], side: SideStream, predicate: &StringPredicate)
     let mut reader = Reader::new(body);
     let nulls = super::NullStream::read(&mut reader)?;
     let dict_count = reader.u32("dictionary count")? as usize;
+    if let StringPredicate::Equals(needle) = predicate {
+        // A point lookup needs only the one entry equal to the needle: compared as bytes (compressed under the
+        // block's own symbol table when the entries are FSST), never decoded or UTF-8-validated entry by entry.
+        let term: Cow<'_, [u8]> = if side == SideStream::FsstDictionaryValues {
+            let encoder = super::FsstDecodeTable::read(&mut reader)?.needle_encoder();
+            Cow::Owned(encoder.compress(needle.as_bytes()))
+        } else {
+            Cow::Borrowed(needle.as_bytes())
+        };
+        // The offset table is walked in place, one `u32` per boundary, so a lookup allocates nothing for it.
+        let table = reader.take(dict_count.saturating_add(1).saturating_mul(4), "string offset")?;
+        let (entries, _) = table.as_chunks::<4>();
+        let data_len = entries.last().map_or(0, |entry| u32::from_le_bytes(*entry) as usize);
+        let data = reader.take(data_len, "dictionary data")?;
+        let want = term.len();
+        let mut code = None;
+        let mut start = entries.first().map_or(0, |entry| u32::from_le_bytes(*entry) as usize);
+        for (index, entry) in entries.iter().skip(1).enumerate() {
+            let end = u32::from_le_bytes(*entry) as usize;
+            if end < start {
+                return Err(FormatError::Structural {
+                    rule: "dictionary offsets must be non-decreasing",
+                });
+            }
+            // Entries are distinct (and plain ones sorted), so the first hit is the only one.
+            if end - start == want && data.get(start..end).is_some_and(|value| value == &*term) {
+                code = Some(index as u64);
+                break;
+            }
+            start = end;
+        }
+        let stream = read_packed_stream(&mut reader)?;
+        let present = match code {
+            None => vec![false; stream.count],
+            Some(code) => {
+                let mut present = vec![false; stream.padded_count()];
+                stream.unpack_into(&mut present, |value| value == code);
+                present.truncate(stream.count);
+                present
+            }
+        };
+        return weave_present(&nulls, present);
+    }
     let owned: Vec<String>;
     let mut dictionary: Vec<&str> = Vec::with_capacity(reader.capacity_hint(dict_count, 1));
     if side == SideStream::FsstDictionaryValues {
