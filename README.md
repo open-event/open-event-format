@@ -17,11 +17,14 @@
 
 OE is the storage engine for events. Events first land in **OEJ**, an append-only journal that is the durable record, then get packed into **OE** files: immutable, self-describing column files for analytical queries. Everything is checksummed end to end, so corruption is always caught and never served.
 
-- **Built for events, not generic tables**: Every file carries a full event envelope (ids, streams, tenants, sequence numbers, timestamps, relationships) next to a schemaless variant payload.
-- **Point lookups without a database**: Granule filters by time window and entity hash, an external-id index, and thread (root reference) lookups answer "latest 50 in this room" or "this event by id" without scanning.
-- **Redaction without rewrites**: Removing an event records a deletion vector of a few bytes instead of rewriting the file.
-- **Integrity end to end**: CRC-64/NVMe and BLAKE3 checksums, optional proof trees, and authenticated (sealed) footers. A reader verifies on open, or opens lazily and verifies what it touches.
-- **Erasure and isolation**: Crypto-shredding, subject-sealed payloads, and encrypted footers for data that has to be forgettable.
+- **Built for events, not generic tables**: Every file carries a full event envelope (ids, streams, tenants, sequence numbers, timestamps, relationships) next to a schemaless variant payload, with vector columns for embeddings stored alongside events.
+- **Durable journal**: OEJ writes append-only frames, each acknowledged only after sync. 172,879 events/s at 128-event batches with a 1.322 ms p99 ack.
+- **Columnar files**: Stripes, granules and projections with per-column encodings chosen per block. Column data maps onto Arrow arrays for the query engine that embeds OE.
+- **Point lookups without a database**: Time-window and entity-hash granule filters, an external-id index, thread (root reference) lookups, IN-list pruning and boolean (AND/OR) filter planning on encoded blocks answer "latest 50 in this room" or "this event by id" without scanning.
+- **Redaction without rewrites**: Removing an event records a deletion vector of a few bytes instead of rewriting the file. Corrections and splice rewrites reuse untouched granules.
+- **Integrity end to end**: CRC-64/NVMe and BLAKE3 checksums, optional BLAKE3 proof trees, and Ed25519-signed seals. A reader verifies on open, or opens lazily and verifies what it touches.
+- **Erasure and isolation**: Crypto-shredding, subject-sealed payloads and encrypted footers with ChaCha20-Poly1305 and AES-GCM, for data that has to be forgettable.
+- **Hardened**: `unsafe` is denied outside one documented FSST call site, `unwrap`/`panic`/indexing are denied by Clippy, and every file structure has a fuzz target.
 
 <br/>
 
@@ -52,20 +55,6 @@ For comparison across a million chat events, single thread, file held in memory:
 | Redact 1% of events | **12.87 ms, 160,005 bytes** | 2,145.08 ms, 37,167,023 bytes | 2,916.68 ms, 47,241,092 bytes |
 | Size per event | 95.5 bytes | **37.7 bytes** | 48.1 bytes |
 | Write | 4,246 ms | **1,188 ms** | 2,180 ms |
-
-<br/>
-
-## Features
-
-- **OEJ journal**: Append-only frames, each acknowledged only after sync. 172,879 events/s at 128-event batches with a 1.322 ms p99 ack.
-- **Columnar OE files**: Stripes, granules and projections with per-column encodings chosen per block.
-- **Skip indexes**: Time-window and entity-hash granule filters, external-id index, thread references, IN-list pruning, and boolean (AND/OR) filter planning on encoded blocks.
-- **Deletes & corrections**: Deletion vectors, corrections and splice rewrites that reuse untouched granules.
-- **Vector columns**: Embeddings stored alongside events.
-- **Integrity**: End-to-end CRC-64/NVMe, BLAKE3 proof trees, Ed25519-signed seals, and verification on open.
-- **Security**: Encrypted footers, subject-sealed payloads and crypto-shredding with ChaCha20-Poly1305 and AES-GCM.
-- **Arrow-friendly**: Column data maps onto Arrow arrays for the query engine that embeds OE.
-- **Hardened**: `unsafe` is denied outside one documented FSST call site, `unwrap`/`panic`/indexing are denied by Clippy, and every file structure has a fuzz target.
 
 <br/>
 
