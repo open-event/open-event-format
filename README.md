@@ -78,14 +78,6 @@ cd open-event-format && cargo test --all-features
 cd benchmark && cargo run --release -- --sizes 10000,100000,1000000 --reps 5 --write-reps 3 --out results
 ```
 
-### Use with your coding agent
-
-Paste this prompt into Claude Code, Cursor, Codex, or any coding agent:
-
-```text
-Read openspec/specs in open-event/open-event-format, then help me store my event stream in OE files.
-```
-
 ## How OE compares
 
 1,000,000 chat events, single thread, file held in memory. All times in milliseconds (median of 5 runs).
