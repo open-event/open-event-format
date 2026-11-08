@@ -4638,8 +4638,9 @@ fn encode_chosen_form(
         // A trailing stage would exceed the declared maximum cascade depth, so it is not added — however well it
         // would have sampled.
         (Compression::None, body)
-    } else if transform == Transform::FsstString {
-        // Kept only when it at least halves the block: see `FSST_TRAILING_MAX_RATIO_NUM`.
+    } else if matches!(transform, Transform::FsstString | Transform::DeltaBitpack | Transform::ForBitpack) {
+        // Kept only when it at least halves the block: see `FSST_TRAILING_MAX_RATIO_NUM`. These transforms are already
+        // compact and answer filters straight from their bytes, which a trailing codec would force a reader to unpack.
         let fallback = body.clone();
         let (compression, bytes) = match replay_trailing {
             Some(captured) => apply_captured_trailing(body, captured, strategy),

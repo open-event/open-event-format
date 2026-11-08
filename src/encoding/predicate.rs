@@ -715,6 +715,25 @@ fn filter_fsst(body: &[u8], predicate: &StringPredicate) -> Result<Vec<bool>, Fo
     let data = reader.take(data_len, "fsst data")?;
     let mut present = Vec::with_capacity(present_count);
     let mut start = entries.first().map_or(0, |entry| u32::from_le_bytes(*entry) as usize);
+    if let FsstTest::Equals(term) = &test {
+        // The common point lookup: a value can only equal the term when its compressed length does, so most rows are
+        // decided from the offsets alone and only same-length values are compared byte for byte.
+        let want = term.len();
+        let mut monotone = true;
+        for entry in entries.iter().skip(1) {
+            let end = u32::from_le_bytes(*entry) as usize;
+            monotone &= end >= start;
+            let hit = end.wrapping_sub(start) == want && data.get(start..end).is_some_and(|value| value == term.as_slice());
+            present.push(hit);
+            start = end;
+        }
+        if !monotone {
+            return Err(FormatError::Structural {
+                rule: "fsst offsets must be non-decreasing",
+            });
+        }
+        return weave_present(&nulls, present);
+    }
     for entry in entries.iter().skip(1) {
         let end = u32::from_le_bytes(*entry) as usize;
         if end < start {
