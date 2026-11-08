@@ -1,5 +1,5 @@
 use super::super::bitmap::RoaringRangeBitmap;
-use super::super::rank_select::RankSelect;
+use super::super::rank_select::{BitRankDirectory, RankSelect};
 
 fn bitmap(rows: impl IntoIterator<Item = u64>) -> RoaringRangeBitmap {
     RoaringRangeBitmap::from_rows(rows)
@@ -222,5 +222,33 @@ fn from_packed_bits_matches_from_bitmap() {
     for p in 0..=33 {
         assert_eq!(packed.rank(p), oracle.rank(p));
         assert_eq!(packed.select(p), oracle.select(p));
+    }
+}
+
+#[test]
+fn bit_rank_directory_matches_naive_popcount() {
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let bits: Vec<u8> = (0..1300)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        })
+        .collect();
+    let is_set = |row: usize| bits.get(row / 8).is_some_and(|byte| byte & (1 << (row % 8)) != 0);
+    for len in [0usize, 1, 7, 511, 512, 513, 4096, 10_399, 10_400, 20_000] {
+        let directory = BitRankDirectory::new(&bits, len);
+        let covered = len.min(bits.len() * 8);
+        assert_eq!(directory.len(), covered);
+        for position in (0..=covered + 3).step_by(37).chain([covered, 512, 1024]) {
+            let expected = (0..position.min(covered)).filter(|&row| is_set(row)).count() as u64;
+            assert_eq!(directory.rank(position), expected, "len {len} position {position}");
+        }
+        assert_eq!(
+            directory.count_range(100, 700),
+            (100..700.min(covered)).filter(|&row| is_set(row)).count() as u64
+        );
+        assert_eq!(directory.count_range(700, 100), 0);
     }
 }

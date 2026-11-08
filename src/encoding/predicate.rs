@@ -414,6 +414,21 @@ pub fn count_string_block_shared(
             Ok(Some(count_fsst_contains(&body, side, matcher)?))
         }
         (Transform::RawString, StringPredicate::Contains(matcher)) => Ok(Some(count_raw_contains(&body, matcher)?)),
+        // A block-local dictionary counts from its codes alone: one histogram over the codes, then the predicate is
+        // tested once per dictionary entry, with no row-sized mask.
+        (Transform::DictionaryString, _) if side != SideStream::FileScopeDictionary => {
+            let codes = super::lazy::dictionary_codes_from_body(&body, side, None)?;
+            let test = dictionary_code_test(predicate, codes.dictionary());
+            Ok(Some(
+                codes
+                    .code_counts()
+                    .iter()
+                    .enumerate()
+                    .filter(|(code, _)| test.matches(*code as u64))
+                    .map(|(_, count)| *count as usize)
+                    .sum(),
+            ))
+        }
         _ => Ok(
             filter_string_block_shared_with_body(pipeline, &body, predicate, shared)?
                 .map(|mask| mask.into_iter().filter(|matched| *matched).count()),
@@ -1888,6 +1903,30 @@ fn zigzag_lane_range(base: u64, (lo, hi): (i64, i64)) -> Option<PackedLaneRange>
 /// straight into one verdict per row through the runtime-dispatched SIMD kernel — the decoded values are never
 /// materialised. `kind` says how the lanes map to the comparison domain: identity for a `u64` column, zigzag codes for
 /// an `i64` column.
+/// Filters a run-length block from its runs: the predicate is tested once per run and its verdict repeated over the
+/// run's rows, so a block of a few long runs costs a few tests rather than one per row.
+fn filter_rle_block(body: &[u8], predicate: &NumericPredicate, kind: ValueKind) -> Result<Vec<bool>, FormatError> {
+    let mut reader = Reader::new(body);
+    let run_count = reader.u32("rle run count")? as usize;
+    let mut mask = Vec::new();
+    for _ in 0..run_count {
+        let value = reader.u64("rle value")?;
+        let count = reader.u32("rle count")? as usize;
+        if mask.len() + count > super::constant::MAX_RLE_EXPANSION_VALUES {
+            return Err(FormatError::Structural {
+                rule: "rle expansion too large",
+            });
+        }
+        let value = if kind == ValueKind::I64 {
+            i128::from(unzigzag(value))
+        } else {
+            i128::from(value)
+        };
+        mask.extend(std::iter::repeat_n(predicate.matches_i128(value), count));
+    }
+    Ok(mask)
+}
+
 fn filter_for_block(body: &[u8], predicate: &NumericPredicate, kind: ValueKind) -> Result<Vec<bool>, FormatError> {
     let mut reader = Reader::new(body);
     let base = reader.u64("for base")?;
@@ -2091,6 +2130,7 @@ pub fn filter_numeric_block_with_body(
     }
     let mask = match transform {
         Transform::DeltaBitpack => filter_delta_block(body, predicate, kind)?,
+        Transform::Rle => filter_rle_block(body, predicate, kind)?,
         _ => filter_for_block(body, predicate, kind)?,
     };
     Ok(Some(mask))
@@ -2105,8 +2145,10 @@ fn numeric_block_has_fast_path(pipeline: PipelineId) -> Result<bool, FormatError
         return Ok(false);
     }
     Ok(transform == Transform::Decimal128
-        || (matches!(transform, Transform::ForBitpack | Transform::DeltaBitpack)
-            && matches!(kind, ValueKind::U64 | ValueKind::I64)))
+        || (matches!(
+            transform,
+            Transform::ForBitpack | Transform::DeltaBitpack | Transform::Rle
+        ) && matches!(kind, ValueKind::U64 | ValueKind::I64)))
 }
 
 /// Answers a numeric predicate, falling back to a full decode when no compressed-data fast path applies.

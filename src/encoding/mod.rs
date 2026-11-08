@@ -42,6 +42,10 @@ use chimp::{decode_chimp, decode_chimp_range, encode_chimp};
 pub(crate) use presence::{PresenceRank, count_present_before, count_set_bits, present_position};
 use scratch::{with_arena_buffer, with_unpack_buffer};
 use sidecar::{PrefixKey, StringFingerprint};
+pub use lazy::{
+    DictionaryCodes, decode_dictionary_codes, filter_block_by_selection, fsst_uncompressed_len, take_block_rows,
+    take_block_rows_shared,
+};
 pub use string_column::StringColumn;
 
 mod chimp;
@@ -50,6 +54,7 @@ pub mod decompressor;
 pub mod deflate;
 pub mod descriptor;
 pub mod global_dict;
+pub(crate) mod lazy;
 pub mod mini_block_directory;
 pub mod predicate;
 mod presence;
@@ -5307,6 +5312,8 @@ pub fn decode_block_range_shared(
             (ValueKind::String, Transform::RawString) => {
                 Ok(ColumnData::Strings(decode_raw_string_range(body, start, end)?))
             }
+            // A run directory expands only the runs overlapping the range, not the whole block.
+            (kind @ (ValueKind::U64 | ValueKind::I64), Transform::Rle) => lazy::decode_rle_range(body, kind, start, end),
             _ => {
                 debug_assert!(
                     !transform.is_per_value_addressable(),
