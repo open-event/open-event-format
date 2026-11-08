@@ -1,9 +1,11 @@
 //! The real, production versions of the engine's outside-world interfaces that need nothing beyond the operating
 //! system: the actual system clock and the thread-pool encode executor.
 //!
-//! `SystemClock` reads the OS clocks. Production journal storage on disk is a [`JournalStorage`](super::JournalStorage)
-//! implementation over a real block store, supplied by the application that deploys OE, so the engine's state machines
-//! stay synchronous and deterministic (design D4) while that store owns the asynchronous edge internally.
+//! `SystemClock` reads the OS clocks. Production journal storage and catalogue publication on local disk live in
+//! [`super::disk`] ([`FileJournalStorage`](super::disk::FileJournalStorage),
+//! [`FilePublishedSet`](super::disk::FilePublishedSet)); an application may instead supply its own
+//! [`JournalStorage`](super::JournalStorage) over a real block store, so the engine's state machines stay synchronous
+//! and deterministic (design D4) while that store owns any asynchronous edge internally.
 
 use super::constant::{JITTER_XORSHIFT_SHIFT_1, JITTER_XORSHIFT_SHIFT_2, JITTER_XORSHIFT_SHIFT_3};
 use super::{Clock, MonotonicClock};

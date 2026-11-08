@@ -402,6 +402,7 @@ impl OePublisher {
             file_id: built.file_id,
             file_type: FileType::OeFile,
             footer_len: Some(built.footer_len),
+            entity_summary: Some(built.entity_summary.clone()),
             graph_event_id_filter: built
                 .footer
                 .graph
@@ -409,6 +410,7 @@ impl OePublisher {
                 .and_then(|graph| graph.event_ids.as_ref())
                 .map(|index| index.filter.clone()),
             graph_summary: GraphFileSummary::of(&built.footer),
+            deletion_vector: None,
             optional_feature_flags: built.footer.optional_feature_flags,
             part_index: 0,
             part_state,

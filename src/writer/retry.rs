@@ -42,7 +42,8 @@ pub struct RetryReceipt {
 /// The application backs this with durable storage, so receipts survive a restart and the replay guard keeps working
 /// across it. Rows are keyed by `(tenant, delivery identity)`: a connector delivery identity is only unique within one
 /// tenant, so two tenants that happen to share one must never see or overwrite each other's receipts.
-/// `writer::sim::SimSafeRetryStore` is the in-memory version for tests.
+/// `writer::disk::FileSafeRetryStore` is the production local-disk version; `writer::sim::SimSafeRetryStore` is the
+/// in-memory version for tests.
 ///
 /// See: oe-write-path/spec.md
 pub trait SafeRetryStore {

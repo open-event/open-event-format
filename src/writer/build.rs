@@ -506,6 +506,9 @@ pub struct BuiltOe {
     pub aliased_block_bytes: u64,
     /// Number of column blocks encoded by this build. For an update, this excludes blocks borrowed from the source.
     pub encoded_blocks: u64,
+    /// Which entities the file's rows belong to, recorded in its manifest entry so planners skip files without opening
+    /// them.
+    pub entity_summary: crate::indexes::entity_summary::EntitySummary,
     /// Encoded source bytes reused by an update without decoding or re-encoding their column blocks.
     pub reused_source_block_bytes: u64,
     /// Number of source column blocks reused by an update. Zero for an ordinary build or a conservative fallback.
@@ -5429,6 +5432,17 @@ fn build_oe_file_sealed_in_order(
         }
     };
 
+    // A sparse update changes payloads and dedupe hashes only, so every row keeps its entity: the source's summary is
+    // this file's, and `rows` may hold only the rebuilt granules' rows anyway.
+    let entity_summary = match sparse_reuse {
+        Some(reuse) => reuse.source.entity_summary.clone(),
+        None => crate::indexes::entity_summary::EntitySummary::from_keys(rows.iter().map(|row| {
+            crate::indexes::entity_summary::EntityKey::new(
+                row.envelope.entity_id_hash_high,
+                row.envelope.entity_id_hash_low,
+            )
+        })),
+    };
     phase_clock.transition(BuildPhase::RowDestruction);
     // The caller transfers ownership of every payload tree to the build. Releasing a large batch serially was visible
     // on the create/update critical path even after all output bytes were complete; fan the independent tree drops
@@ -5441,6 +5455,7 @@ fn build_oe_file_sealed_in_order(
     Ok(BuiltOe {
         aliased_block_bytes,
         encoded_blocks,
+        entity_summary,
         reused_source_block_bytes,
         reused_source_blocks,
         bytes: file,

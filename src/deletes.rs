@@ -74,6 +74,13 @@ impl DeletionVector {
         self.deleted_runs.splice(first..past, std::iter::once(merged));
     }
 
+    /// Adds every row `other` deletes to this vector, so it deletes the union of both.
+    pub fn union_with(&mut self, other: &DeletionVector) {
+        for run in &other.deleted_runs {
+            self.mark_range(*run);
+        }
+    }
+
     /// Returns true if `ordinal` has been marked deleted.
     ///
     /// Annotated `#[inline]` because the query crate calls this once per row over a granule's ordinals, where a
@@ -241,7 +248,7 @@ pub enum CorrectionType {
 ///
 /// A correction is a new event with this metadata attached; the original event is suppressed via a deletion vector in
 /// latest-corrected views while raw-history views keep both visible.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CorrectionMetadata {
     pub correction_epoch: u64,
     pub correction_generation: u64,

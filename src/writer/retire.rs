@@ -95,7 +95,7 @@ impl OePublisher {
         let (_, head) = published.head().map_err(PublishFailure::Publish)?;
         let coverage = merged_coverage(&head, inputs, config.tenant_id)?;
         self.verify_staged(&built, config, &coverage)?;
-        verify_rows_preserved(&built, inputs, config.tenant_id, objects)?;
+        verify_rows_preserved(&built, &head, inputs, config.tenant_id, objects)?;
         publish_in_place_of(
             built,
             config,
@@ -192,6 +192,7 @@ fn publish_in_place_of(
         file_id: built.file_id,
         file_type: FileType::OeFile,
         footer_len: Some(built.footer_len),
+        entity_summary: Some(built.entity_summary.clone()),
         graph_event_id_filter: built
             .footer
             .graph
@@ -199,6 +200,7 @@ fn publish_in_place_of(
             .and_then(|graph| graph.event_ids.as_ref())
             .map(|index| index.filter.clone()),
         graph_summary: GraphFileSummary::of(&built.footer),
+        deletion_vector: None,
         optional_feature_flags: built.footer.optional_feature_flags,
         part_index: 0,
         part_state: PartState::Active,
@@ -480,14 +482,18 @@ fn merged_coverage(
 
 /// Checks that `built` holds every row of the `inputs`, read from each input's stored header: as many rows as the
 /// inputs hold together, from the same first to the same last `(epoch, sequence)`. Sequences covered only by void
-/// records carry no rows on either side, so they never make a faithful merge look short.
+/// records carry no rows on either side, so they never make a faithful merge look short. Rows an input's saved deletion
+/// vector removes are dropped by the merge, so they are subtracted from the expected count, and the output may then
+/// start later or end earlier than the inputs did.
 fn verify_rows_preserved(
     built: &BuiltOe,
+    head: &crate::lifecycle::ManifestGeneration,
     inputs: &[u128],
     tenant_id: TenantId,
     objects: &dyn ObjectStore,
 ) -> Result<(), PublishFailure> {
     let mut row_count = 0u64;
+    let mut any_deleted = false;
     let mut bounds: Option<((u64, u64), (u64, u64))> = None;
     for input in inputs {
         let stored = objects
@@ -505,13 +511,27 @@ fn verify_rows_preserved(
         let first = (header.min_epoch, header.min_sequence);
         let last = (header.max_epoch, header.max_sequence);
         row_count = row_count.saturating_add(header.row_count);
+        let deleted = head
+            .files
+            .iter()
+            .find(|entry| entry.file_id == *input && entry.tenant_id == tenant_id)
+            .and_then(|entry| entry.deletion_vector.as_ref())
+            .map_or(0, |vector| vector.deleted_count);
+        row_count = row_count.saturating_sub(deleted);
+        any_deleted |= deleted > 0;
         bounds = Some(bounds.map_or((first, last), |(low, high)| (low.min(first), high.max(last))));
     }
     let output_bounds = (
         (built.header.min_epoch, built.header.min_sequence),
         (built.header.max_epoch, built.header.max_sequence),
     );
-    if built.header.row_count != row_count || bounds != Some(output_bounds) {
+    let bounds_hold = match bounds {
+        Some(bounds) if any_deleted => {
+            built.header.row_count == 0 || (output_bounds.0 >= bounds.0 && output_bounds.1 <= bounds.1)
+        }
+        bounds => bounds == Some(output_bounds),
+    };
+    if built.header.row_count != row_count || !bounds_hold {
         return Err(PublishFailure::Verification(
             "the compaction output does not hold every row of its inputs",
         ));

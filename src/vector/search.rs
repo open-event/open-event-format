@@ -3,6 +3,7 @@
 //! each file holds, and merges the results.
 
 use super::constant::*;
+use super::deletes::SegmentDeletes;
 use super::error::VectorError;
 use super::model::{EmbeddingModel, SegmentManifest, VectorMetric};
 use super::segment::{ColumnStats, SegmentReader, SegmentSource};
@@ -54,12 +55,29 @@ pub fn search_segments<S: SegmentSource>(
     segments: &[SegmentReader<S>],
     search: &VectorSearch<'_>,
 ) -> Result<Vec<SearchHit>, VectorError> {
+    search_segments_with_deletes(segments, &[], search)
+}
+
+/// [`search_segments`], never returning a row a segment's deletes mark: `deletes[i]` belongs to `segments[i]`, and a
+/// missing or `None` entry deletes nothing. A deleted row is excluded before the coarse scan, so it neither appears
+/// in the results nor takes a candidate slot from a live row.
+pub fn search_segments_with_deletes<S: SegmentSource>(
+    segments: &[SegmentReader<S>],
+    deletes: &[Option<&SegmentDeletes>],
+    search: &VectorSearch<'_>,
+) -> Result<Vec<SearchHit>, VectorError> {
     let mut hits: Vec<(usize, super::model::ScoredRow)> = Vec::new();
     for (index, segment) in segments.iter().enumerate() {
         segment.manifest().model.require_same(search.model)?;
-        let Some(filter) = row_filter(segment, &search.filter)? else {
+        let Some(mut filter) = row_filter(segment, &search.filter)? else {
             continue;
         };
+        if let Some(deletes) = deletes.get(index).copied().flatten().filter(|d| d.deleted_count() > 0) {
+            filter = filter.difference(&deletes.bitmap());
+            if filter.is_empty() {
+                continue;
+            }
+        }
         let representations = segment.representations(EMBEDDING_COLUMN_ID);
         let (Some(coarse), Some(fine)) = (representations.first(), representations.last()) else {
             continue;

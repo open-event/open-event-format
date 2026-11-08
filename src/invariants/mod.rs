@@ -2,10 +2,11 @@
 //! — so the exact same engine code can run against real hardware or a deterministic test double.
 //!
 //! Engine production code reads wall-clock time, randomness, storage, and catalogue publication only through the traits
-//! here. `sim` supplies the deterministic, fault-injecting test implementations; `io` supplies the production ones on
-//! compio. Nothing in the engine calls `std::time` or the filesystem directly.
+//! here. `sim` supplies the deterministic, fault-injecting test implementations; `io` supplies the production clock and
+//! executor, and `disk` the production local-disk journal and published set. Nothing in the engine calls `std::time` or the filesystem directly.
 
 pub mod constant;
+pub mod disk;
 pub mod io;
 pub mod sim;
 
@@ -80,7 +81,8 @@ pub trait EncodeExecutor: Sync {
 /// How a new version of the file catalogue is published, modelled on object-store conditional writes — create-only
 /// generation objects plus an If-Match compare-and-swap on the head pointer.
 ///
-/// Production uses [`crate::object_store::LivePublishedSet`] over the application's object store; tests use the
+/// Production uses [`crate::object_store::LivePublishedSet`] over the application's object store, or
+/// [`disk::FilePublishedSet`] on a local disk; tests use the
 /// in-memory [`sim::SimulatedPublishedSet`], which keeps the same rebase-and-retry, never-overwrite discipline.
 ///
 /// Generation ids are plain numbers, but a real store compares the head pointer by its ETag, not by the id it holds.

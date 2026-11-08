@@ -667,6 +667,12 @@ impl<S: SegmentSource> SegmentReader<S> {
     /// integer column, and each vector decoded from the finest stored representation (renormalized for cosine). Used
     /// to merge small segments; vectors stored only as int8 or 1-bit come back approximate.
     pub fn read_all(&self) -> Result<SegmentInput, VectorError> {
+        self.read_live(None)
+    }
+
+    /// Every row [`read_all`](Self::read_all) returns except those `deletes` marks, in order. What compaction writes
+    /// back, so a deleted embedding is gone from the merged segment.
+    pub fn read_live(&self, deletes: Option<&super::deletes::SegmentDeletes>) -> Result<SegmentInput, VectorError> {
         let mut input = SegmentInput::default();
         let fine = *self
             .representations(EMBEDDING_COLUMN_ID)
@@ -685,16 +691,33 @@ impl<S: SegmentSource> SegmentReader<S> {
                 _ => {}
             }
         }
+        let deletes = deletes.filter(|deletes| deletes.deleted_count() > 0);
         for granule in 0..self.granule_count() {
-            input.event_ids.extend(self.strings(EVENT_ID_COLUMN, granule)?);
+            let first = self.granule_first_row(granule);
+            let live = |local: usize| deletes.is_none_or(|deletes| !deletes.is_deleted(first + local as u64));
+            let keep_live =
+                |values: Vec<String>| values.into_iter().enumerate().filter(|(l, _)| live(*l)).map(|(_, v)| v);
+            input
+                .event_ids
+                .extend(keep_live(self.strings(EVENT_ID_COLUMN, granule)?));
             for (name, values) in &mut input.string_columns {
-                values.extend(self.strings(name, granule)?);
+                values.extend(keep_live(self.strings(name, granule)?));
             }
             for (name, values) in &mut input.integer_columns {
-                values.extend(self.integers(name, granule)?);
+                let integers = self.integers(name, granule)?;
+                values.extend(
+                    integers
+                        .into_iter()
+                        .enumerate()
+                        .filter(|(l, _)| live(*l))
+                        .map(|(_, v)| v),
+                );
             }
             let plaintext = self.open_block(fine_column, granule)?;
-            for row in plaintext.chunks_exact(width.max(1)) {
+            for (local, row) in plaintext.chunks_exact(width.max(1)).enumerate() {
+                if !live(local) {
+                    continue;
+                }
                 let mut vector = decode_row(fine.element, fine.model.dimension, row);
                 if fine.model.metric == VectorMetric::Cosine {
                     normalize(&mut vector);
@@ -888,10 +911,22 @@ pub fn merge_segments<S: SegmentSource>(
     spec: &SegmentSpec,
     wrapping: &WrappingKey,
 ) -> Result<Vec<u8>, VectorError> {
+    merge_segments_with_deletes(segments, &[], spec, wrapping)
+}
+
+/// [`merge_segments`], dropping the rows each segment's deletes mark: `deletes[i]` belongs to `segments[i]`, and a
+/// missing or `None` entry deletes nothing. Merging a single segment with its deletes is how a segment sheds deleted
+/// embeddings; the output starts with no deletes of its own.
+pub fn merge_segments_with_deletes<S: SegmentSource>(
+    segments: &[SegmentReader<S>],
+    deletes: &[Option<&super::deletes::SegmentDeletes>],
+    spec: &SegmentSpec,
+    wrapping: &WrappingKey,
+) -> Result<Vec<u8>, VectorError> {
     let mut merged: Option<SegmentInput> = None;
-    for segment in segments {
+    for (index, segment) in segments.iter().enumerate() {
         segment.manifest().model.require_same(&spec.model)?;
-        let input = segment.read_all()?;
+        let input = segment.read_live(deletes.get(index).copied().flatten())?;
         match &mut merged {
             None => merged = Some(input),
             Some(merged) => {
