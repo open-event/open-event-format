@@ -188,6 +188,14 @@ pub enum Transform {
     /// still applies. Never stores per-value keys and never rides the seekable framing. A file holding one declares
     /// the `PACKED_STRING_OFFSETS` required feature. See [`fsst_packed_as_classic`].
     FsstPackedString = 15,
+    /// An `ingested_at` block stored relative to the same rows' `occurred_at`: the body is a four-byte inner
+    /// pipeline id followed by an ordinary integer block (frame-of-reference, delta, RLE or plain, any trailing stage)
+    /// of the wrapping `i64` residuals `ingested_at - occurred_at`. Nothing in the body alone decodes it: a reader adds
+    /// the granule's decoded `occurred_at` back and hands every caller an equivalent [`Transform::PlainU64`] block (see
+    /// [`resolve_occurred_residual`]). Legal only on the `ingested_at` column of a single-page, dense block; chosen only
+    /// where it stores fewer bytes than the direct encoding. A file holding one declares the
+    /// `OCCURRED_RELATIVE_INGESTED_AT` required feature.
+    OccurredResidual = 16,
     PlainF64 = 5,
     PlainU128 = 4,
     PlainU64 = 0,
@@ -330,6 +338,7 @@ impl PipelineId {
             13 => Transform::AlpRd,
             14 => Transform::Chimp,
             15 => Transform::FsstPackedString,
+            16 => Transform::OccurredResidual,
             _ => {
                 return Err(FormatError::Structural {
                     rule: "unknown transform in pipeline id",
@@ -4499,6 +4508,80 @@ pub fn with_trailing_removed<R>(
         return consume(bytes);
     }
     decompressor::with_inflate_buffer(|scratch| consume(remove_trailing_into(compression, bytes, scratch)?))
+}
+
+/// Encodes an `ingested_at` block relative to the same rows' `occurred_at` ([`Transform::OccurredResidual`]): the
+/// wrapping residuals `ingested - occurred` go through ordinary integer selection, and the result is prefixed with
+/// that inner block's pipeline id. The returned stats describe `ingested` itself, never the residuals, so granule and
+/// page statistics (and time pruning on `ingested_at`) are unaffected by the representation. `None` when the two
+/// columns differ in length or are empty.
+pub fn encode_occurred_residual(ingested: &[i64], occurred: &[i64], strategy: CascadeStrategy) -> Option<EncodedBlock> {
+    if ingested.is_empty() || ingested.len() != occurred.len() {
+        return None;
+    }
+    let residuals: Vec<i64> = ingested
+        .iter()
+        .zip(occurred)
+        .map(|(ingested, occurred)| ingested.wrapping_sub(*occurred))
+        .collect();
+    let inner = encode_block_with_strategy(&ColumnData::I64(residuals), false, strategy);
+    let mut out = Writer::with_capacity(4 + inner.bytes.len());
+    out.put_u32(inner.pipeline.0);
+    out.put_slice(&inner.bytes);
+    Some(EncodedBlock {
+        bytes: out.into_bytes(),
+        fsst: None,
+        pipeline: PipelineId::new(Transform::OccurredResidual, Compression::None, ValueKind::I64),
+        stats: stats_for(&ColumnData::I64(ingested.to_vec())),
+        uncompressed_len: 4 + inner.uncompressed_len,
+    })
+}
+
+/// The inner pipeline id of a [`Transform::OccurredResidual`] body and the inner block's bytes. The inner block must
+/// be an `i64` integer block with no side stream; anything else (a nested residual included) is refused.
+pub fn occurred_residual_inner(body: &[u8]) -> Result<(PipelineId, &[u8]), FormatError> {
+    let mut reader = Reader::new(body);
+    let inner = PipelineId(reader.u32("occurred residual inner pipeline")?);
+    let rest = reader.take(reader.remaining(), "occurred residual inner block")?;
+    let valid = inner.value_kind()? == ValueKind::I64
+        && inner.side_stream()? == SideStream::None
+        && matches!(
+            inner.transform()?,
+            Transform::ForBitpack | Transform::DeltaBitpack | Transform::Rle | Transform::PlainU64
+        );
+    inner.compression()?;
+    if !valid {
+        return Err(FormatError::Structural {
+            rule: "occurred residual inner block must be a plain i64 integer block",
+        });
+    }
+    Ok((inner, rest))
+}
+
+/// Rebuilds the `ingested_at` values of a [`Transform::OccurredResidual`] body from the same rows' decoded
+/// `occurred_at`, as the equivalent uncompressed [`Transform::PlainU64`] block (pipeline and body) every decoder of
+/// integer blocks reads. Refuses a residual count that differs from `occurred`'s.
+pub fn resolve_occurred_residual(body: &[u8], occurred: &[i64]) -> Result<(PipelineId, Vec<u8>), FormatError> {
+    let (inner, rest) = occurred_residual_inner(body)?;
+    let ColumnData::I64(mut values) = decode_block(inner, rest)? else {
+        return Err(FormatError::Structural {
+            rule: "occurred residual inner block must decode to i64",
+        });
+    };
+    if values.len() != occurred.len() {
+        return Err(FormatError::Structural {
+            rule: "occurred residual count must equal the granule's occurred_at count",
+        });
+    }
+    for (value, occurred) in values.iter_mut().zip(occurred) {
+        *value = value.wrapping_add(*occurred);
+    }
+    let mut out = Writer::with_capacity(4 + values.len() * 8);
+    encode_i64_with(Transform::PlainU64, &values, &mut out);
+    Ok((
+        PipelineId::new(Transform::PlainU64, Compression::None, ValueKind::I64),
+        out.into_bytes(),
+    ))
 }
 
 /// Encodes one column block using the `DecodeOptimized` cascade strategy (the write path default).

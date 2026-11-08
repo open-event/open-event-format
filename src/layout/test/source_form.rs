@@ -627,7 +627,8 @@ fn external_ids_that_do_not_repeat_the_event_id_declare_no_elision() {
 fn a_reader_from_before_elision_refuses_the_file_and_a_stray_sentinel_is_an_error() {
     let (rows, _) = mixed_elision_rows();
     let built = build_oe_file(rows, &source_form_config(3)).unwrap();
-    let pre_elision_known: u64 = (1 << 32) - 1;
+    // The occurred-relative `ingested_at` bit is a later, orthogonal one these rows happen to use.
+    let pre_elision_known: u64 = ((1 << 32) - 1) | required_features::OCCURRED_RELATIVE_INGESTED_AT;
     let declared = built.footer.required_feature_flags;
     assert_eq!(
         declared & !pre_elision_known,

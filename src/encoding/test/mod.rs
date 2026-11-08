@@ -5379,7 +5379,7 @@ fn xor_float_blocks_round_trip_bit_for_bit_through_the_pipeline() {
         expected[3..900]
     );
     // A transform id past the ones this reader knows is refused, never decoded as something else.
-    assert!(PipelineId(16).transform().is_err());
+    assert!(PipelineId(17).transform().is_err());
 }
 
 #[test]
@@ -6212,4 +6212,42 @@ fn random_access_blocks_take_the_dictionary_trial() {
         panic!("string block decodes to strings");
     };
     assert_eq!(range.len(), 100);
+}
+
+#[test]
+fn occurred_residual_round_trips_and_refuses_malformed_inner_blocks() {
+    let occurred: Vec<i64> = (0..3_000i64)
+        .map(|i| 1_700_000_000_000 + i * 1_009 + (i * 7_919) % 613)
+        .collect();
+    // Equal timestamps: the residuals are all zero and the block shrinks to a few bytes.
+    let block = encode_occurred_residual(&occurred, &occurred, CascadeStrategy::DecodeOptimized).unwrap();
+    let direct = encode_block(&ColumnData::I64(occurred.clone()), false);
+    assert!(block.bytes.len() * 20 < direct.bytes.len());
+    // Stats describe the ingested values, not the residuals.
+    assert_eq!(block.stats.min_i128, direct.stats.min_i128);
+    assert_eq!(block.stats.max_i128, direct.stats.max_i128);
+    let (plain, body) = resolve_occurred_residual(&block.bytes, &occurred).unwrap();
+    assert_eq!(plain.transform().unwrap(), Transform::PlainU64);
+    assert_eq!(decode_block(plain, &body).unwrap(), ColumnData::I64(occurred.clone()));
+    // Wrapping residuals survive the extremes.
+    let wild: Vec<i64> = occurred
+        .iter()
+        .enumerate()
+        .map(|(i, v)| if i % 2 == 0 { i64::MIN } else { v ^ i64::MAX })
+        .collect();
+    let block = encode_occurred_residual(&wild, &occurred, CascadeStrategy::DecodeOptimized).unwrap();
+    let (plain, body) = resolve_occurred_residual(&block.bytes, &occurred).unwrap();
+    assert_eq!(decode_block(plain, &body).unwrap(), ColumnData::I64(wild));
+    assert!(encode_occurred_residual(&[], &[], CascadeStrategy::DecodeOptimized).is_none());
+    assert!(encode_occurred_residual(&[1, 2], &[1], CascadeStrategy::DecodeOptimized).is_none());
+    // A nested residual, a float inner block, or a u64 inner block are all refused.
+    for inner in [
+        PipelineId::new(Transform::OccurredResidual, Compression::None, ValueKind::I64),
+        PipelineId::new(Transform::PlainF64, Compression::None, ValueKind::F64),
+        PipelineId::new(Transform::PlainU64, Compression::None, ValueKind::U64),
+    ] {
+        let mut body = inner.0.to_le_bytes().to_vec();
+        body.extend_from_slice(&block.bytes[4..]);
+        assert!(resolve_occurred_residual(&body, &occurred).is_err());
+    }
 }

@@ -259,7 +259,7 @@ impl<'a> OeFormat<'a> {
             return Ok((read.data, 0));
         };
         let bytes = (raw.body.len() + raw.presence.len()) as u64;
-        let data = decode_block_shared(raw.pipeline, raw.body, file.shared_alphabet(column_id))
+        let data = decode_block_shared(raw.pipeline, &raw.body, file.shared_alphabet(column_id))
             .map_err(|error| anyhow!("decoding column {column_id} of granule {granule_id}: {error}"))?;
         Ok((data, bytes))
     }
@@ -609,7 +609,7 @@ impl<'a> OeFormat<'a> {
         for row in candidates {
             let decoded = decode_block_range_shared(
                 raw.pipeline,
-                raw.body,
+                &raw.body,
                 file.shared_alphabet(column_ids::ENTITY_ID),
                 row,
                 row + 1,
@@ -821,7 +821,7 @@ impl<'a> OeFormat<'a> {
         // The substring test is pushed into the block: the engine searches the block's own value arena in one
         // pass and counts hits directly, so no row's text or row-sized Boolean mask is rebuilt for this aggregate.
         let count =
-            match count_string_block_shared(raw.pipeline, raw.body, &search.predicate, search.translated.as_ref())
+            match count_string_block_shared(raw.pipeline, &raw.body, &search.predicate, search.translated.as_ref())
                 .map_err(|error| {
                     anyhow!(
                         "searching the free-text column of granule {}: {error}",
@@ -829,7 +829,7 @@ impl<'a> OeFormat<'a> {
                     )
                 })? {
                 Some(count) => count,
-                None => match decode_block_shared(raw.pipeline, raw.body, search.alphabet).map_err(|error| {
+                None => match decode_block_shared(raw.pipeline, &raw.body, search.alphabet).map_err(|error| {
                     anyhow!(
                         "decoding the free-text column of granule {}: {error}",
                         granule.granule_id
@@ -1096,11 +1096,11 @@ impl<'a> OeFormat<'a> {
                         continue;
                     }
                     (
-                        decode_block_shared(before.pipeline, before.body, base.shared_alphabet(column.column_id))
+                        decode_block_shared(before.pipeline, &before.body, base.shared_alphabet(column.column_id))
                             .map_err(|error| {
                                 anyhow!("decoding column {} of granule {granule_id}: {error}", column.column_id)
                             })?,
-                        decode_block_shared(after.pipeline, after.body, next.shared_alphabet(column.column_id))
+                        decode_block_shared(after.pipeline, &after.body, next.shared_alphabet(column.column_id))
                             .map_err(|error| {
                                 anyhow!("decoding column {} of granule {granule_id}: {error}", column.column_id)
                             })?,

@@ -68,3 +68,10 @@ Pipeline transform 15 (FSST with bitpacked value lengths) SHALL have an availabi
 #### Scenario: Unknown transform refused cleanly
 - **WHEN** a reader without transform 15 is handed a block whose pipeline id names it
 - **THEN** it returns a structural "unknown transform" error and decodes nothing
+
+### Requirement: Occurred-relative ingested-at blocks are gated by a required feature
+Pipeline transform 16 (`ingested_at` stored relative to `occurred_at`) SHALL have an availability window opening at format version 1.0 and SHALL be refused, like every unknown transform, by a reader that does not implement it. Its body SHALL NOT decode on its own: a decode handed the bare block without the granule's `occurred_at` SHALL return a structural error rather than values. A file holding such a block SHALL declare required feature bit 34 (`occurred_relative_ingested_at`); a reader whose known required set lacks bit 34 SHALL refuse the file at open.
+
+#### Scenario: Occurred-relative transform refused without its window
+- **WHEN** a reader without transform 16 is handed a block whose pipeline id names it
+- **THEN** it refuses the pipeline before decoding a byte, and a bare decode of the block without `occurred_at` returns a structural error

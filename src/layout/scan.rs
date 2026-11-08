@@ -398,7 +398,7 @@ impl OeFile {
                 // The block is fetched once and its presence frame decoded once; only a declined view decode pays for
                 // a second fetch through the materializing read.
                 let raw = self.read_column_raw_with_mark(block.granule_id, &block.mark)?;
-                if let Some(views) = self.decode_string_block_views(block.column_id, raw.pipeline, raw.body)? {
+                if let Some(views) = self.decode_string_block_views(block.column_id, raw.pipeline, &raw.body)? {
                     validate_block_counts(&raw.presence, views.len(), raw.row_count as usize)?;
                     return Ok(ScanColumn::Views {
                         presence: raw.presence.into_owned(),
@@ -412,7 +412,7 @@ impl OeFile {
             // once, without the shared-extent cache a per-column read consults so that several columns naming one
             // extent decode it once between them.
             let raw = self.read_column_raw_with_mark(block.granule_id, &block.mark)?;
-            let data = decode_block_shared(raw.pipeline, raw.body, self.shared_alphabet(block.column_id))?;
+            let data = decode_block_shared(raw.pipeline, &raw.body, self.shared_alphabet(block.column_id))?;
             validate_block_counts(&raw.presence, data.row_count(), raw.row_count as usize)?;
             return Ok(ScanColumn::Materialized(ColumnRead {
                 presence: raw.presence.into_owned(),

@@ -31,8 +31,8 @@ use crate::encoding::decompressor::active_decompressor;
 use crate::encoding::{
     ColumnData, Compression, PipelineId, PresenceRank, SharedStringViewDictionary, SideStream, Transform, ValueKind,
     count_set_bits, decode_block_range_shared, decode_block_shared, decode_string_block_views_shared_prepared,
-    fsst_uncompressed_len, prepare_shared_string_view_dictionary, present_position, seekable_zstd,
-    take_block_rows_shared,
+    fsst_uncompressed_len, prepare_shared_string_view_dictionary, present_position, resolve_occurred_residual,
+    seekable_zstd, take_block_rows_shared,
 };
 use crate::error::FormatError;
 use crate::events::provenance::hex_lower;
@@ -180,7 +180,9 @@ pub struct ColumnRead {
 /// encoded bytes straight to a kernel that builds an Arrow array, skipping the `ColumnData` materialization.
 #[derive(Debug, Clone)]
 pub struct RawColumnBlock<'a> {
-    pub body: &'a [u8],
+    /// Borrowed from the file's bytes, except for a block the reader had to rebuild: an `ingested_at` block stored
+    /// relative to `occurred_at` comes back as the equivalent plain integer block, owned.
+    pub body: Cow<'a, [u8]>,
     pub pipeline: PipelineId,
     /// Borrowed from the block's own bytes when the file stores the bitmap verbatim, so a repeated point read costs
     /// no copy; owned only for the forms that have to be rebuilt (runs, positions, all-present, all-absent).
@@ -2575,11 +2577,51 @@ impl OeFile {
         let mut reader = Reader::new(block);
         let presence = super::decode_presence_frame(&mut reader, mark.row_count, self.compressed_presence())?;
         let body = reader.take(reader.remaining(), "block body")?;
+        self.resolve_occurred_residual(
+            mark.column_id,
+            granule_id,
+            mark.page_count,
+            RawColumnBlock {
+                body: Cow::Borrowed(body),
+                pipeline: mark.codec_pipeline_id,
+                presence,
+                row_count: mark.row_count,
+            },
+        )
+    }
+
+    /// Hands back `raw` unchanged unless it stores `ingested_at` relative to `occurred_at`
+    /// ([`Transform::OccurredResidual`]); such a block is rebuilt, from the granule's `occurred_at` decoded through
+    /// the decoded-block cache, into the equivalent plain integer block, so every caller of the raw read sees an
+    /// ordinary block. The transform is legal only on a single-page `ingested_at` block; anywhere else — an
+    /// `occurred_at` block claiming it included, which would otherwise recurse — it refuses as corruption.
+    fn resolve_occurred_residual<'a>(
+        &'a self,
+        column_id: u32,
+        granule_id: u32,
+        page_count: u32,
+        raw: RawColumnBlock<'a>,
+    ) -> Result<RawColumnBlock<'a>, FormatError> {
+        if raw.pipeline.transform()? != Transform::OccurredResidual {
+            return Ok(raw);
+        }
+        if column_id != column_ids::INGESTED_AT || page_count > 1 {
+            return Err(FormatError::Structural {
+                rule: "an occurred-relative block is legal only on a single-page ingested_at block",
+            });
+        }
+        let occurred = self.cached_column(column_ids::OCCURRED_AT, granule_id)?;
+        let ColumnData::I64(occurred_values) = &occurred.data else {
+            return Err(FormatError::Structural {
+                rule: "an occurred-relative block needs an i64 occurred_at",
+            });
+        };
+        let (pipeline, body) = resolve_occurred_residual(&raw.body, occurred_values)?;
         Ok(RawColumnBlock {
-            body,
-            pipeline: mark.codec_pipeline_id,
-            presence,
-            row_count: mark.row_count,
+            body: Cow::Owned(body),
+            pipeline,
+            presence: raw.presence,
+            row_count: raw.row_count,
         })
     }
 
@@ -2629,12 +2671,17 @@ impl OeFile {
             };
             compat::validate_pipeline_window_pinned(pipeline.0, self.footer.format_version)?;
             let body = reader.take(reader.remaining(), "block body")?;
-            return Ok(RawColumnBlock {
-                body,
-                pipeline,
-                presence,
-                row_count: entry.row_count,
-            });
+            return self.resolve_occurred_residual(
+                column_id,
+                granule_id,
+                mark.page_count,
+                RawColumnBlock {
+                    body: Cow::Borrowed(body),
+                    pipeline,
+                    presence,
+                    row_count: entry.row_count,
+                },
+            );
         }
         if mark.page_count > 1 {
             return Err(FormatError::RefOutOfRange {
@@ -2777,7 +2824,10 @@ impl OeFile {
             // A file-scope dictionary block stores only codes; decode injects the reading column's own footer
             // alphabet, so byte-identical code streams under two columns still decode to different values. Those
             // decodes are never shared — each aliasing column decodes its own copy of the shared bytes.
-            let column_free_decode = mark.codec_pipeline_id.side_stream() != Ok(SideStream::FileScopeDictionary);
+            // An occurred-relative block decodes against its own granule's `occurred_at`, so it is never shared
+            // either, however identical its stored bytes are to another granule's.
+            let column_free_decode = mark.codec_pipeline_id.side_stream() != Ok(SideStream::FileScopeDictionary)
+                && mark.codec_pipeline_id.transform() != Ok(Transform::OccurredResidual);
             let shared_key = (column_free_decode && self.aliased_extents.contains(&extent)).then_some((
                 extent.0,
                 extent.1,
@@ -2795,7 +2845,7 @@ impl OeFile {
                 }
             }
             let raw = self.read_column_raw_with_mark(granule_id, mark)?;
-            let data = decode_block_shared(raw.pipeline, raw.body, self.shared_alphabet(column_id))?;
+            let data = decode_block_shared(raw.pipeline, &raw.body, self.shared_alphabet(column_id))?;
             validate_block_counts(&raw.presence, data.row_count(), raw.row_count as usize)?;
             let read = ColumnRead {
                 presence: raw.presence.into_owned(),
@@ -2888,7 +2938,7 @@ impl OeFile {
             for page_index in 0..mark.page_count {
                 let raw = self.read_page_raw_with_mark(column_id, granule_id, page_index, &mark)?;
                 let page_rows = raw.row_count as usize;
-                let Some(views) = self.decode_string_block_views(column_id, raw.pipeline, raw.body)? else {
+                let Some(views) = self.decode_string_block_views(column_id, raw.pipeline, &raw.body)? else {
                     return Ok(None);
                 };
                 validate_block_counts(&raw.presence, views.len(), page_rows)?;
@@ -2915,7 +2965,7 @@ impl OeFile {
             return Ok(Some((combined_presence, views)));
         }
         let raw = self.read_column_raw_with_mark(granule_id, &mark)?;
-        let Some(views) = self.decode_string_block_views(column_id, raw.pipeline, raw.body)? else {
+        let Some(views) = self.decode_string_block_views(column_id, raw.pipeline, &raw.body)? else {
             return Ok(None);
         };
         validate_block_counts(&raw.presence, views.len(), raw.row_count as usize)?;
@@ -3010,7 +3060,7 @@ impl OeFile {
             return Ok(None);
         }
         let raw = self.read_column_raw_with_mark(granule_id, &mark)?;
-        Ok(fsst_uncompressed_len(raw.pipeline, raw.body)?.map(|len| len as u64))
+        Ok(fsst_uncompressed_len(raw.pipeline, &raw.body)?.map(|len| len as u64))
     }
 
     /// Reads one page from a `(column, granule)` block by its page index.
@@ -3038,7 +3088,7 @@ impl OeFile {
             return self.materialize_elided_constant(column_id, granule_id, mark);
         }
         let raw = self.read_page_raw_with_mark(column_id, granule_id, page_index, mark)?;
-        let data = decode_block_shared(raw.pipeline, raw.body, self.shared_alphabet(column_id))?;
+        let data = decode_block_shared(raw.pipeline, &raw.body, self.shared_alphabet(column_id))?;
         validate_block_counts(&raw.presence, data.row_count(), raw.row_count as usize)?;
         Ok(ColumnRead {
             data,
@@ -3616,7 +3666,7 @@ impl OeFile {
                 };
                 let data = decode_block_range_shared(
                     raw.pipeline,
-                    raw.body,
+                    &raw.body,
                     self.shared_alphabet(column_id),
                     position,
                     position + 1,
@@ -4177,7 +4227,7 @@ impl OeFile {
                 })
             })
             .collect();
-        let data = take_block_rows_shared(raw.pipeline, raw.body, self.shared_alphabet(column_id), &positions).ok()?;
+        let data = take_block_rows_shared(raw.pipeline, &raw.body, self.shared_alphabet(column_id), &positions).ok()?;
         let values = slots
             .into_iter()
             .map(|slot| slot.and_then(|slot| Self::typed_variant_at(&data, slot)))
@@ -4222,7 +4272,7 @@ impl OeFile {
         };
         let data = decode_block_range_shared(
             raw.pipeline,
-            raw.body,
+            &raw.body,
             self.shared_alphabet(column_id),
             position,
             position + 1,
