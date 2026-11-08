@@ -18,6 +18,7 @@ fn entry(file_id: u128, part_state: PartState) -> OeFileEntry {
         footer_len: Some(64),
         graph_event_id_filter: None,
         graph_summary: None,
+        deletion_vector: None,
         optional_feature_flags: 0,
         part_index: 0,
         part_state,

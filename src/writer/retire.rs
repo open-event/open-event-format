@@ -199,6 +199,7 @@ fn publish_in_place_of(
             .and_then(|graph| graph.event_ids.as_ref())
             .map(|index| index.filter.clone()),
         graph_summary: GraphFileSummary::of(&built.footer),
+        deletion_vector: None,
         optional_feature_flags: built.footer.optional_feature_flags,
         part_index: 0,
         part_state: PartState::Active,

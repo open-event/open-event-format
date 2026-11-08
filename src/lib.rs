@@ -27,7 +27,9 @@ pub mod clock;
 pub mod columns;
 pub mod compat;
 pub mod constant;
+pub mod corrections;
 pub mod deletes;
+pub mod deletion_store;
 // `oe::encoding` is the one sanctioned place for `unsafe` in this crate:
 // FSST string compression reuses one scratch buffer per block through fsst-rs's capacity-contract `compress_into`,
 // which the pinned 0.5.11 release only exposes as an `unsafe fn`. The allow opens here only; every unsafe block inside
