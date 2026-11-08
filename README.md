@@ -30,35 +30,12 @@ OE is the storage engine for events. Events first land in **OEJ**, an append-onl
 - **Telemetry and product analytics**: numeric and text payloads scanned column by column
 - **Agent and session transcripts**: one durable stream per session, queryable after the fact
 
-### Example
-
-Build an OE file from rows and read it back. This mirrors what the [benchmark harness](./benchmark/src/oe.rs) does.
-
-```rust
-use oe::layout::reader::OeFile;
-use oe::writer::build::{build_oe_file, OeBuildConfig, OeRow};
-
-// Writing is behind the `write` feature: oe = { ..., features = ["write"] }
-fn roundtrip(rows: Vec<OeRow>, config: &OeBuildConfig) -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Pack events into one immutable, self-describing OE file
-    let bytes = build_oe_file(rows, config)?.bytes;
-
-    // 2. Open it with a full integrity check of the whole file...
-    let file = OeFile::open(bytes.clone(), None)?;
-
-    // 3. ...or lazily, verifying only the blocks a query touches
-    let lazy = OeFile::open_lazy(bytes, None, None)?;
-
-    println!("{:?}", file.footer());
-    Ok(())
-}
-```
-
 ### Why a new format?
 
 Parquet and Vortex are excellent general analytical formats, but an event store asks for more than scans: append with a durable acknowledgement, find one event by its id, follow a thread, remove a single message for a GDPR request, and prove the file was not tampered with. General formats cannot append, cannot remove rows in place, and do not verify content on open.
 
 OE keeps the columnar layout and modern encodings (FSST, bit-packing, dictionaries, RLE, XOR floats, zstd and LZ4) and adds the envelope, indexes, deletion vectors and integrity an event stream needs. The cost is size: OE stores every envelope column, skip index and checksum, so its files are larger than Parquet's.
+
 
 ## Getting Started
 
@@ -66,15 +43,11 @@ OE is a Rust crate (`oe`, edition 2024, Rust 1.96, pinned in [`rust-toolchain.to
 
 ```bash
 git clone https://github.com/open-event/open-event-format.git
-```
 
-```bash
+# Run tests
 cd open-event-format && cargo test --all-features
-```
 
-### Run the benchmarks
-
-```bash
+# Run benchmarks
 cd benchmark && cargo run --release -- --sizes 10000,100000,1000000 --reps 5 --write-reps 3 --out results
 ```
 
