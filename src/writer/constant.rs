@@ -44,3 +44,29 @@ pub(crate) const LINEAR_LOOKUP_MAX_ENTRIES: usize = 16;
 /// How many ledger records a state chunk sweep reads at a time: 1024, about 48 KiB of records, which bounds the sweep's
 /// own memory however many chunks a tenant has while keeping ledger round trips to one per thousand chunks.
 pub const STATE_CHUNK_SWEEP_PAGE_RECORDS: usize = 1024;
+
+/// File name of a `disk::FileSafeRetryStore`'s append-only receipt log.
+pub const RETRY_LOG_FILE: &str = "receipts.log";
+
+/// File name a `disk::FileSafeRetryStore` stages a compacted log under before renaming it over the live one.
+pub const RETRY_LOG_COMPACT_FILE: &str = "receipts.log.compact";
+
+/// Magic bytes and format version opening every receipt log.
+pub const RETRY_LOG_MAGIC: [u8; 4] = *b"OERS";
+pub const RETRY_LOG_VERSION: u32 = 1;
+
+/// Length of the log header: magic plus little-endian version.
+pub const RETRY_LOG_HEADER_LEN: u64 = 8;
+
+/// Log record tags: an upserted receipt, or an eviction watermark (every row expired as of the stored instant).
+pub const RETRY_LOG_TAG_RECORD: u8 = 1;
+pub const RETRY_LOG_TAG_EVICT: u8 = 2;
+
+/// Largest payload a receipt-log record may declare; anything larger is treated as a torn or corrupt tail.
+pub const RETRY_LOG_MAX_PAYLOAD: u32 = 256;
+
+/// The log is compacted once it holds at least this many records past the live rows...
+pub const RETRY_LOG_COMPACT_MIN_GARBAGE: u64 = 4096;
+
+/// ...and at least this many times as many records as there are live rows.
+pub const RETRY_LOG_COMPACT_RATIO: u64 = 2;

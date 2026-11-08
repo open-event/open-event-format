@@ -44,6 +44,11 @@ impl SimSafeRetryStore {
         self.rows.is_empty()
     }
 
+    /// Every delivery row on record, in no particular order.
+    pub fn receipts(&self) -> impl Iterator<Item = &RetryReceipt> {
+        self.rows.values()
+    }
+
     fn unindex_dedupe(&mut self, tenant_id: TenantId, dedupe: (u64, u64), delivery_identity: (u64, u64)) {
         if let Some(identities) = self.dedupe_index.get_mut(&(tenant_id, dedupe)) {
             identities.retain(|identity| *identity != delivery_identity);

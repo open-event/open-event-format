@@ -1680,3 +1680,65 @@ fn a_frame_failing_to_append_mid_flush_leaves_the_frames_before_it_possibly_dura
     assert_eq!(result.range.first_sequence, voided[0].last_sequence + 1);
     assert_eq!(worker.queue().pending_bytes(), 0);
 }
+
+#[test]
+fn on_disk_journal_and_retry_store_survive_a_restart_and_rebuild_from_replay() {
+    use crate::invariants::JournalStorage;
+    use crate::invariants::disk::FileJournalStorage;
+    use crate::writer::disk::FileSafeRetryStore;
+
+    let dir = tempfile::tempdir().unwrap();
+    let clock = SimClock::new(5);
+    let mut allocator = SequenceAllocator::new(1);
+    let mut watermarks = WatermarkTracker::new();
+    let mut overlay = LiveOverlayStore::new();
+    {
+        let mut storage = FileJournalStorage::open(dir.path().join("journal")).unwrap();
+        let mut retry = FileSafeRetryStore::open(dir.path().join("retry")).unwrap();
+        let mut worker = pipeline();
+        worker.submit(event(0), 1, &mut retry, &clock).unwrap();
+        worker
+            .flush(
+                FlushReason::Target,
+                &mut allocator,
+                &mut storage,
+                &mut watermarks,
+                &mut retry,
+                &mut overlay,
+                &clock,
+            )
+            .unwrap();
+        assert!(retry.take_failure().is_none());
+    }
+    // A crash mid-append leaves a torn partial frame past the committed one.
+    let journal_dir = dir.path().join("journal");
+    let mut storage = FileJournalStorage::open(&journal_dir).unwrap();
+    let path = storage.shard_path(ShardId(0));
+    let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+    std::io::Write::write_all(&mut file, &[0x5A; 100]).unwrap();
+    drop(file);
+
+    // The receipt survived the restart and still suppresses a retried delivery.
+    let mut retry = FileSafeRetryStore::open(dir.path().join("retry")).unwrap();
+    assert!(retry.lookup(TenantId::new_test_id(9), (5000, 1)).is_some());
+    assert!(retry.duplicate_within_guard(TenantId::new_test_id(9), (1000, 7), clock.now_nanos()));
+
+    let replay = replay_segment(&storage, ShardId(0), 1, 1).unwrap();
+    assert_eq!(replay.frames.len(), 1);
+    let ReplayTail::Truncated { offset: valid_len, .. } = replay.tail else {
+        panic!("torn tail not detected: {:?}", replay.tail);
+    };
+    storage.truncate(ShardId(0), valid_len).unwrap();
+    assert_eq!(storage.extent(ShardId(0)).unwrap(), valid_len);
+
+    // A store that lost its rows rebuilds them from the journal, durably.
+    let mut rebuilt = FileSafeRetryStore::open(dir.path().join("rebuilt")).unwrap();
+    rebuilt.reconstruct_from_replay(&replay.frames, ShardId(0), clock.now_nanos() + 1);
+    drop(rebuilt);
+    let rebuilt = FileSafeRetryStore::open(dir.path().join("rebuilt")).unwrap();
+    assert_eq!(rebuilt.len(), 1);
+    assert_eq!(
+        rebuilt.lookup(TenantId::new_test_id(9), (5000, 1)).unwrap().commit,
+        retry.lookup(TenantId::new_test_id(9), (5000, 1)).unwrap().commit
+    );
+}

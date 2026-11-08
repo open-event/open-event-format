@@ -8,6 +8,7 @@ pub mod audit;
 pub mod build;
 pub mod compaction;
 pub mod constant;
+pub mod disk;
 pub mod error;
 pub mod graph;
 pub mod graph_seal;
