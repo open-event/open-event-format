@@ -51,8 +51,8 @@ For comparison across a million chat events, single thread, file held in memory:
 | Every reply in a thread | **0.28 ms** | 17.65 ms | 4.01 ms |
 | One event by id | **0.19 ms** | 5.18 ms | 1.15 ms |
 | Latest 50 messages in a room | 6.00 ms | 47.17 ms | **2.56 ms** |
-| Redact 1 event | **0.00 ms, 9 bytes written** | 2,007.53 ms, 37,698,174 bytes | 2,861.48 ms, 48,035,456 bytes |
-| Redact 1% of events | **12.87 ms, 160,005 bytes** | 2,145.08 ms, 37,167,023 bytes | 2,916.68 ms, 47,241,092 bytes |
+| Redact 1 event | **0.00 ms, 0.000009 MB written** | 2,007.53 ms, 37.70 MB | 2,861.48 ms, 48.04 MB |
+| Redact 1% of events | **12.87 ms, 0.16 MB** | 2,145.08 ms, 37.17 MB | 2,916.68 ms, 47.24 MB |
 | Size per event | 95.5 bytes | **37.7 bytes** | 48.1 bytes |
 | Write | 4,246 ms | **1,188 ms** | 2,180 ms |
 
