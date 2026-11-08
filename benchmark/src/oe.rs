@@ -309,12 +309,12 @@ impl OeReader {
             }
             let mut partial = Partial { rows: picked.len() as u64, sums: Vec::new(), tail: Vec::new() };
             for (name, column) in query.fold.iter().zip(&fold_ids) {
-                let ColumnData::I64(values) = self.decode_column(*column, id)? else {
+                let ColumnData::I64(values) = self.take_column(*column, id, &picked, keep.len())? else {
                     return Ok(None);
                 };
-                partial.sums.push(picked.iter().map(|&p| values[p] as i128).sum());
+                partial.sums.push(values.iter().map(|&v| v as i128).sum());
                 if let (Some(n), "occurred_at") = (query.last_n, *name) {
-                    partial.tail = picked[picked.len().saturating_sub(n)..].iter().map(|&p| values[p]).collect();
+                    partial.tail = values[values.len().saturating_sub(n)..].to_vec();
                 }
             }
             total.add(&partial, query.last_n);
@@ -322,13 +322,21 @@ impl OeReader {
         Ok(Some(total))
     }
 
-    /// One column block decoded straight from its encoded bytes, skipping the reader's per-row presence handling; a
-    /// block with no single raw form (paged or elided) goes through the full reader.
-    fn decode_column(&self, column: u32, granule: u32) -> Result<ColumnData> {
-        match self.file.read_column_raw(column, granule) {
-            Ok(raw) if raw.presence.is_empty() => Ok(decode_block(raw.pipeline, raw.body)?),
-            _ => Ok(self.file.read_column(column, granule)?.data),
+    /// The values at ascending `rows` of one column block: read straight from the encoded block when it has no nulls
+    /// (a sparse pick unpacks only what it needs), otherwise decoded through the reader and gathered.
+    fn take_column(&self, column: u32, granule: u32, rows: &[usize], row_count: usize) -> Result<ColumnData> {
+        if let Ok(raw) = self.file.read_column_raw(column, granule)
+            && raw.presence.is_empty()
+        {
+            if rows.len() == row_count {
+                return Ok(decode_block(raw.pipeline, raw.body)?);
+            }
+            return Ok(take_block_rows(raw.pipeline, raw.body, rows)?);
         }
+        let ColumnData::I64(values) = self.file.read_column(column, granule)?.data else {
+            return Err(anyhow!("fold column is not i64"));
+        };
+        Ok(ColumnData::I64(rows.iter().map(|&row| values[row]).collect()))
     }
 
     fn column_id(&self, name: &str) -> Result<u32> {

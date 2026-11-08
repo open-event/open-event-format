@@ -925,6 +925,67 @@ fn decode_delta_bitpack<T: IntValue>(reader: &mut Reader<'_>) -> Result<Vec<T>, 
     Ok(values)
 }
 
+/// The values at ascending `rows` of a delta bit-packed block, without materialising the block: vectors are unpacked
+/// one at a time into a reused buffer, only up to the vector holding the last requested row, with the running total
+/// carried across them.
+fn take_delta_bitpack<T: IntValue>(body: &[u8], rows: &[usize]) -> Result<Vec<T>, FormatError> {
+    let mut reader = Reader::new(body);
+    let first = reader.u64("delta first")?;
+    let stream = read_packed_stream(&mut reader)?;
+    let mut out = Vec::with_capacity(rows.len());
+    if !rows.is_sorted() {
+        // Rows out of order: decode once and gather.
+        let values = decode_delta_bitpack::<T>(&mut Reader::new(body))?;
+        return rows
+            .iter()
+            .map(|&row| values.get(row).copied().ok_or(FormatError::RefOutOfRange { what: "take row" }))
+            .collect();
+    }
+    if rows.last().is_some_and(|&row| row > stream.count) {
+        return Err(FormatError::RefOutOfRange { what: "take row" });
+    }
+    let mut wanted = rows.iter().copied().peekable();
+    while wanted.next_if_eq(&0).is_some() {
+        out.push(T::from_code(first));
+    }
+    let mut buffer = [0u64; FASTLANES_VECTOR];
+    let bytes_per_vector = FASTLANES_LANES * fastlanes_words_per_lane(stream.width as usize) * 8;
+    let mut carry = first;
+    let mut start = 1usize;
+    let mut vectors = stream.packed.chunks(bytes_per_vector.max(1));
+    while let Some(&row) = wanted.peek() {
+        if stream.width != 0 {
+            let Some(packed) = vectors.next() else {
+                return Err(FormatError::RefOutOfRange { what: "take row" });
+            };
+            unpack_vectors(packed, stream.width, &mut buffer, |code| unzigzag(code) as u64);
+        }
+        let end = start + FASTLANES_VECTOR;
+        let mut position = start;
+        let mut next = row;
+        loop {
+            if next >= end {
+                break;
+            }
+            for delta in buffer.get(position - start..=next - start).unwrap_or(&[]) {
+                carry = carry.wrapping_add(*delta);
+            }
+            out.push(T::from_code(carry));
+            position = next + 1;
+            wanted.next();
+            match wanted.peek() {
+                Some(&n) => next = n,
+                None => return Ok(out),
+            }
+        }
+        for delta in buffer.get(position - start..).unwrap_or(&[]) {
+            carry = carry.wrapping_add(*delta);
+        }
+        start = end;
+    }
+    Ok(out)
+}
+
 /// Turns a run of differences into the values they describe, in place: each slot becomes `carry` plus every
 /// difference up to and including its own, mapped back from the stored code with [`IntValue::from_code`]. Returns the
 /// last running total (still a stored code), so the next run can carry on from it. All sums wrap.

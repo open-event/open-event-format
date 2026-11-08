@@ -287,3 +287,19 @@ fn take_matches_full_decode_for_for_bitpack() {
         assert!(take_block_rows(block.pipeline, &block.bytes, &[5000]).is_err());
     }
 }
+
+#[test]
+fn take_matches_full_decode_for_delta_bitpack() {
+    let u: Vec<u64> = (0..5000u64).map(|row| 1_000_000 + row * 37 + (row * 7919) % 613).collect();
+    let i: Vec<i64> = (0..5000i64).map(|row| (row * 7919) % 613 - 300).collect();
+    for data in [ColumnData::U64(u), ColumnData::I64(i)] {
+        let block = forced(&data, Transform::DeltaBitpack);
+        for rows in [sample_rows(5000), vec![0, 0, 1, 1023, 1024, 1025, 2047, 4999], vec![4999, 3, 0], vec![]] {
+            assert_eq!(
+                take_block_rows(block.pipeline, &block.bytes, &rows).unwrap(),
+                oracle_gather(&data, &rows)
+            );
+        }
+        assert!(take_block_rows(block.pipeline, &block.bytes, &[5000]).is_err());
+    }
+}
