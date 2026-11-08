@@ -316,8 +316,24 @@ impl StringPredicate {
     /// Filters already-decoded values, one bool per row. This is the plain reference path the compressed-data kernels
     /// must agree with; it is also what a caller falls back to when no kernel applies.
     pub fn filter_decoded(&self, values: &StringColumn) -> Vec<bool> {
+        if let StringPredicate::InSet(needles) = self {
+            // Sorted and deduplicated once, so each row is one binary search rather than a walk of the whole list.
+            let set = sorted_needles(needles);
+            return values
+                .iter()
+                .map(|value| value.is_some_and(|value| set.binary_search(&value).is_ok()))
+                .collect();
+        }
         values.iter().map(|value| self.matches_value(value)).collect()
     }
+}
+
+/// `needles` sorted by byte order with duplicates removed, ready for binary search.
+fn sorted_needles(needles: &[String]) -> Vec<&str> {
+    let mut set: Vec<&str> = needles.iter().map(String::as_str).collect();
+    set.sort_unstable();
+    set.dedup();
+    set
 }
 
 /// Tries to answer `predicate` straight from an encoded string block, without decoding every row to text.
@@ -398,6 +414,21 @@ pub fn count_string_block_shared(
             Ok(Some(count_fsst_contains(&body, side, matcher)?))
         }
         (Transform::RawString, StringPredicate::Contains(matcher)) => Ok(Some(count_raw_contains(&body, matcher)?)),
+        // A block-local dictionary counts from its codes alone: one histogram over the codes, then the predicate is
+        // tested once per dictionary entry, with no row-sized mask.
+        (Transform::DictionaryString, _) if side != SideStream::FileScopeDictionary => {
+            let codes = super::lazy::dictionary_codes_from_body(&body, side, None)?;
+            let test = dictionary_code_test(predicate, codes.dictionary());
+            Ok(Some(
+                codes
+                    .code_counts()
+                    .iter()
+                    .enumerate()
+                    .filter(|(code, _)| test.matches(*code as u64))
+                    .map(|(_, count)| *count as usize)
+                    .sum(),
+            ))
+        }
         _ => Ok(
             filter_string_block_shared_with_body(pipeline, &body, predicate, shared)?
                 .map(|mask| mask.into_iter().filter(|matched| *matched).count()),
@@ -637,7 +668,9 @@ impl FsstTest {
     fn matches(&self, compressed: &[u8]) -> bool {
         match self {
             FsstTest::Equals(term) => compressed == term.as_slice(),
-            FsstTest::InSet(terms) => terms.iter().any(|term| term.as_slice() == compressed),
+            FsstTest::InSet(terms) => terms
+                .binary_search_by(|term| term.as_slice().cmp(compressed))
+                .is_ok(),
             FsstTest::NotEquals(term) => compressed != term.as_slice(),
         }
     }
@@ -648,16 +681,21 @@ impl FsstTest {
 fn filter_fsst(body: &[u8], predicate: &StringPredicate) -> Result<Vec<bool>, FormatError> {
     let mut reader = Reader::new(body);
     let nulls = super::NullStream::read(&mut reader)?;
-    let compressor = read_fsst_compressor(&mut reader)?;
+    // The needle encoder writes the codes the crate's compressor would, without building its lookup tables.
+    let encoder = super::FsstDecodeTable::read(&mut reader)?.needle_encoder();
     let test = match predicate {
-        StringPredicate::Equals(needle) => FsstTest::Equals(compressor.compress(needle.as_bytes())),
-        StringPredicate::NotEquals(needle) => FsstTest::NotEquals(compressor.compress(needle.as_bytes())),
-        StringPredicate::InSet(needles) => FsstTest::InSet(
-            needles
+        StringPredicate::Equals(needle) => FsstTest::Equals(encoder.compress(needle.as_bytes())),
+        StringPredicate::NotEquals(needle) => FsstTest::NotEquals(encoder.compress(needle.as_bytes())),
+        StringPredicate::InSet(needles) => {
+            // Compressed once, then sorted and deduplicated so each row is a binary search over the terms.
+            let mut terms: Vec<Vec<u8>> = needles
                 .iter()
-                .map(|needle| compressor.compress(needle.as_bytes()))
-                .collect(),
-        ),
+                .map(|needle| encoder.compress(needle.as_bytes()))
+                .collect();
+            terms.sort_unstable();
+            terms.dedup();
+            FsstTest::InSet(terms)
+        }
         StringPredicate::Contains(_) => {
             return Err(FormatError::Structural {
                 rule: "FSST substring predicates are answered by the arena kernel, not the equality kernel",
@@ -670,19 +708,42 @@ fn filter_fsst(body: &[u8], predicate: &StringPredicate) -> Result<Vec<bool>, Fo
         }
     };
     let present_count = reader.u32("fsst present count")? as usize;
-    let offsets = super::read_offsets(&mut reader, present_count)?;
-    let data_len = offsets.last().copied().unwrap_or(0);
+    // The offset table is read in place, one `u32` per boundary, rather than copied into a `Vec<usize>` first.
+    let table = reader.take(present_count.saturating_add(1).saturating_mul(4), "string offset")?;
+    let (entries, _) = table.as_chunks::<4>();
+    let data_len = entries.last().map_or(0, |entry| u32::from_le_bytes(*entry) as usize);
     let data = reader.take(data_len, "fsst data")?;
-    let mut present = Vec::with_capacity(reader.capacity_hint(present_count, 1));
-    for pair in offsets.windows(2) {
-        let [start, end] = pair else { continue };
+    let mut present = Vec::with_capacity(present_count);
+    let mut start = entries.first().map_or(0, |entry| u32::from_le_bytes(*entry) as usize);
+    if let FsstTest::Equals(term) = &test {
+        // The common point lookup: a value can only equal the term when its compressed length does, so most rows are
+        // decided from the offsets alone and only same-length values are compared byte for byte.
+        let want = term.len();
+        let mut monotone = true;
+        for entry in entries.iter().skip(1) {
+            let end = u32::from_le_bytes(*entry) as usize;
+            monotone &= end >= start;
+            let hit = end.wrapping_sub(start) == want && data.get(start..end).is_some_and(|value| value == term.as_slice());
+            present.push(hit);
+            start = end;
+        }
+        if !monotone {
+            return Err(FormatError::Structural {
+                rule: "fsst offsets must be non-decreasing",
+            });
+        }
+        return weave_present(&nulls, present);
+    }
+    for entry in entries.iter().skip(1) {
+        let end = u32::from_le_bytes(*entry) as usize;
         if end < start {
             return Err(FormatError::Structural {
                 rule: "fsst offsets must be non-decreasing",
             });
         }
-        let compressed = slice(data, *start, end - start, "fsst value")?;
+        let compressed = slice(data, start, end - start, "fsst value")?;
         present.push(test.matches(compressed));
+        start = end;
     }
     weave_present(&nulls, present)
 }
@@ -1866,6 +1927,30 @@ fn zigzag_lane_range(base: u64, (lo, hi): (i64, i64)) -> Option<PackedLaneRange>
 /// straight into one verdict per row through the runtime-dispatched SIMD kernel — the decoded values are never
 /// materialised. `kind` says how the lanes map to the comparison domain: identity for a `u64` column, zigzag codes for
 /// an `i64` column.
+/// Filters a run-length block from its runs: the predicate is tested once per run and its verdict repeated over the
+/// run's rows, so a block of a few long runs costs a few tests rather than one per row.
+fn filter_rle_block(body: &[u8], predicate: &NumericPredicate, kind: ValueKind) -> Result<Vec<bool>, FormatError> {
+    let mut reader = Reader::new(body);
+    let run_count = reader.u32("rle run count")? as usize;
+    let mut mask = Vec::new();
+    for _ in 0..run_count {
+        let value = reader.u64("rle value")?;
+        let count = reader.u32("rle count")? as usize;
+        if mask.len() + count > super::constant::MAX_RLE_EXPANSION_VALUES {
+            return Err(FormatError::Structural {
+                rule: "rle expansion too large",
+            });
+        }
+        let value = if kind == ValueKind::I64 {
+            i128::from(unzigzag(value))
+        } else {
+            i128::from(value)
+        };
+        mask.extend(std::iter::repeat_n(predicate.matches_i128(value), count));
+    }
+    Ok(mask)
+}
+
 fn filter_for_block(body: &[u8], predicate: &NumericPredicate, kind: ValueKind) -> Result<Vec<bool>, FormatError> {
     let mut reader = Reader::new(body);
     let base = reader.u64("for base")?;
@@ -2069,6 +2154,7 @@ pub fn filter_numeric_block_with_body(
     }
     let mask = match transform {
         Transform::DeltaBitpack => filter_delta_block(body, predicate, kind)?,
+        Transform::Rle => filter_rle_block(body, predicate, kind)?,
         _ => filter_for_block(body, predicate, kind)?,
     };
     Ok(Some(mask))
@@ -2083,8 +2169,10 @@ fn numeric_block_has_fast_path(pipeline: PipelineId) -> Result<bool, FormatError
         return Ok(false);
     }
     Ok(transform == Transform::Decimal128
-        || (matches!(transform, Transform::ForBitpack | Transform::DeltaBitpack)
-            && matches!(kind, ValueKind::U64 | ValueKind::I64)))
+        || (matches!(
+            transform,
+            Transform::ForBitpack | Transform::DeltaBitpack | Transform::Rle
+        ) && matches!(kind, ValueKind::U64 | ValueKind::I64)))
 }
 
 /// Answers a numeric predicate, falling back to a full decode when no compressed-data fast path applies.

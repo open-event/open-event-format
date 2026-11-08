@@ -188,3 +188,12 @@ pub const ZSTD_LENGTH_PREFIX_BYTES: usize = 4;
 /// so a narrow range — a point read most of all — is far cheaper addressed directly; the crossover sits well above
 /// this bound, which is set low enough that neither side can lose.
 pub const FASTLANES_SPARSE_MAX_VALUES: usize = 64;
+
+/// An FSST string block keeps a trailing codec only when the codec stores it in at most this many parts in
+/// [`FSST_TRAILING_MAX_RATIO_DEN`] of its size. Equality filters answer an FSST block by comparing stored codes, which
+/// they can do in place only on a block with no trailing stage, so a codec that merely trims the block costs every
+/// filter a decompression for little saving.
+pub const FSST_TRAILING_MAX_RATIO_NUM: usize = 1;
+
+/// Denominator of the FSST trailing bar. See [`FSST_TRAILING_MAX_RATIO_NUM`].
+pub const FSST_TRAILING_MAX_RATIO_DEN: usize = 2;

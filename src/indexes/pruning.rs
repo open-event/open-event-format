@@ -18,6 +18,8 @@
 //! min/max-only granule scanning.
 
 use super::Exactness;
+use super::bool_pruning::{ExprQuery, FilterExpr};
+use crate::layout::reader::query_scan::ScanOrder;
 use hashbrown::HashMap;
 
 /// What a single statistic concludes about a single filter clause for one granule: either it has *proven* that no row
@@ -67,9 +69,88 @@ pub enum PredicateKind {
 /// A granule is dropped only if some clause is *proven* unsatisfiable there; a clause with no statistic able to falsify
 /// it simply keeps the granule. The clauses are ANDed: proving any one clause absent is enough to drop the granule,
 /// because a row must satisfy all of them to match.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// An `IN (…)` list rides along in `memberships`: its [`InList::clause`] sits in `clauses` like any other clause, and
+/// every statistic judging that clause probes the sorted list instead of its `[lo, hi]` envelope, so a granule whose
+/// values fall in a gap between listed values is dropped too.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Filter {
     pub clauses: Vec<FilterClause>,
+    pub memberships: Vec<InList>,
+}
+
+impl Filter {
+    pub fn new(clauses: Vec<FilterClause>) -> Self {
+        Filter {
+            clauses,
+            memberships: Vec::new(),
+        }
+    }
+
+    /// Adds `column_id IN (values)`. A gap-free list becomes a plain range clause; any other list adds its envelope
+    /// clause plus the list that judges it.
+    pub fn with_in_list(mut self, column_id: u32, values: Vec<i128>) -> Self {
+        let in_list = InList::new(column_id, MembershipList::new(values));
+        self.clauses.push(in_list.clause);
+        if in_list.clause.predicate != PredicateKind::Range {
+            self.memberships.push(in_list);
+        }
+        self
+    }
+
+    /// The membership list that judges `clause`, when the clause came from one.
+    pub fn membership_for(&self, clause: &FilterClause) -> Option<&MembershipList> {
+        self.memberships
+            .iter()
+            .find(|in_list| in_list.clause == *clause)
+            .map(|in_list| &in_list.list)
+    }
+}
+
+/// One column's `IN (…)` list together with the clause that stands for it in a [`Filter`] or
+/// [`FilterExpr`](super::bool_pruning::FilterExpr).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InList {
+    /// The list's envelope (a `Range` when the list is gap-free). An empty list gets an inverted `Membership` range,
+    /// which bounds statistics rule out and no row satisfies.
+    pub clause: FilterClause,
+    pub list: MembershipList,
+}
+
+impl InList {
+    pub fn new(column_id: u32, list: MembershipList) -> Self {
+        let clause = list.clause(column_id).unwrap_or(FilterClause {
+            column_id,
+            predicate: PredicateKind::Membership,
+            value_hi: i128::MIN,
+            value_lo: i128::MAX,
+        });
+        InList { clause, list }
+    }
+
+    /// Whether one row's value is listed, given an exact per-clause row test over this column: a binary search over
+    /// the list driven by `value <= listed` range probes, then one equality probe.
+    pub fn matches_row(&self, clause_matches: &mut impl FnMut(&FilterClause) -> bool) -> bool {
+        let values = self.list.values();
+        let probe = |predicate, value_lo, value_hi| FilterClause {
+            column_id: self.clause.column_id,
+            predicate,
+            value_hi,
+            value_lo,
+        };
+        let (mut lo, mut hi) = (0, values.len());
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if clause_matches(&probe(PredicateKind::Range, i128::MIN, values[mid])) {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        values
+            .get(lo)
+            .is_some_and(|&value| clause_matches(&probe(PredicateKind::Equality, value, value)))
+    }
 }
 
 /// One statistic a granule carries, together with the summary data it needs to judge a clause — modelled as *data*, so
@@ -224,6 +305,38 @@ impl Statistic {
             | Statistic::SingleSpan { .. }
             | Statistic::TextToken { .. }
             | Statistic::TimeBounds { .. } => false,
+        }
+    }
+
+    /// [`Self::judge`], except that a clause standing for an `IN (…)` list is judged against the sorted list itself:
+    /// bounds and spans by binary search for a listed value inside them, member sets by a binary search per member.
+    pub fn judge_in(&self, clause: &FilterClause, list: Option<&MembershipList>) -> StatVerdict {
+        let Some(list) = list else {
+            return self.judge(clause);
+        };
+        let could_match = match self {
+            Statistic::MinMaxBound { max, min, .. } => list.any_in(*min, *max),
+            Statistic::SequenceBounds {
+                max_sequence,
+                min_sequence,
+                ..
+            } => list.any_in(*min_sequence, *max_sequence),
+            Statistic::TimeBounds { max_time, min_time, .. } => list.any_in(*min_time, *max_time),
+            Statistic::PointMembership { members, .. } => members.iter().any(|&m| list.contains(m)),
+            Statistic::TextToken { token_hashes, .. } => token_hashes.iter().any(|&h| list.contains(h)),
+            Statistic::SingleMember { member, .. } => member.is_some_and(|m| list.contains(m)),
+            Statistic::RangeEmptiness { non_empty_spans, .. } => {
+                non_empty_spans.iter().any(|&(lo, hi)| list.any_in(lo, hi))
+            }
+            Statistic::SingleSpan { span, .. } => span.is_some_and(|(lo, hi)| list.any_in(lo, hi)),
+            Statistic::NullCount { .. } | Statistic::PathPresence { .. } => {
+                return self.judge(clause);
+            }
+        };
+        if could_match {
+            StatVerdict::CouldMatch
+        } else {
+            StatVerdict::ProvenAbsent
         }
     }
 
@@ -395,13 +508,22 @@ pub struct PruneOutcome {
 /// A query that has been planned against the statistics a granule may carry.
 ///
 /// Either the query is answerable from an exact aggregate block, cube cell, or sketch — in which case it takes the
-/// `AggregateShortcut` and skips granule scanning entirely — or it falls through to a `Scan` carrying the pruning
-/// expression that will be evaluated per granule. Choosing the shortcut never weakens to min/max-only pruning; the two
-/// tiers compose.
+/// `AggregateShortcut` and skips granule scanning entirely — or it falls through to a `Scan`. A scan carries the
+/// boolean `filter` (pruned per granule with [`drops_granule`](super::bool_pruning::drops_granule) and applied to kept
+/// rows as its [`residual`](super::bool_pruning::residual)), the row `limit` and `order` pushed down to
+/// [`OeFile::execute_query`](crate::layout::reader::OeFile::execute_query), and — when the filter is a flat
+/// conjunction — the term-list `pruning` expression evaluated by [`evaluate`]. Choosing the shortcut never weakens to
+/// min/max-only pruning; the two tiers compose.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryPlan {
     AggregateShortcut,
-    Scan { pruning: PruningExpression },
+    Scan {
+        filter: FilterExpr,
+        limit: Option<usize>,
+        order: ScanOrder,
+        /// `None` when the filter holds an `Or` and so has no flat term list.
+        pruning: Option<PruningExpression>,
+    },
 }
 
 /// One query plus the one fact pruning needs to know about the shortcut tier: can an exact aggregate / cube / sketch
@@ -464,7 +586,7 @@ pub fn evaluate(expr: &PruningExpression, granule: &GranuleStatistics) -> PruneO
         let Some(stat) = granule.matching(&term.statistic) else {
             continue;
         };
-        match stat.judge(&term.clause) {
+        match stat.judge_in(&term.clause, expr.filter.membership_for(&term.clause)) {
             StatVerdict::ProvenAbsent => {
                 // One clause proven unsatisfiable drops the granule outright; a dropped granule needs no residual
                 // filter.
@@ -525,32 +647,117 @@ pub fn prune_pages_in_granule(
 /// [`QueryPlan::AggregateShortcut`] and does not build a granule-pruning scan — the more powerful path answers it, and
 /// pruning never downgrades it to min/max-only scanning. Otherwise it returns a [`QueryPlan::Scan`] whose pruning
 /// expression is built from the declared statistics.
-pub fn plan_query(query: &Query, declared: &GranuleStatistics) -> QueryPlan {
+///
+/// This is the one planning entry point: it takes an AND-only [`Query`] or a boolean [`ExprQuery`] with a limit and
+/// order, by value or by reference.
+pub fn plan_query(query: impl Into<ExprQuery>, declared: &GranuleStatistics) -> QueryPlan {
+    let query = query.into();
     if query.answerable_from_aggregate {
         return QueryPlan::AggregateShortcut;
     }
     QueryPlan::Scan {
-        pruning: build_pruning_expression(&query.filter, declared),
+        pruning: query
+            .filter
+            .as_conjunction()
+            .map(|filter| build_pruning_expression(&filter, declared)),
+        filter: query.filter,
+        limit: query.limit,
+        order: query.order,
+    }
+}
+
+/// A query's `IN (…)` list over an ordered column, sorted and deduplicated once so every later probe — a granule's
+/// min/max bounds, or a single value — is a binary search rather than a walk of the whole list.
+///
+/// A [`FilterClause`] summarises a membership list by its `[lo, hi]` envelope, which keeps a granule whose bounds sit
+/// in a gap between listed values; [`Self::judge_bounds`] drops it. A list that names every value of a contiguous span
+/// is exactly a range, so [`Self::clause`] turns it into a [`PredicateKind::Range`] clause.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MembershipList {
+    values: Vec<i128>,
+}
+
+impl MembershipList {
+    pub fn new(mut values: Vec<i128>) -> Self {
+        values.sort_unstable();
+        values.dedup();
+        Self { values }
+    }
+
+    /// The listed values, ascending and distinct.
+    pub fn values(&self) -> &[i128] {
+        &self.values
+    }
+
+    pub fn contains(&self, value: i128) -> bool {
+        self.values.binary_search(&value).is_ok()
+    }
+
+    /// Whether any listed value falls in the inclusive span `[lo, hi]`.
+    pub fn any_in(&self, lo: i128, hi: i128) -> bool {
+        if lo > hi {
+            return false;
+        }
+        let first_at_or_above = self.values.partition_point(|value| *value < lo);
+        self.values.get(first_at_or_above).is_some_and(|value| *value <= hi)
+    }
+
+    /// What a granule's `[min, max]` bounds conclude about the list: absent unless some listed value lies inside them.
+    pub fn judge_bounds(&self, min: i128, max: i128) -> StatVerdict {
+        if self.any_in(min, max) {
+            StatVerdict::CouldMatch
+        } else {
+            StatVerdict::ProvenAbsent
+        }
+    }
+
+    /// The clause this list contributes to a [`Filter`]: a `Range` over the span when the list covers it without a
+    /// gap, otherwise a `Membership` summarised by its envelope. `None` for an empty list, which matches nothing.
+    pub fn clause(&self, column_id: u32) -> Option<FilterClause> {
+        let (&value_lo, &value_hi) = (self.values.first()?, self.values.last()?);
+        let contiguous = value_hi
+            .checked_sub(value_lo)
+            .and_then(|span| span.checked_add(1))
+            .is_some_and(|span| span == self.values.len() as i128);
+        Some(FilterClause {
+            column_id,
+            predicate: if contiguous {
+                PredicateKind::Range
+            } else {
+                PredicateKind::Membership
+            },
+            value_hi,
+            value_lo,
+        })
     }
 }
 
 /// Whether a page survives the filter: the same keep/drop verdict as `evaluate(&build_pruning_expression(filter,
 /// stats), stats)`, computed by borrowing instead of building and discarding an expression per page.
-///
-/// Each relevant clause/statistic pair is judged against the page's first statistic of the same kind and column, exactly
-/// as `evaluate` looks up a term's statistic, and the search stops at the first `ProvenAbsent`.
 fn page_could_match(filter: &Filter, stats: &GranuleStatistics) -> bool {
-    !filter.clauses.iter().any(|clause| {
-        stats
-            .statistics
-            .iter()
-            .filter(|statistic| statistic.relevant_to(clause))
-            .any(|statistic| {
-                stats
-                    .matching(statistic)
-                    .is_some_and(|own| own.judge(clause) == StatVerdict::ProvenAbsent)
-            })
-    })
+    !filter
+        .clauses
+        .iter()
+        .any(|clause| clause_proven_absent(clause, filter.membership_for(clause), stats))
+}
+
+/// Whether the granule's statistics prove no row satisfies `clause` (judged against `list` when the clause stands for
+/// an `IN (…)` list). Each relevant statistic is judged against the granule's first statistic of the same kind and
+/// column, exactly as [`evaluate`] looks up a term's statistic. Shared by page pruning and the boolean tree's leaves.
+pub(crate) fn clause_proven_absent(
+    clause: &FilterClause,
+    list: Option<&MembershipList>,
+    granule: &GranuleStatistics,
+) -> bool {
+    granule
+        .statistics
+        .iter()
+        .filter(|statistic| statistic.relevant_to(clause))
+        .any(|statistic| {
+            granule
+                .matching(statistic)
+                .is_some_and(|own| own.judge_in(clause, list) == StatVerdict::ProvenAbsent)
+        })
 }
 
 /// The exactness of the SkipIndex a statistic comes from.

@@ -680,3 +680,37 @@ fn scrambled_and_repeated_marks_encode_to_the_same_bytes_as_sorted_marks() {
         assert_encodes_like_a_built_bitmap(&name, &scrambled, form);
     }
 }
+
+/// A granule's selection is decided from the deleted runs: fully deleted selects none whatever the predicate, untouched
+/// without a predicate selects all, and otherwise the keep mask is the predicate with deleted rows cleared — classified
+/// so an all-true or all-false result is never applied row by row.
+#[test]
+fn granule_selections_skip_empty_masks_and_full_masks() {
+    let mut deleted = DeletionVector::new();
+    for ordinal in (10..20).chain([22, 23]) {
+        deleted.mark_deleted(ordinal);
+    }
+    assert_eq!(deleted.deleted_in(0, 10), 0);
+    assert_eq!(deleted.deleted_in(10, 10), 10);
+    assert_eq!(deleted.deleted_in(15, 10), 7);
+    assert_eq!(deleted.deleted_in(5, 30), 12);
+
+    assert_eq!(deleted.selection(0, 10, None), RowSelection::All);
+    assert_eq!(deleted.selection(10, 10, None), RowSelection::None);
+    assert_eq!(deleted.selection(10, 10, Some(vec![true; 10])), RowSelection::None);
+    let partial = deleted.selection(20, 5, None);
+    assert_eq!(partial, RowSelection::Some(vec![true, true, false, false, true]));
+
+    // The predicate keeps only rows the deletions remove: nothing is left.
+    assert_eq!(
+        deleted.selection(20, 5, Some(vec![false, false, true, true, false])),
+        RowSelection::None
+    );
+    // The predicate keeps every live row of an untouched granule.
+    assert_eq!(deleted.selection(0, 3, Some(vec![true; 3])), RowSelection::All);
+    assert_eq!(
+        deleted.selection(20, 5, Some(vec![true, false, true, true, true])),
+        RowSelection::Some(vec![true, false, false, false, true])
+    );
+    assert_eq!(RowSelection::from_mask(vec![]), RowSelection::None);
+}

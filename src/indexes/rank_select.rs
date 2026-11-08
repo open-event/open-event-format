@@ -113,6 +113,95 @@ impl RankSelect {
     }
 }
 
+/// Bits per [`BitRankDirectory`] superblock: eight 64-bit words, so a rank query costs one directory read plus at most
+/// eight hardware popcounts.
+const RANK_SUPERBLOCK_BITS: usize = 512;
+
+/// A rank directory over a packed LSB-0 bit vector (bit `i` is bit `i % 8` of byte `i / 8`), such as a row selection.
+///
+/// One cumulative count is stored per [`RANK_SUPERBLOCK_BITS`]-bit superblock, so `rank(pos)` is one directory read
+/// plus a POPCNT over at most eight words, and the selected count inside any row range `[start, end)` is two ranks.
+/// A run-length block filtered by such a selection counts each run's surviving rows that way in one pass over the
+/// runs, never one test per row.
+#[derive(Debug, Clone)]
+pub struct BitRankDirectory<'a> {
+    bits: &'a [u8],
+    len: usize,
+    /// `superblocks[i]` = set bits in `[0, i * RANK_SUPERBLOCK_BITS)`.
+    superblocks: Vec<u64>,
+}
+
+impl<'a> BitRankDirectory<'a> {
+    /// Indexes the first `len` bits of `bits`; bits at or past `len`, or past the end of `bits`, count as unset.
+    pub fn new(bits: &'a [u8], len: usize) -> Self {
+        let len = len.min(bits.len().saturating_mul(8));
+        let full = len / RANK_SUPERBLOCK_BITS;
+        let mut superblocks = Vec::with_capacity(full + 1);
+        let mut running = 0u64;
+        superblocks.push(0);
+        for block in bits.chunks(RANK_SUPERBLOCK_BITS / 8).take(full) {
+            running += popcount_bytes(block);
+            superblocks.push(running);
+        }
+        Self { bits, len, superblocks }
+    }
+
+    /// Number of bits the directory covers.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the directory covers no bits.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Set bits strictly before `position` (clamped to [`Self::len`]).
+    pub fn rank(&self, position: usize) -> u64 {
+        let position = position.min(self.len);
+        let block = position / RANK_SUPERBLOCK_BITS;
+        let base = self.superblocks.get(block).copied().unwrap_or(0);
+        let start_byte = block * (RANK_SUPERBLOCK_BITS / 8);
+        let end_byte = position / 8;
+        let whole = self.bits.get(start_byte..end_byte).map_or(0, popcount_bytes);
+        let tail_bits = position % 8;
+        let tail = if tail_bits == 0 {
+            0
+        } else {
+            self.bits
+                .get(end_byte)
+                .map_or(0, |byte| u64::from((byte & ((1u8 << tail_bits) - 1)).count_ones()))
+        };
+        base + whole + tail
+    }
+
+    /// Set bits in `[start, end)`.
+    pub fn count_range(&self, start: usize, end: usize) -> u64 {
+        if end <= start {
+            return 0;
+        }
+        self.rank(end) - self.rank(start)
+    }
+
+    /// Total set bits.
+    pub fn total(&self) -> u64 {
+        self.rank(self.len)
+    }
+}
+
+/// Popcount of a byte slice, eight bytes per hardware popcount.
+fn popcount_bytes(bytes: &[u8]) -> u64 {
+    let mut words = bytes.chunks_exact(8);
+    let mut count = 0u64;
+    for word in words.by_ref() {
+        count += u64::from(u64::from_le_bytes(word.try_into().unwrap_or([0; 8])).count_ones());
+    }
+    for byte in words.remainder() {
+        count += u64::from(byte.count_ones());
+    }
+    count
+}
+
 #[cfg(test)]
 #[path = "test/rank_select.rs"]
 mod tests;

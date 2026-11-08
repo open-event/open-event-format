@@ -809,6 +809,65 @@ fn read_payload_paths_agrees_with_the_per_row_path_read() {
     );
 }
 
+/// Long, distinct text values (FSST-encoded blocks) read through the batched path's sparse take agree with the per-row
+/// read and with whole payload reconstruction, and an FSST block's plaintext size computed from its codes matches its
+/// decoded text.
+#[test]
+fn batched_reads_over_long_text_agree_and_fsst_plaintext_size_matches_decode() {
+    let notes: Vec<String> = (0..48u64)
+        .map(|i| format!("free text body {i} about deal {} in region {}", i * 7919, i % 5))
+        .collect();
+    let mut rows: Vec<_> = (0..48u64)
+        .map(|i| freetext_row(i, (i % 5 != 2).then(|| notes[i as usize].as_str())))
+        .collect();
+    for (ordinal, row) in rows.iter_mut().enumerate() {
+        if let PayloadInput::Variant(VariantValue::Object(fields)) = &mut row.event.payload {
+            fields.insert(
+                "label".to_owned(),
+                VariantValue::String(format!("label-{ordinal}-{}", "x".repeat(ordinal % 40))),
+            );
+        }
+    }
+    // Granules of 24 rows: enough values per block for the encoder to pick FSST over raw.
+    let mut config = freetext_config();
+    config.targets.index_granularity = 24;
+    let built = build_oe_file(rows, &config).unwrap();
+    let file = OeFile::open(built.bytes, Some(&built.file_seal)).unwrap();
+    let refs: Vec<PayloadRef> = [40, 1, 2, 3, 5, 3, 47, 12, 13, 14, 15, 0, 30, 31]
+        .into_iter()
+        .map(|row_ordinal| PayloadRef { row_ordinal })
+        .collect();
+    for path in ["label", "note", "amount"] {
+        let batched = file.read_payload_paths(&refs, path).unwrap();
+        for (reference, value) in refs.iter().zip(&batched) {
+            assert_eq!(
+                *value,
+                file.payload_path(reference.row_ordinal, path).unwrap(),
+                "`{path}`"
+            );
+        }
+    }
+    let batch = file.read_payloads(&refs).unwrap();
+    for (reference, payload) in refs.iter().zip(&batch.payloads) {
+        assert_eq!(*payload, file.payload(reference.row_ordinal).unwrap());
+    }
+    let mut fsst_blocks = 0;
+    for column in &file.footer.columns {
+        for granule in &file.footer.granules {
+            let Ok(Some(bytes)) = file.string_block_plaintext_bytes(column.column_id, granule.granule_id) else {
+                continue;
+            };
+            let ColumnData::Strings(values) = file.read_column(column.column_id, granule.granule_id).unwrap().data
+            else {
+                panic!("an FSST block decodes to strings");
+            };
+            assert_eq!(bytes, values.text_len() as u64);
+            fsst_blocks += 1;
+        }
+    }
+    assert!(fsst_blocks > 0, "the long text must store at least one FSST block");
+}
+
 /// The point of the batch: each granule the references reach into is visited once. The per-row read fetches the
 /// path's column block again for every row it answers, which is what the batch is there to stop paying.
 #[test]

@@ -31,7 +31,8 @@ use crate::encoding::decompressor::active_decompressor;
 use crate::encoding::{
     ColumnData, Compression, PipelineId, PresenceRank, SharedStringViewDictionary, SideStream, Transform, ValueKind,
     count_set_bits, decode_block_range_shared, decode_block_shared, decode_string_block_views_shared_prepared,
-    prepare_shared_string_view_dictionary, present_position, seekable_zstd,
+    fsst_uncompressed_len, prepare_shared_string_view_dictionary, present_position, seekable_zstd,
+    take_block_rows_shared,
 };
 use crate::error::FormatError;
 use crate::events::provenance::hex_lower;
@@ -60,6 +61,9 @@ use zeekstd::SeekTable;
 #[path = "scan.rs"]
 pub mod scan;
 pub use scan::*;
+
+#[path = "query_scan.rs"]
+pub mod query_scan;
 
 /// Concatenates two `ColumnData` values of the same variant. Returns an error when the variants differ (a structural
 /// violation — multi-page marks within one granule always encode the same column type).
@@ -233,10 +237,19 @@ enum PathBlock<'a> {
     Located {
         rank: PresenceRank,
         raw: RawColumnBlock<'a>,
+        /// The batch's rows for this granule, decoded up front by one sparse take when the batch asks for several.
+        taken: Option<TakenRows>,
     },
     /// A block with no per-value form — multi-page, an elided constant, or a pipeline that cannot address one value —
     /// decoded whole once for the granule and answered from its rank index.
     Whole(Arc<CachedColumn>),
+}
+
+/// One granule's batch rows (ascending, within the granule) and their values, decoded by one sparse take.
+#[derive(Debug)]
+struct TakenRows {
+    rows: Vec<u64>,
+    values: Vec<Option<VariantValue>>,
 }
 
 /// The state a batched single-path payload read carries while it visits one granule: which columns the requested path
@@ -247,7 +260,25 @@ struct PathGroup<'a> {
     block: Option<PathBlock<'a>>,
     freetext_column: Option<u32>,
     granule: &'a GranuleEntry,
+    /// The granule's rows this batch asks for, ascending and deduplicated.
+    rows: Vec<u64>,
     shredded_column: Option<u32>,
+}
+
+/// The rows of `granule` the sorted batch asks for, starting at `order[from]`: ascending, deduplicated, relative to
+/// the granule's first row.
+fn batch_rows_in_granule(refs: &[PayloadRef], order: &[usize], from: usize, granule: &GranuleEntry) -> Vec<u64> {
+    let end = granule.first_row_ordinal.saturating_add(u64::from(granule.row_count));
+    let mut rows: Vec<u64> = order
+        .get(from..)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|&index| refs.get(index).map(|reference| reference.row_ordinal))
+        .take_while(|&row| row >= granule.first_row_ordinal && row < end)
+        .map(|row| row - granule.first_row_ordinal)
+        .collect();
+    rows.dedup();
+    rows
 }
 
 /// The state a batched full-payload read ([`OeFile::read_payloads`]) carries while it visits one granule: every
@@ -261,6 +292,8 @@ struct PayloadGroup<'a> {
     flags: Arc<CachedColumn>,
     granule: &'a GranuleEntry,
     payload: &'a PayloadGranule,
+    /// The granule's rows this batch asks for, ascending and deduplicated.
+    rows: Vec<u64>,
 }
 
 /// One inflated span of a granule's residual arena, with the same eviction accounting as [`CachedColumnSlot`].
@@ -2955,6 +2988,21 @@ impl OeFile {
         Ok(reads)
     }
 
+    /// The plaintext bytes a single-page FSST string block's present values decode to, computed from the block's
+    /// symbol lengths without decompressing a value ([`fsst_uncompressed_len`]). `None` for any other block — a
+    /// different transform, a multi-page or elided block, or a framed seekable-Zstandard one — whose caller sizes it
+    /// from a decode or the mark instead.
+    pub fn string_block_plaintext_bytes(&self, column_id: u32, granule_id: u32) -> Result<Option<u64>, FormatError> {
+        let Some(mark) = self.mark(column_id, 0, granule_id)? else {
+            return Ok(None);
+        };
+        if mark.page_count > 1 || mark.compressed_size == 0 {
+            return Ok(None);
+        }
+        let raw = self.read_column_raw_with_mark(granule_id, &mark)?;
+        Ok(fsst_uncompressed_len(raw.pipeline, raw.body)?.map(|len| len as u64))
+    }
+
     /// Reads one page from a `(column, granule)` block by its page index.
     ///
     /// When per-page marks are available, only the page's own byte range is read — no neighbouring pages are touched.
@@ -3741,7 +3789,7 @@ impl OeFile {
         // The current group's accelerators — resolved once per run of ascending rows that share a granule, and
         // served to every one of them (see `PayloadGroup`).
         let mut group: Option<PayloadGroup<'_>> = None;
-        for index in order {
+        for (from, &index) in order.iter().enumerate() {
             let row_ordinal = refs[index].row_ordinal;
             let in_group = group.as_ref().is_some_and(|group| {
                 group.granule.first_row_ordinal <= row_ordinal
@@ -3754,7 +3802,8 @@ impl OeFile {
             if !in_group {
                 let granule = self.granule_of_row(row_ordinal)?;
                 let payload = self.payload_granule(granule.granule_id)?;
-                group = Some(self.payload_group(granule, payload)?);
+                let rows = batch_rows_in_granule(refs, &order, from, granule);
+                group = Some(self.payload_group(granule, payload, rows)?);
             }
             if let Some(group) = group.as_mut() {
                 let row_in_granule = row_ordinal - group.granule.first_row_ordinal;
@@ -3805,6 +3854,7 @@ impl OeFile {
         &'a self,
         granule: &'a GranuleEntry,
         payload: &'a PayloadGranule,
+        rows: Vec<u64>,
     ) -> Result<PayloadGroup<'a>, FormatError> {
         Ok(PayloadGroup {
             dictionary: None,
@@ -3812,6 +3862,7 @@ impl OeFile {
             flags: self.cached_column(crate::columns::column_ids::PAYLOAD_FLAGS, granule.granule_id)?,
             granule,
             payload,
+            rows,
         })
     }
 
@@ -3862,7 +3913,7 @@ impl OeFile {
         row_in_granule: u64,
     ) -> Result<Option<VariantValue>, FormatError> {
         if !group.field_blocks.contains_key(&column_id) {
-            let block = self.path_block(column_id, group.granule.granule_id)?;
+            let block = self.path_block(column_id, group.granule.granule_id, &group.rows)?;
             group.field_blocks.insert(column_id, block);
         }
         let block = group.field_blocks.get(&column_id).expect("resolved above");
@@ -3960,7 +4011,7 @@ impl OeFile {
         order.sort_by_key(|&index| refs[index].row_ordinal);
         let mut values = vec![None; refs.len()];
         let mut group: Option<PathGroup<'_>> = None;
-        for index in order {
+        for (from, &index) in order.iter().enumerate() {
             let row_ordinal = refs[index].row_ordinal;
             let in_group = group.as_ref().is_some_and(|group| {
                 group.granule.first_row_ordinal <= row_ordinal
@@ -3971,10 +4022,12 @@ impl OeFile {
                         .is_some_and(|end| row_ordinal < end)
             });
             if !in_group {
+                let granule = self.granule_of_row(row_ordinal)?;
                 group = Some(PathGroup {
                     block: None,
                     freetext_column,
-                    granule: self.granule_of_row(row_ordinal)?,
+                    granule,
+                    rows: batch_rows_in_granule(refs, &order, from, granule),
                     shredded_column,
                 });
             }
@@ -4000,7 +4053,7 @@ impl OeFile {
             let granule_id = group.granule.granule_id;
             let block = match &mut group.block {
                 Some(block) => block,
-                slot @ None => slot.insert(self.path_block(column_id, granule_id)?),
+                slot @ None => slot.insert(self.path_block(column_id, granule_id, &group.rows)?),
             };
             if let Some(value) = self.value_in_block(block, column_id, row_in_granule)? {
                 return Ok(Some(value));
@@ -4029,7 +4082,11 @@ impl OeFile {
     /// Locates one granule's block for a batched read's path: the block's bytes when it is per-value addressable —
     /// the shape the per-row read's point path accepts, a single-page block that stores bytes under a pipeline that
     /// can decode one value out of them — and the whole block decoded through the column cache otherwise.
-    fn path_block(&self, column_id: u32, granule_id: u32) -> Result<PathBlock<'_>, FormatError> {
+    ///
+    /// `rows` are the granule's rows (ascending) the batch will ask for: when more than one, a located block answers
+    /// them all with one sparse [`take_block_rows_shared`] up front — one block header and symbol table read, only
+    /// those rows' values decoded — instead of one range decode per row.
+    fn path_block(&self, column_id: u32, granule_id: u32, rows: &[u64]) -> Result<PathBlock<'_>, FormatError> {
         let mark = self.mark(column_id, 0, granule_id)?;
         let addressable = match &mark {
             Some(mark) => {
@@ -4041,12 +4098,52 @@ impl OeFile {
         };
         if addressable {
             let raw = self.read_column_raw_with_mark(granule_id, mark.as_ref().expect("addressable implies Some"))?;
-            return Ok(PathBlock::Located {
-                rank: PresenceRank::new(&raw.presence),
-                raw,
-            });
+            let rank = PresenceRank::new(&raw.presence);
+            let taken = if rows.len() > 1 {
+                self.take_located_rows(&rank, &raw, column_id, rows)
+            } else {
+                None
+            };
+            return Ok(PathBlock::Located { rank, raw, taken });
         }
         Ok(PathBlock::Whole(self.cached_column(column_id, granule_id)?))
+    }
+
+    /// The values of `rows` out of a located block, decoded by one [`take_block_rows_shared`]. `None` when the take
+    /// declines (a row past the block's values, or a block it cannot read), leaving each row to the per-row range
+    /// decode, whose answer — and error — stays the oracle.
+    fn take_located_rows(
+        &self,
+        rank: &PresenceRank,
+        raw: &RawColumnBlock<'_>,
+        column_id: u32,
+        rows: &[u64],
+    ) -> Option<TakenRows> {
+        let mut positions = Vec::with_capacity(rows.len());
+        let slots: Vec<Option<usize>> = rows
+            .iter()
+            .map(|&row| {
+                let row = row as usize;
+                let position = if raw.presence.is_empty() {
+                    Some(row)
+                } else {
+                    rank.position(&raw.presence, row)
+                };
+                position.map(|position| {
+                    positions.push(position);
+                    positions.len() - 1
+                })
+            })
+            .collect();
+        let data = take_block_rows_shared(raw.pipeline, raw.body, self.shared_alphabet(column_id), &positions).ok()?;
+        let values = slots
+            .into_iter()
+            .map(|slot| slot.and_then(|slot| Self::typed_variant_at(&data, slot)))
+            .collect();
+        Some(TakenRows {
+            rows: rows.to_vec(),
+            values,
+        })
     }
 
     /// One row's value out of a granule's already-located block, or `None` when the row carries no value for the
@@ -4058,7 +4155,15 @@ impl OeFile {
         row_in_granule: u64,
     ) -> Result<Option<VariantValue>, FormatError> {
         let (rank, raw) = match block {
-            PathBlock::Located { rank, raw } => (rank, raw),
+            PathBlock::Located { rank, raw, taken } => {
+                if let Some(taken) = taken
+                    && let Ok(slot) = taken.rows.binary_search(&row_in_granule)
+                    && let Some(value) = taken.values.get(slot)
+                {
+                    return Ok(value.clone());
+                }
+                (rank, raw)
+            }
             PathBlock::Whole(column) => return Ok(column.value_at(row_in_granule)),
         };
         let row = row_in_granule as usize;

@@ -276,3 +276,49 @@ fn planning_reads_granules_from_footer() {
     assert!(footer_is_authoritative_for_planning());
     assert_eq!(plan_granules_from_footer(&footer), vec![3, 4]);
 }
+
+/// A summary whose row count disagrees with its granule count cannot describe any file and is refused on decode.
+#[test]
+fn summary_decode_rejects_row_counts_that_disagree_with_granule_counts() {
+    let base = summary_from_footer(&footer_with(vec![granule(0, 1, 4, 1, 2), granule(1, 5, 8, 3, 4)], 8));
+    assert_eq!(ManifestSummary::decode(&base.encode()).unwrap(), base);
+    for (granule_count, row_count) in [(0, 8), (2, 0), (3, 2)] {
+        let forged = ManifestSummary {
+            granule_count,
+            row_count,
+            ..base
+        };
+        assert!(
+            ManifestSummary::decode(&forged.encode()).is_err(),
+            "{granule_count} granules, {row_count} rows"
+        );
+    }
+}
+
+/// Granule statistics and a summary are checked against the footer they describe: counts that overrun or undercount
+/// the file's rows are structural errors.
+#[test]
+fn granule_stats_and_summaries_are_validated_against_the_footer() {
+    let footer = footer_with(vec![granule(0, 1, 4, 1, 2), granule(1, 5, 8, 3, 4)], 8);
+    validate_granule_row_counts(&footer).unwrap();
+    let summary = summary_from_footer(&footer);
+    summary.validate_against_footer(&footer).unwrap();
+
+    let overrun = footer_with(footer.granules.clone(), 7);
+    assert!(validate_granule_row_counts(&overrun).is_err());
+    assert!(summary.validate_against_footer(&overrun).is_err());
+
+    let mut empty_granule = footer.clone();
+    empty_granule.granules[1].row_count = 0;
+    empty_granule.exact_counts.row_count = 4;
+    assert!(validate_granule_row_counts(&empty_granule).is_err());
+
+    let stale = ManifestSummary {
+        granule_count: 1,
+        row_count: 4,
+        ..summary
+    };
+    assert!(stale.validate_against_footer(&footer).is_err());
+    let miscounted = ManifestSummary { row_count: 9, ..summary };
+    assert!(miscounted.validate_against_footer(&footer).is_err());
+}

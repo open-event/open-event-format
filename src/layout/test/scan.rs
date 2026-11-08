@@ -328,3 +328,46 @@ fn projected_scan_repeats_duplicate_ids_across_many_windows() {
         }
     }
 }
+
+/// A live scan never decodes a granule its deletion vector empties, hands an untouched granule over as `All` so its
+/// filter step is skipped, and pairs a partly deleted one with its keep mask — the batches themselves unchanged.
+#[test]
+fn a_live_scan_skips_fully_deleted_granules_and_marks_untouched_ones() {
+    let file = file(40, 8);
+    let columns = all_columns(&file);
+    let granules = all_granules(&file);
+    assert!(granules.len() >= 4);
+    let entry = |id: u32| *file.granule_entry(id).unwrap();
+    let emptied = entry(granules[1]);
+    let partial = entry(granules[2]);
+    let mut deleted = DeletionVector::new();
+    for ordinal in emptied.first_row_ordinal..emptied.first_row_ordinal + u64::from(emptied.row_count) {
+        deleted.mark_deleted(ordinal);
+    }
+    deleted.mark_deleted(partial.first_row_ordinal + 1);
+
+    let reference = collect(&file, &columns, &granules, true, SCAN_WINDOW_BYTES).unwrap();
+    let mut seen = Vec::new();
+    file.scan_projected_live(&columns, &granules, &deleted, |batch, selection| {
+        seen.push((batch, selection));
+        Ok(())
+    })
+    .unwrap();
+    let ids: Vec<u32> = seen.iter().map(|(batch, _)| batch.granule_id).collect();
+    let expected: Vec<u32> = granules.iter().copied().filter(|id| *id != granules[1]).collect();
+    assert_eq!(ids, expected, "the emptied granule is never scanned");
+    for (batch, selection) in &seen {
+        let same = reference.iter().find(|other| other.granule_id == batch.granule_id).unwrap();
+        assert_eq!(batch.row_count, same.row_count);
+        for (column, other) in batch.columns.iter().zip(&same.columns) {
+            assert_eq!(flatten(column), flatten(other));
+        }
+        if batch.granule_id == granules[2] {
+            let mut keep = vec![true; partial.row_count as usize];
+            keep[1] = false;
+            assert_eq!(*selection, RowSelection::Some(keep));
+        } else {
+            assert_eq!(*selection, RowSelection::All);
+        }
+    }
+}

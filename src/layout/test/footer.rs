@@ -780,6 +780,7 @@ fn columnar_marks_footer_decodes_directory_only_leaving_row_oriented_marks_and_p
     footer.required_feature_flags = required_features::COLUMNAR_MARKS;
     // Granules 0 and 1 sit in stripe 0; granule 2 rolls into stripe 1.
     footer.granules = vec![columnar_granule(0, 0), columnar_granule(1, 0), columnar_granule(2, 1)];
+    footer.exact_counts.row_count = 3;
     footer.marks = vec![
         sample_mark(0, 1, 0, None),
         sample_mark(0, 1, 1, None),
@@ -874,6 +875,7 @@ fn columnar_and_row_oriented_forms_decode_to_the_same_logical_directory() {
     // The row-oriented form: no `columnar_marks`, marks and the per-page directory in their own footer sections.
     let mut row_oriented = minimal_footer();
     row_oriented.granules = granules.clone();
+    row_oriented.exact_counts.row_count = 3;
     row_oriented.marks = marks.clone();
     row_oriented.page_directory = page_directory.clone();
     let row_decoded = decode_footer(&encode_footer(&row_oriented)).expect("row-oriented footer decodes");
@@ -882,6 +884,7 @@ fn columnar_and_row_oriented_forms_decode_to_the_same_logical_directory() {
     let mut columnar = minimal_footer();
     columnar.required_feature_flags = required_features::COLUMNAR_MARKS;
     columnar.granules = granules;
+    columnar.exact_counts.row_count = 3;
     columnar.marks = marks;
     columnar.page_directory = page_directory;
     let col_decoded = decode_footer(&encode_footer(&columnar)).expect("columnar footer decodes");
@@ -1360,6 +1363,7 @@ fn graph_edges_and_their_feature_bits_come_together_on_a_graph_profile_file() {
 fn state_roots_footer() -> Footer {
     let mut footer = graph_footer();
     footer.exact_counts.row_count = 3;
+    footer.granules[0].row_count = 3;
     footer.required_feature_flags |= required_features::GRAPH_STATE_ROOTS;
     footer.state_roots = [0, 2]
         .into_iter()
@@ -1591,4 +1595,19 @@ fn vector_metadata_must_cover_exactly_the_vector_columns() {
     let mut undeclared = vector_footer(VectorElement::I8, VectorMetric::Cosine);
     undeclared.required_feature_flags &= !crate::layout::required_features::VECTOR_COLUMNS;
     assert!(decode_footer(&encode_footer(&undeclared)).is_err());
+}
+
+/// Decoding a footer refuses granule statistics whose row counts overrun or undercount the file's rows, or that cover
+/// no rows at all, so no open path plans or prunes from them.
+#[test]
+fn footer_decode_rejects_granule_row_counts_that_disagree_with_the_file() {
+    let built = build_oe_file((0..12).map(plain_row).collect(), &source_form_config(4)).unwrap();
+    assert!(built.footer.granules.len() > 1);
+    decode_footer(&encode_footer(&built.footer)).unwrap();
+    let mut overrun = built.footer.clone();
+    overrun.granules[0].row_count += 1;
+    assert!(decode_footer(&encode_footer(&overrun)).is_err());
+    let mut undercount = built.footer.clone();
+    undercount.exact_counts.row_count += 1;
+    assert!(decode_footer(&encode_footer(&undercount)).is_err());
 }

@@ -4307,3 +4307,27 @@ fn built_files_summarize_the_entities_they_hold() {
     assert_eq!(small.entity_summary.exact_keys(), Some(keys.as_slice()));
     assert!(!small.entity_summary.may_hold(EntityKey::new(1, 8)));
 }
+
+/// The one-pass bounds a granule's entry is built from agree with separate minimum and maximum folds.
+#[test]
+fn granule_bounds_come_from_one_pass_that_agrees_with_separate_folds() {
+    assert_eq!(min_max(std::iter::empty::<i64>()), None);
+    assert_eq!(min_max([7i64]), Some((7, 7)));
+    let values = [5i64, -3, i64::MAX, 0, i64::MIN, 9];
+    for len in 1..=values.len() {
+        let slice = &values[..len];
+        assert_eq!(
+            min_max(slice.iter().copied()),
+            Some((*slice.iter().min().unwrap(), *slice.iter().max().unwrap()))
+        );
+    }
+    let keys = [(2u64, 1u64), (1, 9), (2, 0), (1, 3)];
+    assert_eq!(min_max(keys), Some(((1, 3), (2, 1))));
+
+    let built = build_oe_file((0..40).map(row).collect(), &config()).unwrap();
+    for granule in &built.footer.granules {
+        assert!(granule.min_occurred_at_physical <= granule.max_occurred_at_physical);
+        assert!(granule.min_ingested_at_physical <= granule.max_ingested_at_physical);
+        assert!((granule.first_epoch, granule.first_sequence) <= (granule.last_epoch, granule.last_sequence));
+    }
+}

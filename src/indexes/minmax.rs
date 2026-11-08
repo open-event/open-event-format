@@ -38,21 +38,25 @@ impl NumericMinMax {
     /// the bounds come back `None`. The result is a pure function of the input, so two builds over the same values
     /// produce the same zone map.
     pub fn build(values: &[Option<i128>]) -> NumericMinMax {
-        let mut min: Option<i128> = None;
-        let mut max: Option<i128> = None;
+        // One pass over plain accumulators seeded at the opposite extremes, rather than re-wrapping an `Option` per
+        // value.
+        let mut min = i128::MAX;
+        let mut max = i128::MIN;
+        let mut any_value = false;
         let mut null_count: u32 = 0;
         for value in values {
             match value {
                 Some(value) => {
-                    min = Some(min.map_or(*value, |current| current.min(*value)));
-                    max = Some(max.map_or(*value, |current| current.max(*value)));
+                    min = min.min(*value);
+                    max = max.max(*value);
+                    any_value = true;
                 }
                 None => null_count = null_count.saturating_add(1),
             }
         }
         NumericMinMax {
-            max,
-            min,
+            max: any_value.then_some(max),
+            min: any_value.then_some(min),
             null_count,
             row_count: values.len() as u32,
         }
@@ -126,6 +130,11 @@ impl NumericMinMax {
                     rule: "numeric minmax absent bounds require an all-null block",
                 });
             }
+            (Some(_), Some(_)) if row_count == null_count => {
+                return Err(FormatError::Structural {
+                    rule: "numeric minmax bounds over a block with no non-null rows",
+                });
+            }
             _ => {}
         }
         Ok(NumericMinMax {
@@ -134,6 +143,19 @@ impl NumericMinMax {
             null_count,
             row_count,
         })
+    }
+
+    /// [`Self::decode`] for the zone map of a block the granule directory says holds `granule_row_count` rows. A zone
+    /// map counting a different number of rows describes some other block — its null count could overrun the
+    /// granule's rows, or its bounds miss rows it never saw — so it is rejected rather than used to prune.
+    pub fn decode_for_granule(bytes: &[u8], granule_row_count: u32) -> Result<NumericMinMax, FormatError> {
+        let zone_map = Self::decode(bytes)?;
+        if zone_map.row_count != granule_row_count {
+            return Err(FormatError::Structural {
+                rule: "numeric minmax row count disagrees with its granule",
+            });
+        }
+        Ok(zone_map)
     }
 }
 

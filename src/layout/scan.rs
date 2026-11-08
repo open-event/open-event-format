@@ -12,6 +12,7 @@
 //! See: oe-apis/spec.md
 
 use super::*;
+use crate::deletes::{DeletionVector, RowSelection};
 use crate::encoding::predicate::scan_in_parallel;
 use crate::layout::constant::SCAN_WINDOW_BYTES;
 use crate::layout::footer::ColumnKind;
@@ -109,6 +110,54 @@ impl OeFile {
         sink: impl FnMut(ScanBatch) -> Result<(), FormatError>,
     ) -> Result<(), FormatError> {
         self.scan_projected_inner(column_ids, granule_ids, false, SCAN_WINDOW_BYTES, sink)
+    }
+
+    /// [`Self::scan_projected`] over the rows `deleted` leaves live, handing `sink` each batch with its
+    /// [`RowSelection`]. A granule whose every row is deleted is never decoded or projected; one with no deleted row
+    /// comes with [`RowSelection::All`], so the caller can skip its filter step; the rest carry their keep mask.
+    pub fn scan_projected_live(
+        &self,
+        column_ids: &[u32],
+        granule_ids: &[u32],
+        deleted: &DeletionVector,
+        sink: impl FnMut(ScanBatch, RowSelection) -> Result<(), FormatError>,
+    ) -> Result<(), FormatError> {
+        self.scan_live_inner(column_ids, granule_ids, deleted, true, sink)
+    }
+
+    /// [`Self::scan_projected_live`] kept on the calling thread, as [`Self::scan_projected_serial`] is.
+    pub fn scan_projected_serial_live(
+        &self,
+        column_ids: &[u32],
+        granule_ids: &[u32],
+        deleted: &DeletionVector,
+        sink: impl FnMut(ScanBatch, RowSelection) -> Result<(), FormatError>,
+    ) -> Result<(), FormatError> {
+        self.scan_live_inner(column_ids, granule_ids, deleted, false, sink)
+    }
+
+    fn scan_live_inner(
+        &self,
+        column_ids: &[u32],
+        granule_ids: &[u32],
+        deleted: &DeletionVector,
+        fan_out: bool,
+        mut sink: impl FnMut(ScanBatch, RowSelection) -> Result<(), FormatError>,
+    ) -> Result<(), FormatError> {
+        let mut live = Vec::with_capacity(granule_ids.len());
+        for &granule_id in granule_ids {
+            let entry = self.granule_entry(granule_id).ok_or(FormatError::RefOutOfRange {
+                what: "scanned granule missing from the granule directory",
+            })?;
+            if deleted.deleted_in(entry.first_row_ordinal, entry.row_count) < u64::from(entry.row_count) {
+                live.push(granule_id);
+            }
+        }
+        self.scan_projected_inner(column_ids, &live, fan_out, SCAN_WINDOW_BYTES, |batch| {
+            let entry = self.granule_entry(batch.granule_id).ok_or(OUT_OF_STEP)?;
+            let selection = deleted.selection(entry.first_row_ordinal, entry.row_count, None);
+            sink(batch, selection)
+        })
     }
 
     fn scan_projected_inner(

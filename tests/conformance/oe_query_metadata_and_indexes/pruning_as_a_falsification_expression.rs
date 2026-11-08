@@ -53,6 +53,7 @@ fn one_expression_spans_every_declared_statistic() {
         ],
     };
     let filter = Filter {
+        memberships: Vec::new(),
         clauses: vec![eq_clause(1, 5), eq_clause(2, 20), range_clause(3, 10, 40)],
     };
 
@@ -82,6 +83,7 @@ fn a_granule_with_no_matching_row_may_be_kept_but_one_with_a_match_is_never_drop
         }],
     };
     let filter = Filter {
+        memberships: Vec::new(),
         clauses: vec![eq_clause(1, 5)],
     };
     let expr = build_pruning_expression(&filter, &cannot_prove);
@@ -96,6 +98,7 @@ fn a_granule_with_no_matching_row_may_be_kept_but_one_with_a_match_is_never_drop
         }],
     };
     let range = Filter {
+        memberships: Vec::new(),
         clauses: vec![range_clause(1, 2, 4)],
     };
     let expr_match = build_pruning_expression(&range, &has_match);
@@ -105,6 +108,7 @@ fn a_granule_with_no_matching_row_may_be_kept_but_one_with_a_match_is_never_drop
     // statistic.
     let no_stat = GranuleStatistics { statistics: vec![] };
     let other = Filter {
+        memberships: Vec::new(),
         clauses: vec![eq_clause(7, 42)],
     };
     let expr_missing = build_pruning_expression(&other, &no_stat);
@@ -114,6 +118,7 @@ fn a_granule_with_no_matching_row_may_be_kept_but_one_with_a_match_is_never_drop
     // And a granule that provably cannot match IS dropped (so "never dropped" is a real constraint, not vacuous): 999
     // is outside [0, 10].
     let absent = Filter {
+        memberships: Vec::new(),
         clauses: vec![eq_clause(1, 999)],
     };
     let expr_absent = build_pruning_expression(&absent, &cannot_prove);
@@ -128,6 +133,7 @@ fn a_new_statistic_adds_a_term_not_a_branch() {
     // by the SAME loop as every other kind. The call sites below (`build_pruning_expression`, `evaluate`) are identical
     // to those used for min/max — no new per-statistic branch is needed.
     let filter = Filter {
+        memberships: Vec::new(),
         clauses: vec![presence_clause(4)],
     };
 
@@ -176,6 +182,7 @@ fn an_inexact_term_keeps_the_residual_filter() {
         }],
     };
     let filter = Filter {
+        memberships: Vec::new(),
         clauses: vec![eq_clause(1, 5)],
     };
     let expr = build_pruning_expression(&filter, &declared);
@@ -195,6 +202,7 @@ fn an_inexact_term_keeps_the_residual_filter() {
         }],
     };
     let range_filter = Filter {
+        memberships: Vec::new(),
         clauses: vec![range_clause(2, 10, 20)],
     };
     let range_expr = build_pruning_expression(&range_filter, &range_declared);
@@ -221,6 +229,7 @@ fn aggregate_and_sketch_shortcuts_stay_above_pruning() {
     let answerable = Query {
         answerable_from_aggregate: true,
         filter: Filter {
+            memberships: Vec::new(),
             clauses: vec![eq_clause(1, 5)],
         },
     };
@@ -231,11 +240,16 @@ fn aggregate_and_sketch_shortcuts_stay_above_pruning() {
     let not_answerable = Query {
         answerable_from_aggregate: false,
         filter: Filter {
+            memberships: Vec::new(),
             clauses: vec![eq_clause(1, 5)],
         },
     };
     match plan_query(&not_answerable, &declared) {
-        QueryPlan::Scan { pruning } => assert_eq!(pruning.term_count(), 1),
-        QueryPlan::AggregateShortcut => panic!("expected a scan plan when no aggregate answers it"),
+        QueryPlan::Scan {
+            pruning: Some(pruning), ..
+        } => assert_eq!(pruning.term_count(), 1),
+        QueryPlan::AggregateShortcut | QueryPlan::Scan { pruning: None, .. } => {
+            panic!("expected a scan plan when no aggregate answers it")
+        }
     }
 }

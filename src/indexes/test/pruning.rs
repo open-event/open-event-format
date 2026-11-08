@@ -36,7 +36,7 @@ fn presence_clause(column_id: u32) -> FilterClause {
 }
 
 fn filter(clauses: Vec<FilterClause>) -> Filter {
-    Filter { clauses }
+    Filter::new(clauses)
 }
 
 fn stats(statistics: Vec<Statistic>) -> GranuleStatistics {
@@ -331,8 +331,10 @@ fn non_aggregate_query_falls_through_to_scan() {
         min: 0,
     }]);
     match plan_query(&query, &declared) {
-        QueryPlan::Scan { pruning } => assert_eq!(pruning.term_count(), 1),
-        QueryPlan::AggregateShortcut => panic!("expected a scan plan"),
+        QueryPlan::Scan {
+            pruning: Some(pruning), ..
+        } => assert_eq!(pruning.term_count(), 1),
+        QueryPlan::AggregateShortcut | QueryPlan::Scan { pruning: None, .. } => panic!("expected a scan plan"),
     }
 }
 
@@ -778,5 +780,142 @@ fn inline_statistics_match_their_vector_forms() {
             assert_eq!(exactness_of(&inline), exactness_of(&vector));
             assert!(!inline.keep_confirms_match());
         }
+    }
+}
+
+/// A membership list is sorted and deduplicated once; probing it by binary search agrees with a linear scan, drops a
+/// granule whose bounds fall in a gap the list's envelope would keep, and a gap-free list becomes a range clause.
+#[test]
+fn membership_lists_prune_by_binary_search_and_contiguous_lists_become_ranges() {
+    let raw = vec![90, 10, 50, 10, 70, 30, 90];
+    let list = MembershipList::new(raw.clone());
+    assert_eq!(list.values(), &[10, 30, 50, 70, 90]);
+    for lo in 0..100 {
+        assert_eq!(list.contains(lo), raw.contains(&lo));
+        for hi in lo - 3..lo + 25 {
+            let linear = raw.iter().any(|value| (lo..=hi).contains(value));
+            assert_eq!(list.any_in(lo, hi), linear, "[{lo}, {hi}]");
+            let expected = if linear {
+                StatVerdict::CouldMatch
+            } else {
+                StatVerdict::ProvenAbsent
+            };
+            assert_eq!(list.judge_bounds(lo, hi), expected);
+        }
+    }
+    // Bounds [31, 49] sit inside the envelope [10, 90] but between listed values.
+    let envelope = list.clause(4).unwrap();
+    assert_eq!(envelope.predicate, PredicateKind::Membership);
+    assert_eq!((envelope.value_lo, envelope.value_hi), (10, 90));
+    let gap = Statistic::MinMaxBound {
+        column_id: 4,
+        max: 49,
+        min: 31,
+    };
+    assert_eq!(gap.judge(&envelope), StatVerdict::CouldMatch);
+    assert_eq!(list.judge_bounds(31, 49), StatVerdict::ProvenAbsent);
+
+    let contiguous = MembershipList::new((5..=20).rev().chain(7..9).collect())
+        .clause(2)
+        .unwrap();
+    assert_eq!(contiguous, range_clause(2, 5, 20));
+    assert_eq!(
+        MembershipList::new(vec![i128::MIN, i128::MAX])
+            .clause(1)
+            .unwrap()
+            .predicate,
+        PredicateKind::Membership
+    );
+    assert_eq!(MembershipList::new(vec![]).clause(1), None);
+}
+
+/// A filter carrying an IN list drops granules (and pages) whose bounds fall between listed values, and keeps every
+/// granule that holds a listed value — checked against the granules' raw rows.
+#[test]
+fn filter_in_list_prunes_gaps_against_naive_rows() {
+    let values = vec![17, 205, 206, 640, 999];
+    let filter = Filter::default().with_in_list(3, values.clone());
+    assert_eq!(filter.memberships.len(), 1);
+    let declared = stats(vec![Statistic::MinMaxBound {
+        column_id: 3,
+        max: 0,
+        min: 0,
+    }]);
+    let expr = build_pruning_expression(&filter, &declared);
+    let mut page_stats = Vec::new();
+    for g in 0..100i128 {
+        let rows: Vec<i128> = (0..10).map(|r| g * 10 + r).collect();
+        let granule = stats(vec![Statistic::MinMaxBound {
+            column_id: 3,
+            max: g * 10 + 9,
+            min: g * 10,
+        }]);
+        let holds_match = rows.iter().any(|row| values.contains(row));
+        assert_eq!(evaluate(&expr, &granule).drop, !holds_match, "granule {g}");
+        // The envelope alone would keep every granule from 1 to 99.
+        let envelope_only = build_pruning_expression(&Filter::new(filter.clauses.clone()), &declared);
+        assert_eq!(evaluate(&envelope_only, &granule).drop, g < 1);
+        page_stats.push((g as u32, granule));
+    }
+    assert_eq!(prune_pages_in_granule(&filter, &page_stats, 100), vec![1, 20, 64, 99]);
+
+    // Member-set statistics are probed by binary search too.
+    let points = stats(vec![Statistic::PointMembership {
+        column_id: 3,
+        members: vec![18, 300, 998],
+    }]);
+    assert!(evaluate(&build_pruning_expression(&filter, &points), &points).drop);
+    // A gap-free list is a plain range and needs no list.
+    let range = Filter::default().with_in_list(3, vec![4, 5, 6]);
+    assert!(range.memberships.is_empty());
+    assert_eq!(range.clauses, vec![range_clause(3, 4, 6)]);
+}
+
+/// The one planner carries an OR filter with its limit and order; a flat filter also gets its term list.
+#[test]
+fn plan_query_carries_boolean_filters_limit_and_order() {
+    use crate::indexes::bool_pruning::ExprQuery;
+    let declared = stats(vec![Statistic::MinMaxBound {
+        column_id: 1,
+        max: 10,
+        min: 0,
+    }]);
+    let or = FilterExpr::Or(vec![
+        FilterExpr::Clause(eq_clause(1, 5)),
+        FilterExpr::Clause(eq_clause(1, 9)),
+    ]);
+    let plan = plan_query(
+        ExprQuery {
+            answerable_from_aggregate: false,
+            filter: or.clone(),
+            limit: Some(3),
+            order: ScanOrder::TimeDescending,
+        },
+        &declared,
+    );
+    assert_eq!(
+        plan,
+        QueryPlan::Scan {
+            filter: or,
+            limit: Some(3),
+            order: ScanOrder::TimeDescending,
+            pruning: None,
+        }
+    );
+    let flat = Query {
+        answerable_from_aggregate: false,
+        filter: filter(vec![eq_clause(1, 5)]),
+    };
+    match plan_query(&flat, &declared) {
+        QueryPlan::Scan {
+            filter,
+            limit: None,
+            order: ScanOrder::Stored,
+            pruning: Some(pruning),
+        } => {
+            assert_eq!(filter, FilterExpr::from(flat.filter.clone()));
+            assert_eq!(pruning.term_count(), 1);
+        }
+        other => panic!("unexpected plan {other:?}"),
     }
 }

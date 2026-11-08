@@ -343,12 +343,65 @@ fn bench_presence(c: &mut Criterion) {
     group.finish();
 }
 
+/// Lazy and sparse paths against the whole-block decode they replace: an FSST take of 16 rows, its uncompressed size,
+/// a dictionary code projection, and a run-length filter by a row selection.
+fn bench_lazy(c: &mut Criterion) {
+    let mut group = c.benchmark_group("lazy");
+    let mut rng = Rng(0x1234_5678);
+    let fsst = encode(&ColumnData::Strings(urls(&mut rng)), Transform::FsstString);
+    let rows: Vec<usize> = (0..16).map(|i| i * (ROWS / 16) + 7).collect();
+    group.bench_function("fsst/take16", |b| {
+        b.iter(|| take_block_rows(fsst.0, black_box(&fsst.1), &rows).unwrap())
+    });
+    group.bench_function("fsst/decode_then_take16", |b| {
+        b.iter(|| {
+            let ColumnData::Strings(all) = decode_block(fsst.0, black_box(&fsst.1)).unwrap() else {
+                unreachable!()
+            };
+            rows.iter().map(|&row| all.get(row).unwrap().map(str::len)).collect::<Vec<_>>()
+        })
+    });
+    group.bench_function("fsst/uncompressed_len", |b| {
+        b.iter(|| fsst_uncompressed_len(fsst.0, black_box(&fsst.1)).unwrap())
+    });
+    let dict_data: StringColumn = (0..ROWS).map(|row| Some(format!("service-{}", row % 50))).collect();
+    let dict = encode(&ColumnData::Strings(dict_data), Transform::DictionaryString);
+    group.bench_function("dictionary/codes", |b| {
+        b.iter(|| decode_dictionary_codes(dict.0, black_box(&dict.1), None).unwrap())
+    });
+    group.bench_function("dictionary/decode", |b| {
+        b.iter(|| decode_block(dict.0, black_box(&dict.1)).unwrap())
+    });
+    let rle = encode(
+        &ColumnData::U64((0..ROWS as u64).map(|row| row / 512).collect()),
+        Transform::Rle,
+    );
+    let selection: Vec<u8> = (0..ROWS / 8).map(|_| rng.next() as u8).collect();
+    group.bench_function("rle/filter_by_selection", |b| {
+        b.iter(|| filter_block_by_selection(rle.0, black_box(&rle.1), None, &selection).unwrap())
+    });
+    group.bench_function("rle/decode_then_filter", |b| {
+        b.iter(|| {
+            let ColumnData::U64(all) = decode_block(rle.0, black_box(&rle.1)).unwrap() else {
+                unreachable!()
+            };
+            all.iter()
+                .enumerate()
+                .filter(|(row, _)| selection[row / 8] & (1 << (row % 8)) != 0)
+                .map(|(_, value)| *value)
+                .collect::<Vec<_>>()
+        })
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_numeric_filters,
     bench_string_filters,
     bench_decoded_filters,
     bench_float_codecs,
-    bench_presence
+    bench_presence,
+    bench_lazy
 );
 criterion_main!(benches);

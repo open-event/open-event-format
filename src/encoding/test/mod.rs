@@ -5913,3 +5913,53 @@ fn fsst_dictionary_values_written_in_place_match_the_reference_across_the_thresh
     );
     assert!(sides.contains(&SideStream::None), "the sweep must roll FSST back");
 }
+
+/// The needle encoder must write exactly the codes the crate's compressor writes over the same table — trained
+/// tables and forged ones alike, plaintexts built from the table's own symbols, NUL bytes and stray bytes included —
+/// or an FSST equality scan would miss rows that hold the needle.
+#[test]
+fn the_needle_encoder_matches_the_crate_compressor() {
+    let mut state = 0x5EED_F55Au64;
+    let mut tables: Vec<Vec<(u64, u8)>> = Vec::new();
+    for round in 0..40u64 {
+        let corpus: Vec<Vec<u8>> = (0..300u64)
+            .map(|row| format!("room-{:05}-user{}-{}", (row * 7919 + round) % 997, row % 13, round).into_bytes())
+            .collect();
+        let compressor = fsst::Compressor::train(&corpus.iter().map(Vec::as_slice).collect());
+        let symbols = compressor.symbol_table().iter().map(|symbol| symbol.to_u64());
+        tables.push(symbols.zip(compressor.symbol_lengths().iter().copied()).collect());
+    }
+    while tables.len() < 400 {
+        let count = 1 + (pseudo_random(&mut state) % 255) as usize;
+        let shape = 1 + pseudo_random(&mut state) % 3;
+        let symbols = forged_fsst_symbols(&mut state, count, shape);
+        if fsst_table_is_well_formed(&symbols) {
+            tables.push(symbols);
+        }
+    }
+    for (index, symbols) in tables.iter().enumerate() {
+        let table = FsstDecodeTable::read(&mut Reader::new(&forged_fsst_table(symbols))).unwrap();
+        let compressor = table.compressor();
+        let encoder = table.needle_encoder();
+        for _ in 0..50 {
+            let mut plaintext = Vec::new();
+            for _ in 0..pseudo_random(&mut state) % 12 {
+                let draw = pseudo_random(&mut state);
+                match draw % 4 {
+                    0 => plaintext.push((draw >> 8) as u8),
+                    1 => plaintext.push(0),
+                    _ => {
+                        let (word, len) = symbols[(draw >> 8) as usize % symbols.len()];
+                        let cut = 1 + (draw >> 20) as usize % usize::from(len);
+                        plaintext.extend_from_slice(&word.to_le_bytes()[..cut]);
+                    }
+                }
+            }
+            assert_eq!(
+                encoder.compress(&plaintext),
+                compressor.compress(&plaintext),
+                "table {index}: {plaintext:?}"
+            );
+        }
+    }
+}

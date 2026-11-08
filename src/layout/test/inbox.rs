@@ -240,6 +240,38 @@ fn reading_a_queue_never_returns_a_row_at_or_below_the_ack_watermark() {
     );
 }
 
+/// A granule the deletion vector empties drops out of the queue whole (the live scan never decodes it), while rows of
+/// the recipient in other granules come back as before.
+#[test]
+fn reading_a_queue_skips_a_wholly_deleted_granule() {
+    let file = open(build_oe_file(rows(4, 64), &config(Profile::Inbox, 4)).unwrap());
+    let (acks, none) = (Acks::default(), Deletes::default());
+    let all = read_inbox(&[&file], tenant(), recipient(1), &acks, &none).unwrap();
+    let entry = file.inbox_recipients().unwrap()[1];
+    let granule = *file
+        .footer()
+        .granules
+        .iter()
+        .find(|granule| granule.first_row_ordinal >= entry.first_row_ordinal)
+        .unwrap();
+    let mut vector = DeletionVector::new();
+    for ordinal in granule.first_row_ordinal..granule.first_row_ordinal + u64::from(granule.row_count) {
+        vector.mark_deleted(ordinal);
+    }
+    let dropped = crate::layout::event::read_u64s(
+        &file,
+        crate::columns::column_ids::SEQUENCE,
+        granule.granule_id,
+        granule.row_count as usize,
+    )
+    .unwrap();
+    let deletes = Deletes(HashMap::from([(file.header().file_id, vector)]));
+    let kept = read_inbox(&[&file], tenant(), recipient(1), &acks, &deletes).unwrap();
+    let expected: Vec<u64> = sequences(&all).into_iter().filter(|s| !dropped.contains(s)).collect();
+    assert!(expected.len() < all.len(), "the deleted granule held some of the queue");
+    assert_eq!(sequences(&kept), expected);
+}
+
 #[test]
 fn reading_a_queue_skips_deleted_rows() {
     let file = build(Profile::Inbox);

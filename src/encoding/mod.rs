@@ -26,7 +26,8 @@ use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, ScalarBuffer};
 use constant::{
     ALP_CONVERT_MAGIC, ALP_EXACT_CONVERT_MAX_WIDTH, ALP_MAX_EXCEPTION_SAMPLE_DIVISOR, ALP_MAX_SCALED_MAGNITUDE,
     ALP_RD_CODE_MISS, ALP_RD_MAX_DICT_LEN, ALP_RD_MAX_RIGHT_WIDTH, ALP_RD_MIN_RIGHT_WIDTH, ALP_VECTOR_ESCAPE_SENTINEL,
-    BYTE_STREAM_SPLIT_TILE, DECODE_OPTIMIZED_THRESHOLD_DEN, DECODE_OPTIMIZED_THRESHOLD_NUM,
+    BYTE_STREAM_SPLIT_TILE, DECODE_OPTIMIZED_THRESHOLD_DEN, DECODE_OPTIMIZED_THRESHOLD_NUM, FSST_TRAILING_MAX_RATIO_DEN,
+    FSST_TRAILING_MAX_RATIO_NUM,
     DICTIONARY_FSST_MAX_VALUE_LEN, DICTIONARY_MAX_CARDINALITY_DIVISOR, FASTLANES_SPARSE_MAX_VALUES,
     FSST_LOSSY_PHT_HASH_MULTIPLIER, FSST_LOSSY_PHT_HASH_SHIFT, FSST_MAX_AVERAGE_VALUE_LEN, FSST_MAX_SYMBOL_COUNT,
     FSST_MIN_SAMPLE_COUNT, FSST_VALUE_KEYS_MAX_PLAINTEXT_DIVISOR, MAX_RLE_EXPANSION_VALUES, PREFIX_KEY_BYTES,
@@ -42,6 +43,10 @@ use chimp::{decode_chimp, decode_chimp_range, encode_chimp};
 pub(crate) use presence::{PresenceRank, count_present_before, count_set_bits, present_position};
 use scratch::{with_arena_buffer, with_unpack_buffer};
 use sidecar::{PrefixKey, StringFingerprint};
+pub use lazy::{
+    DictionaryCodes, decode_dictionary_codes, filter_block_by_selection, fsst_uncompressed_len, take_block_rows,
+    take_block_rows_shared,
+};
 pub use string_column::StringColumn;
 
 mod chimp;
@@ -50,6 +55,7 @@ pub mod decompressor;
 pub mod deflate;
 pub mod descriptor;
 pub mod global_dict;
+pub(crate) mod lazy;
 pub mod mini_block_directory;
 pub mod predicate;
 mod presence;
@@ -3061,7 +3067,171 @@ struct FsstDecodeTable {
     symbols: [u64; 256],
 }
 
+/// One entry of [`FsstNeedleEncoder`]'s two-byte table: the code byte written, how many input bytes it consumes and
+/// whether it is an escape (which writes the literal byte after the code).
+#[derive(Clone, Copy)]
+struct FsstShortCode {
+    code: u8,
+    escape: bool,
+    len: u8,
+}
+
+/// One symbol of three or more bytes in [`FsstNeedleEncoder`]'s hash table, keyed by its lossy-hash slot.
+#[derive(Clone, Copy)]
+struct FsstLongCode {
+    code: u8,
+    len: u8,
+    mask: u64,
+    slot: u64,
+    symbol: u64,
+}
+
+/// Compresses search terms to exactly the codes [`fsst::Compressor::compress`] writes over the same symbol table,
+/// without building the crate's 128 KiB two-byte table and lossy hash table. An equality scan compresses one or two
+/// needles per block, so rebuilding a full compressor for them cost more than comparing every row did.
+///
+/// The crate's greedy step is replicated exactly, quirks included: at each position it reads the next eight bytes
+/// (zero-padded past the end), takes a two-byte-table code outright when no longer symbol shares its first two
+/// bytes, and otherwise probes the hash slot of the next three bytes, keeping that symbol only when its non-null bytes
+/// match, before falling back to the two-byte table (a two-byte symbol, else a one-byte symbol, else an escape).
+pub(crate) struct FsstNeedleEncoder {
+    has_suffix_code: u8,
+    long: Vec<FsstLongCode>,
+    one_byte: [FsstShortCode; 256],
+    two_byte: Vec<(u16, u8)>,
+}
+
+impl FsstNeedleEncoder {
+    fn new(table: &FsstDecodeTable) -> Self {
+        let defined = || {
+            table
+                .symbols
+                .iter()
+                .copied()
+                .zip(table.lengths.iter().copied())
+                .take(table.symbol_count)
+        };
+        let mut one_byte = [FsstShortCode {
+            code: fsst::ESCAPE_CODE,
+            escape: true,
+            len: 1,
+        }; 256];
+        let mut two_byte: Vec<(u16, u8)> = Vec::new();
+        let mut long = Vec::new();
+        for (code, (symbol, len)) in defined().enumerate() {
+            let code = code as u8;
+            match len {
+                1 => {
+                    if let Some(slot) = one_byte.get_mut((symbol & 0xFF) as usize) {
+                        *slot = FsstShortCode {
+                            code,
+                            escape: false,
+                            len: 1,
+                        };
+                    }
+                }
+                2 => {
+                    let first2 = symbol as u16;
+                    match two_byte.iter_mut().find(|(key, _)| *key == first2) {
+                        Some(entry) => entry.1 = code,
+                        None => two_byte.push((first2, code)),
+                    }
+                }
+                _ => {
+                    let null_bytes = (symbol.leading_zeros() / 8) as usize;
+                    let value_len = (8 - null_bytes).max(1);
+                    long.push(FsstLongCode {
+                        code,
+                        len,
+                        mask: u64::MAX >> (64 - 8 * value_len),
+                        slot: fsst_lossy_pht_slot(symbol),
+                        symbol,
+                    });
+                }
+            }
+        }
+        two_byte.sort_unstable_by_key(|(key, _)| *key);
+        long.sort_unstable_by_key(|entry| entry.slot);
+        let mut has_suffix_code = 0u8;
+        for (code, (symbol, len)) in defined().enumerate() {
+            if len != 2 {
+                break;
+            }
+            let first2 = symbol as u16;
+            if defined()
+                .skip(code)
+                .any(|(other, other_len)| other_len > 2 && other as u16 == first2)
+            {
+                has_suffix_code = code as u8;
+                break;
+            }
+        }
+        Self {
+            has_suffix_code,
+            long,
+            one_byte,
+            two_byte,
+        }
+    }
+
+    fn short_code(&self, word: u64) -> FsstShortCode {
+        let two_byte = self
+            .two_byte
+            .binary_search_by_key(&(word as u16), |(key, _)| *key)
+            .ok()
+            .and_then(|index| self.two_byte.get(index));
+        match two_byte {
+            Some(&(_, code)) => FsstShortCode {
+                code,
+                escape: false,
+                len: 2,
+            },
+            None => self.one_byte.get((word & 0xFF) as usize).copied().unwrap_or(FsstShortCode {
+                code: fsst::ESCAPE_CODE,
+                escape: true,
+                len: 1,
+            }),
+        }
+    }
+
+    /// The codes `fsst::Compressor::compress` writes for `plaintext` over this table.
+    pub(crate) fn compress(&self, plaintext: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(plaintext.len() * 2);
+        let mut position = 0;
+        while let Some(rest) = plaintext.get(position..).filter(|rest| !rest.is_empty()) {
+            let mut bytes = [0u8; 8];
+            for (slot, byte) in bytes.iter_mut().zip(rest) {
+                *slot = *byte;
+            }
+            let word = u64::from_le_bytes(bytes);
+            let short = self.short_code(word);
+            if short.escape || short.code >= self.has_suffix_code {
+                let slot = fsst_lossy_pht_slot(word);
+                let found = self.long.binary_search_by_key(&slot, |entry| entry.slot).ok();
+                if let Some(&entry) = found.and_then(|index| self.long.get(index))
+                    && word & entry.mask == entry.symbol
+                {
+                    out.push(entry.code);
+                    position += entry.len as usize;
+                    continue;
+                }
+            }
+            out.push(short.code);
+            if short.escape {
+                out.push(bytes[0]);
+            }
+            position += short.len as usize;
+        }
+        out
+    }
+}
+
 impl FsstDecodeTable {
+    /// The needle encoder over this table, for an equality scan that compares compressed codes.
+    pub(crate) fn needle_encoder(&self) -> FsstNeedleEncoder {
+        FsstNeedleEncoder::new(self)
+    }
+
     fn new(compressor: &fsst::Compressor) -> Self {
         let mut table = Self {
             lengths: [0; 256],
@@ -4468,6 +4638,21 @@ fn encode_chosen_form(
         // A trailing stage would exceed the declared maximum cascade depth, so it is not added — however well it
         // would have sampled.
         (Compression::None, body)
+    } else if matches!(transform, Transform::FsstString | Transform::DeltaBitpack | Transform::ForBitpack) {
+        // Kept only when it at least halves the block: see `FSST_TRAILING_MAX_RATIO_NUM`. These transforms are already
+        // compact and answer filters straight from their bytes, which a trailing codec would force a reader to unpack.
+        let fallback = body.clone();
+        let (compression, bytes) = match replay_trailing {
+            Some(captured) => apply_captured_trailing(body, captured, strategy),
+            None => apply_trailing(body, strategy),
+        };
+        if compression == Compression::None
+            || bytes.len() * FSST_TRAILING_MAX_RATIO_DEN <= fallback.len() * FSST_TRAILING_MAX_RATIO_NUM
+        {
+            (compression, bytes)
+        } else {
+            (Compression::None, fallback)
+        }
     } else if let Some(captured) = replay_trailing {
         apply_captured_trailing(body, captured, strategy)
     } else {
@@ -5307,6 +5492,8 @@ pub fn decode_block_range_shared(
             (ValueKind::String, Transform::RawString) => {
                 Ok(ColumnData::Strings(decode_raw_string_range(body, start, end)?))
             }
+            // A run directory expands only the runs overlapping the range, not the whole block.
+            (kind @ (ValueKind::U64 | ValueKind::I64), Transform::Rle) => lazy::decode_rle_range(body, kind, start, end),
             _ => {
                 debug_assert!(
                     !transform.is_per_value_addressable(),

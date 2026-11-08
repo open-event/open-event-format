@@ -1300,3 +1300,36 @@ fn state_at_an_event_cold_and_warm() {
     );
     assert!(state_lookup_gate_passes(&measurement));
 }
+
+/// A piece one reader fetched is served from the shared cache to the next reader even when that reader wants it
+/// together with an adjacent piece: the cache is checked per piece before neighbours are joined, so only the uncached
+/// neighbour is planned rather than one joined request that fetches the cached bytes again.
+#[test]
+fn prefetch_checks_the_cache_for_each_piece_before_joining_neighbours() {
+    let built = large_file();
+    let source = CountingSource::new(&built.bytes);
+    let cache = Arc::new(BlockCache::new(64 << 20, None));
+    let file = open(&source, Some(&cache), &built, None);
+    let remote = file.remote().unwrap();
+    let stripe = &built.footer.stripes[0];
+    let first = remote.footer.plan_verified_stripe_read(stripe.stripe_id, 0, 1).unwrap();
+    let leaf = first.length;
+    assert!(3 * leaf <= stripe.byte_len, "the stripe spans several proof leaves");
+    let x = (first.file_offset, first.file_offset + 1);
+    let y = (first.file_offset + leaf, first.file_offset + leaf + 1);
+
+    let pieces = remote.plan_prefetch(&[x]).unwrap();
+    assert_eq!(pieces.len(), 1);
+    let piece = &pieces[0];
+    let bytes = &built.bytes[piece.file_offset as usize..][..piece.length as usize];
+    remote.admit(piece, bytes).unwrap();
+
+    let next = remote.fresh();
+    let planned = next.plan_prefetch(&[x, y]).unwrap();
+    assert_eq!(planned.len(), 1, "only the uncached neighbour is planned");
+    assert!(
+        planned[0].file_offset >= first.file_offset + leaf,
+        "the cached piece is not fetched again: {planned:?}"
+    );
+    assert!(next.held.find(x.0, x.1).is_some(), "the cached piece is held");
+}

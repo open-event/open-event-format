@@ -5564,6 +5564,14 @@ fn encode_residual(
     Ok((dictionary_bytes, offsets.into_bytes(), residual.into_bytes()))
 }
 
+/// The lowest and highest of `values` from one pass, or `None` when there are none — so a granule's bounds cost one
+/// walk of its rows rather than one for the minimum and another for the maximum.
+fn min_max<T: Ord + Copy>(values: impl IntoIterator<Item = T>) -> Option<(T, T)> {
+    let mut values = values.into_iter();
+    let first = values.next()?;
+    Some(values.fold((first, first), |(min, max), value| (min.min(value), max.max(value))))
+}
+
 /// Builds one granule's typed pieces from its rows. `wanted` narrows the blocks to build to those columns — the
 /// rest are still routed, so what moves out of the residual is unchanged, but never stored — and `build_residual`
 /// says whether the payload arena, its dictionary and offsets are encoded at all; an update that borrows a granule's
@@ -5595,20 +5603,10 @@ fn build_granule(
     // loan to the borrowed residual and column values and cannot be looked at again.
     // The lowest and highest rather than the first and last row: the same thing for the primary `(epoch, sequence)`
     // order, and the true sequence bounds for the entity projection, whose granule rows interleave across entities.
-    let (first_epoch, first_sequence) =
-        rows.iter()
-            .map(|row| (row.epoch, row.sequence))
-            .min()
-            .ok_or(FormatError::Structural {
-                rule: "granules are non-empty",
-            })?;
-    let (last_epoch, last_sequence) =
-        rows.iter()
-            .map(|row| (row.epoch, row.sequence))
-            .max()
-            .ok_or(FormatError::Structural {
-                rule: "granules are non-empty",
-            })?;
+    let ((first_epoch, first_sequence), (last_epoch, last_sequence)) =
+        min_max(rows.iter().map(|row| (row.epoch, row.sequence))).ok_or(FormatError::Structural {
+            rule: "granules are non-empty",
+        })?;
     let mut epoch = Vec::with_capacity(row_count);
     let mut sequence = Vec::with_capacity(row_count);
     let mut stream_id = Vec::with_capacity(row_count);
@@ -5989,14 +5987,23 @@ fn build_granule(
     // checked in ingest order exactly like `file_has_late_events`, but over the `occurred` values this granule
     // already collected above instead of re-reading the rows). A late event whose inversion instead crosses a
     // granule boundary is caught by the file-wide fold over `min_occurred_at_physical`/running-max in the caller.
+    // The same walk also takes the granule's lowest `occurred_at`; the running maximum ends as its highest.
     let mut max_occurred_so_far = i64::MIN;
+    let mut min_occurred = i64::MAX;
     let mut has_internal_late_event = false;
     for &occurred_at in &occurred {
         if occurred_at < max_occurred_so_far {
             has_internal_late_event = true;
         }
         max_occurred_so_far = max_occurred_so_far.max(occurred_at);
+        min_occurred = min_occurred.min(occurred_at);
     }
+    let (min_occurred, max_occurred) = if occurred.is_empty() {
+        (0, 0)
+    } else {
+        (min_occurred, max_occurred_so_far)
+    };
+    let (min_ingested, max_ingested) = min_max(ingested.iter().copied()).unwrap_or((0, 0));
 
     let entry = GranuleEntry {
         granule_id,
@@ -6007,10 +6014,10 @@ fn build_granule(
         first_sequence,
         last_epoch,
         last_sequence,
-        min_occurred_at_physical: occurred.iter().copied().min().unwrap_or(0),
-        max_occurred_at_physical: occurred.iter().copied().max().unwrap_or(0),
-        min_ingested_at_physical: ingested.iter().copied().min().unwrap_or(0),
-        max_ingested_at_physical: ingested.iter().copied().max().unwrap_or(0),
+        min_occurred_at_physical: min_occurred,
+        max_occurred_at_physical: max_occurred,
+        min_ingested_at_physical: min_ingested,
+        max_ingested_at_physical: max_ingested,
         compressed_bytes_estimate: residual_bytes.len() as u64,
     };
 

@@ -8,7 +8,10 @@ use anyhow::{Result, anyhow};
 use oe::artifacts::batch::{EventInput, PayloadInput, build_batch};
 use oe::artifacts::frame::{FrameBuildInput, build_frame};
 use oe::columns::{FreetextDeclaration, PromotionPlan, column_ids};
-use oe::encoding::ColumnData;
+use oe::encoding::{ColumnData, SideStream};
+use oe::encoding::predicate::{
+    NumericPredicate, StringPredicate, filter_numeric_block_or_decode, filter_string_block_or_decode,
+};
 use oe::events::variant::VariantValue;
 use oe::deletes::{DeletionVector, encode_deletion_vector};
 use oe::events::relationships::{EventRelationships, RelationshipKind, RelationshipRef, TargetIdSpace};
@@ -234,6 +237,69 @@ impl OeReader {
         Ok(totals)
     }
 
+    /// Equality filters on `entity_id` and `event_type` answered on the encoded blocks: the entity id against its
+    /// dictionary codes and the event type as one dictionary code, so neither string column is materialised. The
+    /// folded columns are decoded only in granules with a match. `None` when the query has
+    /// any other predicate or folds a non-integer column.
+    fn query_on_keys(&self, query: &Query) -> Result<Option<Partial>> {
+        let footer = self.file.footer();
+        let mut entity = None;
+        let mut event_type = None;
+        for predicate in &query.predicates {
+            match predicate {
+                Predicate::EqStr { column: "entity_id", value } => entity = Some((stable_hash(value.as_bytes()), value.as_str())),
+                Predicate::EqStr { column: "event_type", value } => match footer.dictionaries.event_type.iter().position(|t| t == value) {
+                    Some(code) => event_type = Some(code as u64),
+                    None => return Ok(Some(Partial::default())),
+                },
+                _ => return Ok(None),
+            }
+        }
+        let Some((low, entity_value)) = entity else { return Ok(None) };
+        let fold_ids: Vec<u32> = query.fold.iter().map(|n| self.column_id(n)).collect::<Result<_>>()?;
+        let mut total = Partial::default();
+        let entity_test = StringPredicate::Equals(entity_value.to_owned());
+        let type_test = event_type.map(|code| NumericPredicate::Equals(i128::from(code)));
+        for granule in self.file.granules_for_entity_hash(low) {
+            let id = granule.granule_id;
+            let raw = self.file.read_column_raw(column_ids::ENTITY_ID, id)?;
+            let mut keep = if raw.pipeline.side_stream()? == SideStream::FileScopeDictionary {
+                // The block's codes point into the file's shared alphabet, which only the reader resolves.
+                match self.file.read_column(column_ids::ENTITY_ID, id)?.data {
+                    ColumnData::Strings(values) => entity_test.filter_decoded(&values),
+                    _ => return Err(anyhow!("entity_id is not a string column")),
+                }
+            } else {
+                filter_string_block_or_decode(raw.pipeline, raw.body, &entity_test)?
+            };
+            if !keep.contains(&true) {
+                continue;
+            }
+            if let Some(test) = &type_test {
+                let raw = self.file.read_column_raw(column_ids::EVENT_TYPE_ID, id)?;
+                for (flag, v) in keep.iter_mut().zip(filter_numeric_block_or_decode(raw.pipeline, raw.body, test)?) {
+                    *flag &= v;
+                }
+            }
+            let picked: Vec<usize> = keep.iter().enumerate().filter(|(_, k)| **k).map(|(i, _)| i).collect();
+            if picked.is_empty() {
+                continue;
+            }
+            let mut partial = Partial { rows: picked.len() as u64, sums: Vec::new(), tail: Vec::new() };
+            for (name, column) in query.fold.iter().zip(&fold_ids) {
+                let ColumnData::I64(values) = self.file.read_column(*column, id)?.data else {
+                    return Ok(None);
+                };
+                partial.sums.push(picked.iter().map(|&p| values[p] as i128).sum());
+                if let (Some(n), "occurred_at") = (query.last_n, *name) {
+                    partial.tail = picked[picked.len().saturating_sub(n)..].iter().map(|&p| values[p]).collect();
+                }
+            }
+            total.add(&partial, query.last_n);
+        }
+        Ok(Some(total))
+    }
+
     fn column_id(&self, name: &str) -> Result<u32> {
         let physical = match name {
             "event_id" => Some(column_ids::EVENT_ID),
@@ -286,6 +352,9 @@ impl Opened for OeReader {
         });
         if let Some(rows) = by_index {
             return self.rows_partial(&rows?, query);
+        }
+        if let Some(partial) = self.query_on_keys(query)? {
+            return Ok(partial);
         }
         let names = needed(query);
         let ids: Vec<u32> = names.iter().map(|n| self.column_id(n)).collect::<Result<_>>()?;
