@@ -402,6 +402,7 @@ impl OePublisher {
             file_id: built.file_id,
             file_type: FileType::OeFile,
             footer_len: Some(built.footer_len),
+            entity_summary: Some(built.entity_summary.clone()),
             graph_event_id_filter: built
                 .footer
                 .graph

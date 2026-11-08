@@ -18,6 +18,7 @@ fn entry() -> OeFileEntry {
             last_sequence: 99,
         },
         deletion_vector: None,
+        entity_summary: None,
         feature_metadata: None,
         file_seal: [0; 32],
         file_id: FILE_ID,

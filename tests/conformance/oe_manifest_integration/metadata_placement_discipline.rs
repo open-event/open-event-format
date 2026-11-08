@@ -29,6 +29,7 @@ fn large_rollup_not_in_manifest() {
         file_id: 0xAA,
         file_type: FileType::OeFile,
         footer_len: None,
+        entity_summary: None,
         graph_event_id_filter: None,
         graph_summary: None,
         deletion_vector: None,

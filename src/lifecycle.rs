@@ -99,6 +99,10 @@ pub struct OeFileEntry {
     /// (see [`crate::deletion_store`]). `None` when no row was ever deleted, and on entries written before it existed.
     #[serde(default)]
     pub deletion_vector: Option<crate::deletion_store::StoredDeletionVector>,
+    /// Which entities the file holds (see [`crate::indexes::entity_summary`]), so a planner looking for one entity's
+    /// events skips files that cannot hold any. `None` on entries written before the summary existed.
+    #[serde(default)]
+    pub entity_summary: Option<crate::indexes::entity_summary::EntitySummary>,
     /// Day-scoped service rollup payload. Valid only on `GenerationPart` entries with `part_index == 0`; must be
     /// `None` on all other entries.
     pub feature_metadata: Option<Vec<u8>>,

@@ -721,3 +721,95 @@ fn merging_small_segments_keeps_every_row_in_order_and_searches_the_same() {
     let dot = self::model(24, VectorMetric::Dot);
     assert!(merge_segments(&readers, &spec(dot, representations), &key(2)).is_err());
 }
+
+#[test]
+fn segment_deletes_are_immutable_generations_that_round_trip() {
+    let empty = SegmentDeletes::new();
+    let first = empty.with_deleted([3, 4, 9]);
+    let second = first.with_deleted([5]);
+    assert_eq!((empty.generation(), first.generation(), second.generation()), (0, 1, 2));
+    assert_eq!(empty.deleted_count(), 0);
+    assert_eq!(first.deleted_count(), 3);
+    assert!(!first.is_deleted(5));
+    assert!(second.is_deleted(5) && second.is_deleted(3));
+    let back = SegmentDeletes::decode(&second.encode()).unwrap();
+    assert_eq!(back.generation(), 2);
+    assert_eq!(back.deletion_vector().iter().collect::<Vec<_>>(), vec![3, 4, 5, 9]);
+    assert!(SegmentDeletes::decode(&[1, 2]).is_err());
+}
+
+#[test]
+fn search_skips_deleted_rows_and_compaction_drops_them() {
+    let model = model(24, VectorMetric::Cosine);
+    let representations = vec![VectorElement::U1, VectorElement::F32];
+    let rows = input(GRANULE_ROWS + 10, 24);
+    let bytes = write_segment(&spec(model.clone(), representations.clone()), &rows, &key(1)).unwrap();
+    let readers = vec![SegmentReader::open(bytes.clone(), &key(1)).unwrap()];
+    let target = GRANULE_ROWS as u64 + 2;
+    let query = rows.vectors[target as usize].clone();
+    let search = VectorSearch {
+        filter: SearchFilter::default(),
+        k: 3,
+        model: &model,
+        oversample: DEFAULT_OVERSAMPLE,
+        query: &query,
+    };
+    let before = search_segments(&readers, &search).unwrap();
+    assert_eq!(before[0].row, target);
+
+    let event = rows.event_ids[target as usize].clone();
+    let deleted_rows = readers[0].rows_for_event_ids(&[event.as_str()]).unwrap();
+    assert_eq!(deleted_rows, vec![target]);
+    let deletes = SegmentDeletes::new().with_deleted(deleted_rows);
+    let after = search_segments_with_deletes(&readers, &[Some(&deletes)], &search).unwrap();
+    assert_eq!(after.len(), 3);
+    assert!(after.iter().all(|hit| hit.row != target && hit.event_id != event));
+    assert_eq!(after[0].row, before[1].row);
+    // The segment itself is untouched, and an older generation still sees the row.
+    assert_eq!(
+        search_segments_with_deletes(&readers, &[Some(&SegmentDeletes::new())], &search).unwrap(),
+        before
+    );
+
+    // A filtered search skips it too, and deleting every row leaves nothing.
+    let filtered = VectorSearch {
+        filter: SearchFilter {
+            room_ids: Some(vec![rows.string_columns[0].1[target as usize].clone()]),
+            ..SearchFilter::default()
+        },
+        ..search.clone()
+    };
+    assert!(
+        search_segments_with_deletes(&readers, &[Some(&deletes)], &filtered)
+            .unwrap()
+            .iter()
+            .all(|hit| hit.row != target)
+    );
+    let everything = deletes.with_deleted(0..readers[0].row_count());
+    assert!(
+        search_segments_with_deletes(&readers, &[Some(&everything)], &search)
+            .unwrap()
+            .is_empty()
+    );
+
+    let compacted = SegmentReader::open(
+        merge_segments_with_deletes(
+            &readers,
+            &[Some(&deletes)],
+            &spec(model.clone(), representations),
+            &key(2),
+        )
+        .unwrap(),
+        &key(2),
+    )
+    .unwrap();
+    assert_eq!(compacted.row_count(), readers[0].row_count() - 1);
+    let all = compacted.read_all().unwrap();
+    let expected: Vec<String> = rows.event_ids.iter().filter(|id| **id != event).cloned().collect();
+    assert_eq!(all.event_ids, expected);
+    assert_eq!(all.string_columns[0].1.len(), expected.len());
+    assert_eq!(all.integer_columns[0].1.len(), expected.len());
+    assert!(!all.integer_columns[0].1.contains(&(1_000 + target as i64)));
+    let hits = search_segments(std::slice::from_ref(&compacted), &search).unwrap();
+    assert!(hits.iter().all(|hit| hit.event_id != event));
+}

@@ -16,6 +16,7 @@ fn entry(file_id: u128, part_state: PartState) -> OeFileEntry {
         file_id,
         file_type: FileType::OeFile,
         footer_len: Some(64),
+        entity_summary: None,
         graph_event_id_filter: None,
         graph_summary: None,
         deletion_vector: None,

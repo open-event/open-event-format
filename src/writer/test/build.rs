@@ -4275,3 +4275,35 @@ fn a_time_series_build_refuses_rows_that_go_back_in_time_and_widths_it_cannot_us
         }
     );
 }
+
+/// A built file records exactly which entities its rows belong to, and an update — sparse or whole — records the same
+/// set as a fresh build of the replacement rows.
+#[test]
+fn built_files_summarize_the_entities_they_hold() {
+    use crate::indexes::entity_summary::EntityKey;
+    let cfg = sparse_config();
+    let before: Vec<OeRow> = (0..400).map(row).collect();
+    let source = build_oe_file(before.clone(), &cfg).unwrap();
+    // 400 distinct entities: past the exact limit, so a filter that still admits every one of them.
+    assert!(!source.entity_summary.is_exact());
+    assert_eq!(source.entity_summary.entity_count(), 400);
+    assert!((0..400).all(|i| source.entity_summary.may_hold(EntityKey::new(1, i))));
+    let strangers = (0..10_000u64)
+        .filter(|i| source.entity_summary.may_hold(EntityKey::new(2, *i)))
+        .count();
+    assert!(strangers < 500, "{strangers} false positives");
+
+    let mut after = before.clone();
+    let mut rng = Lcg(7);
+    mutate(&mut after[3], &mut rng, false, 3);
+    let changes = changes_for(&before, &after, &[3]);
+    let updated =
+        update_oe_file_from_changes_with_executor(&source, after.clone(), &changes, &cfg, &SerialEncodeExecutor)
+            .unwrap();
+    assert_eq!(updated.entity_summary, source.entity_summary);
+
+    let small = build_oe_file((0..8).map(row).collect(), &config()).unwrap();
+    let keys: Vec<EntityKey> = (0..8).map(|i| EntityKey::new(1, i)).collect();
+    assert_eq!(small.entity_summary.exact_keys(), Some(keys.as_slice()));
+    assert!(!small.entity_summary.may_hold(EntityKey::new(1, 8)));
+}

@@ -222,6 +222,7 @@ fn entry(built: &BuiltOe) -> OeFileEntry {
         file_id: built.file_id,
         file_type: FileType::OeFile,
         footer_len: Some(built.footer_len),
+        entity_summary: None,
         graph_event_id_filter: None,
         graph_summary: None,
         deletion_vector: None,
