@@ -148,12 +148,3 @@ No. OE provides the file format, indexes and predicate evaluation on encoded blo
 In [`openspec/specs`](./openspec/specs), one directory per `oe-*` capability, with proposed changes under [`openspec/changes`](./openspec/changes). [`conformance/capability-map.toml`](./conformance/capability-map.toml) maps each capability to its module and tests.
 
 </details>
-
-## Community
-
-- [GitHub Issues](https://github.com/open-event/open-event-format/issues) - Report bugs and propose changes
-- [Pull Requests](https://github.com/open-event/open-event-format/pulls) - Contribute
-
-## License
-
-Apache 2.0
