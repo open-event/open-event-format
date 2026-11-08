@@ -1600,15 +1600,15 @@ fn paged_columns_round_trip_with_non_byte_aligned_pages() {
     );
 
     let file = OeFile::open(built.bytes.clone(), Some(&built.file_seal)).unwrap();
-    for page_index in 0..sequence_pages.len() {
+    for (page_index, sequence_page) in sequence_pages.iter().enumerate() {
         let page = file
             .read_page(column_ids::SEQUENCE, granule_id, page_index as u32)
             .unwrap();
         assert_eq!(
             page.data,
             ColumnData::U64(
-                (sequence_pages[page_index].first_row_ordinal + 1
-                    ..=sequence_pages[page_index].first_row_ordinal + u64::from(sequence_pages[page_index].row_count))
+                (sequence_page.first_row_ordinal + 1
+                    ..=sequence_page.first_row_ordinal + u64::from(sequence_page.row_count))
                     .collect()
             ),
             "plain page {page_index} must read its own [start, end) range"

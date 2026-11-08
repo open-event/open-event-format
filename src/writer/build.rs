@@ -27,7 +27,7 @@ use crate::events::variant::{
     EncodeScratch, KeyDictionary, VariantRef, VariantValue, encode_object_fields_into_with_scratch,
     encode_value_into_with_scratch,
 };
-use crate::events::{EventEnvelope, EventFlags, EventId, StreamId, TenantId, TimestampValue};
+use crate::events::{EventFlags, EventId, StreamId, TenantId, TimestampValue};
 use crate::file::bytes::Writer;
 use crate::file::constant::{CHUNK_GROUP_BYTES, TREE_TRAILER_MAGIC};
 use crate::indexes::ndv::NdvSketch;
@@ -679,7 +679,7 @@ fn plan_sparse_update(
         || carries_relationships != has_column(column_ids::PARENT_REF)
         || footer.io_alignment_bytes != config.io_alignment_bytes
         || (!config.freetext.fields.is_empty()
-            && config.freetext_row_offset_index != !footer.freetext_row_offsets.is_empty())
+            && config.freetext_row_offset_index == footer.freetext_row_offsets.is_empty())
         || reuse
             .changed_columns_by_granule
             .values()
@@ -1794,7 +1794,14 @@ fn seal_footer(dek: &[u8; 32], file_id: u128, footer_blob: &[u8]) -> Result<Vec<
     hasher.update(b"oe-footer-nonce-v1");
     hasher.update(&file_id.to_le_bytes());
     hasher.update_rayon(footer_blob);
-    let nonce = hasher.finalize().as_bytes()[..scheme.nonce_len()].to_vec();
+    let digest = hasher.finalize();
+    let nonce = digest
+        .as_bytes()
+        .get(..scheme.nonce_len())
+        .ok_or(FormatError::Structural {
+            rule: "footer nonce longer than the keyed digest",
+        })?
+        .to_vec();
     let ciphertext = scheme
         .seal(dek, &nonce, &file_id.to_le_bytes(), footer_blob)
         .ok_or(FormatError::Structural {
@@ -1825,7 +1832,7 @@ fn build_entity_hash_filters(granules: &[GranulePieces]) -> BTreeMap<u32, Vec<u8
     for granule in granules {
         let Some(hashes) = granule.blocks.iter().find_map(|block| {
             (block.column_id == column_ids::ENTITY_ID_HASH_LOW)
-                .then(|| match &block.data {
+                .then_some(match &block.data {
                     ColumnData::U64(values) => Some(values.as_slice()),
                     _ => None,
                 })
@@ -2040,6 +2047,7 @@ fn build_scheduled_footer_metadata(
             *slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(batch);
         }
     });
+    #[expect(clippy::expect_used, reason = "the executor runs every job before returning")]
     let batches = slots
         .into_iter()
         .map(|slot| {
@@ -3140,7 +3148,12 @@ fn build_oe_file_sealed_in_order(
         .filter_map(|path| field_identities.field_id(path))
         .collect();
     let (shred_plan, sparse_keys, shred_kinds) = if reuse_path_plan {
-        let source = &update_reuse.expect("reuse path plan has a source").source.footer;
+        let source = &update_reuse
+            .ok_or(FormatError::Structural {
+                rule: "reuse path plan has a source",
+            })?
+            .source
+            .footer;
         let shred_plan = source.shredded.clone();
         let sparse_keys = source.sparse_keys.clone();
         let shred_kinds = shred_plan
@@ -3155,7 +3168,9 @@ fn build_oe_file_sealed_in_order(
             .collect();
         (shred_plan, sparse_keys, shred_kinds)
     } else {
-        let statistics = statistics.expect("full path analysis produces statistics");
+        let statistics = statistics.ok_or(FormatError::Structural {
+            rule: "full path analysis produces statistics",
+        })?;
         // One owned copy per distinct field name, for the candidate selection's own name lists.
         let field_names: Vec<String> = field_identities
             .field_names()
@@ -3482,7 +3497,9 @@ fn build_oe_file_sealed_in_order(
         granules.push(
             slot.into_inner()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .expect("the executor runs every job")?,
+                .ok_or(FormatError::Structural {
+                    rule: "the executor runs every job",
+                })??,
         );
     }
     for (granule, blocks) in granules.iter_mut().zip(source_form_blocks) {
@@ -3547,8 +3564,7 @@ fn build_oe_file_sealed_in_order(
         .collect();
     // Each granule's per-row free-text offset indexes in declared order: the ones the granule built, and for a
     // sparse update the ones it left to the source because that column's values did not change.
-    let mut freetext_row_offsets_by_granule: Vec<Vec<(u32, Cow<'_, [u8]>, Cow<'_, [u8]>)>> =
-        Vec::with_capacity(granules.len());
+    let mut freetext_row_offsets_by_granule: Vec<Vec<FreetextOffsetIndex<'_>>> = Vec::with_capacity(granules.len());
     for granule in granules.iter_mut() {
         let mut built = std::mem::take(&mut granule.freetext_row_offsets).into_iter().peekable();
         let mut indexes = Vec::new();
@@ -3691,7 +3707,7 @@ fn build_oe_file_sealed_in_order(
         /// Per indexed free-text column, this granule's per-row byte-offset index: `(column_id, raw row bytes,
         /// offsets table)`, borrowed from the source when an update left the column alone. Empty when the file
         /// declares no free-text fields, and when the build did not opt into the index.
-        freetext_row_offsets: Vec<(u32, Cow<'a, [u8]>, Cow<'a, [u8]>)>,
+        freetext_row_offsets: Vec<FreetextOffsetIndex<'a>>,
         granule_id: u32,
         offsets: Cow<'a, [u8]>,
         residual: Cow<'a, [u8]>,
@@ -3794,6 +3810,10 @@ fn build_oe_file_sealed_in_order(
 
     /// Encodes one pending block into its piece. Pure per-block work — no shared state — so the executor can run one
     /// job per block concurrently and the products only need reassembling in job order.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "each argument is an independent per-block input"
+    )]
     fn encode_block_piece(
         block: &PendingBlock,
         entry: &GranuleEntry,
@@ -4265,7 +4285,7 @@ fn build_oe_file_sealed_in_order(
     // split is by granule index and every capture is a pure function of its head block, so any executor — serial or
     // threaded — produces byte-identical files. Requirement: "Encoding selection may capture and replay a winning
     // pipeline".
-    let is_head = |granule_idx: usize| granule_idx % REPLAY_SEGMENT_GRANULES == 0;
+    let is_head = |granule_idx: usize| granule_idx.is_multiple_of(REPLAY_SEGMENT_GRANULES);
     let (head_jobs, tail_jobs): (Vec<usize>, Vec<usize>) =
         (0..job_list.len()).partition(|idx| job_list.get(*idx).is_some_and(|(granule_idx, _)| is_head(*granule_idx)));
     let run_phase = |jobs: &[usize], captures: &HashMap<(u32, usize), ReplayCapture>| {
@@ -4360,7 +4380,9 @@ fn build_oe_file_sealed_in_order(
         let product = slot
             .into_inner()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .expect("the executor runs every job")?;
+            .ok_or(FormatError::Structural {
+                rule: "the executor runs every job",
+            })??;
         text_token_indexes.extend(product.text_tokens);
         if product.reused {
             reused_source_block_bytes += product.piece.len() as u64;
@@ -4488,7 +4510,9 @@ fn build_oe_file_sealed_in_order(
         let product = slot
             .into_inner()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .expect("the executor runs every job");
+            .ok_or(FormatError::Structural {
+                rule: "the executor runs every job",
+            })?;
         if let Some(text_token) = product.text_token {
             text_token_indexes.push(text_token);
         }
@@ -5033,6 +5057,7 @@ fn build_oe_file_sealed_in_order(
             *slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(laid);
         }
     });
+    #[expect(clippy::expect_used, reason = "the executor runs every job before returning")]
     let laid_out: Vec<LaidOutStripe> = slots
         .into_iter()
         .map(|slot| {
@@ -5460,7 +5485,7 @@ fn build_oe_file_sealed_in_order(
         .chain(proof_trees)
         .chain((proof_appendix_len != 0).then(|| proof_tree_len_bytes.to_vec()))
         .chain((proof_appendix_len != 0).then(|| TREE_TRAILER_MAGIC.to_vec()));
-    let file = match sink.as_deref_mut() {
+    let file = match sink {
         // Streamed: the stripes already went out; the tail follows them, and the header — final only now that the
         // footer pointer and file id it carries are known — goes last, to the front of the file.
         Some(sink) => {
@@ -5535,6 +5560,12 @@ const RELATIONSHIP_COLUMN_IDS: [u32; 6] = [
     column_ids::AUTH_REFS,
 ];
 
+/// A granule's encoded payload arena: `(key dictionary, offsets table, arena bytes)`.
+type EncodedResidual = (Vec<u8>, Vec<u8>, Vec<u8>);
+
+/// One indexed free-text column's per-row offset index: `(column_id, raw row bytes, offsets table)`.
+type FreetextOffsetIndex<'a> = (u32, Cow<'a, [u8]>, Cow<'a, [u8]>);
+
 /// Encodes one granule's payload arena: the key dictionary over every residual key, then each row's residual value —
 /// or external reference — straight into the arena, with an `(offset, len)` entry per row (`(0, 0)` for a row that
 /// stores nothing). Returns the dictionary, offsets table and arena bytes.
@@ -5544,7 +5575,7 @@ fn encode_residual(
     external_refs: &[Option<&str>],
     residual_value_bytes: usize,
     payloads: &NormalizedPayloads,
-) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), FormatError> {
+) -> Result<EncodedResidual, FormatError> {
     let row_count = residuals.len();
     // Granule variant dictionary: the residual keys, self-contained for the rows it governs. The names are gathered
     // borrowed and owned once for the granule, so a key every row carries is copied once rather than once per row.
@@ -5922,10 +5953,9 @@ fn build_granule(
                             && promoted_present(promoted, envelope.schema_version)
                             && let Some((bitmap, values)) = promoted_values.get_mut(index)
                             && values.push_variant(field_value)
+                            && let Some(byte) = bitmap.get_mut(row_index / 8)
                         {
-                            if let Some(byte) = bitmap.get_mut(row_index / 8) {
-                                *byte |= 1 << (row_index % 8);
-                            }
+                            *byte |= 1 << (row_index % 8);
                         }
                     }
                     // Shredded paths move: the value lives in exactly one of the typed column or the residual.

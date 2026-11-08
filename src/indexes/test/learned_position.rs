@@ -71,7 +71,7 @@ fn duplicate_run_straddling_a_segment_break_brackets_the_true_row() {
     let index = LearnedPositionIndex::build(1, 0, &keys, 1);
     let window = index.estimate_position(0);
     assert!(
-        window.search_from <= 0 && 0 <= window.search_to,
+        window.search_from == 0,
         "window [{}, {}] must contain the true boundary row 0 for the duplicated key 0",
         window.search_from,
         window.search_to,

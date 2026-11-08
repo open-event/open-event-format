@@ -973,7 +973,7 @@ fn page_directory_bounds_that_are_inverted_are_rejected_by_both_encodings() {
     };
 
     let mut row_oriented = minimal_footer();
-    row_oriented.page_directory = vec![inverted.clone()];
+    row_oriented.page_directory = vec![inverted];
     assert!(
         decode_footer(&encode_footer(&row_oriented)).is_err(),
         "an inverted integer bound must not decode from the row-oriented directory"
@@ -981,7 +981,7 @@ fn page_directory_bounds_that_are_inverted_are_rejected_by_both_encodings() {
 
     let marks = vec![sample_mark(0, 1, 5, None)];
     let granule_stripe_ids = std::collections::BTreeMap::from([(5u32, 0u32)]);
-    let bytes = encode_columnar_marks(&marks, &[inverted.clone()], &granule_stripe_ids).expect("encode succeeds");
+    let bytes = encode_columnar_marks(&marks, &[inverted], &granule_stripe_ids).expect("encode succeeds");
     assert!(
         decode_columnar_marks(&bytes).is_err(),
         "an inverted integer bound must not decode from the columnar directory"

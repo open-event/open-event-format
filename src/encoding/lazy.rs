@@ -12,7 +12,7 @@ use super::constant::MAX_RLE_EXPANSION_VALUES;
 use super::{
     ColumnData, DictionaryValues, FsstDecodeTable, IntValue, NullStream, PipelineId, SideStream, StringColumn,
     Transform, ValueKind, decode_block_shared_with_body, fastlanes_value_at, fsst_decompress_value, offset_window,
-    read_packed_stream, read_string_header, with_trailing_removed,
+    read_packed_stream, read_string_header, take_delta_bitpack, with_trailing_removed,
 };
 use crate::error::FormatError;
 use crate::file::bytes::{Reader, slice};
@@ -276,10 +276,33 @@ pub fn take_block_rows_shared(
             shared,
             rows,
         )?)),
+        (ValueKind::U64, Transform::ForBitpack) => Ok(ColumnData::U64(take_for_bitpack(body, rows)?)),
+        (ValueKind::I64, Transform::ForBitpack) => Ok(ColumnData::I64(take_for_bitpack(body, rows)?)),
+        (ValueKind::U64, Transform::DeltaBitpack) => Ok(ColumnData::U64(take_delta_bitpack(body, rows)?)),
+        (ValueKind::I64, Transform::DeltaBitpack) => Ok(ColumnData::I64(take_delta_bitpack(body, rows)?)),
         (ValueKind::U64, Transform::Rle) => Ok(ColumnData::U64(RunDirectory::read(body)?.take(rows)?)),
         (ValueKind::I64, Transform::Rle) => Ok(ColumnData::I64(RunDirectory::read(body)?.take(rows)?)),
         _ => gather_column(&decode_block_shared_with_body(pipeline, body, shared)?, rows),
     })
+}
+
+/// The values at `rows` of a frame-of-reference bitpacked block, each read straight out of its FastLanes lane.
+fn take_for_bitpack<T: IntValue>(body: &[u8], rows: &[usize]) -> Result<Vec<T>, FormatError> {
+    let mut reader = Reader::new(body);
+    let base = reader.u64("for base")?;
+    let packed = read_packed_stream(&mut reader)?;
+    rows.iter()
+        .map(|&row| {
+            if row >= packed.count {
+                return Err(FormatError::RefOutOfRange { what: "take row" });
+            }
+            base.checked_add(fastlanes_value_at(packed.packed, packed.width, row))
+                .map(T::from_code)
+                .ok_or(FormatError::Structural {
+                    rule: "frame-of-reference overflow",
+                })
+        })
+        .collect()
 }
 
 /// [`take_block_rows_shared`] for a block with no file-scope alphabet.

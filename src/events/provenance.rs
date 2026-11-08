@@ -48,6 +48,10 @@ impl SignatureScheme {
     }
 
     /// The scheme a stored tag names, or `None` when the tag is not in the registry.
+    #[allow(
+        clippy::should_implement_trait,
+        reason = "an unknown tag is `None`, not a parse error"
+    )]
     pub fn from_str(tag: &str) -> Option<Self> {
         match tag {
             "bip340-schnorr-secp256k1" => Some(SignatureScheme::Bip340SchnorrSecp256k1),

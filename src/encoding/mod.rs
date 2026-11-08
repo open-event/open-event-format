@@ -28,7 +28,7 @@ use constant::{
     ALP_RD_CODE_MISS, ALP_RD_MAX_DICT_LEN, ALP_RD_MAX_RIGHT_WIDTH, ALP_RD_MIN_RIGHT_WIDTH, ALP_VECTOR_ESCAPE_SENTINEL,
     BYTE_STREAM_SPLIT_TILE, DECODE_OPTIMIZED_THRESHOLD_DEN, DECODE_OPTIMIZED_THRESHOLD_NUM, FSST_TRAILING_MAX_RATIO_DEN,
     FSST_TRAILING_MAX_RATIO_NUM,
-    DICTIONARY_FSST_MAX_VALUE_LEN, DICTIONARY_MAX_CARDINALITY_DIVISOR, FASTLANES_SPARSE_MAX_VALUES,
+    DICTIONARY_FSST_MAX_VALUE_LEN, DICTIONARY_MAX_CARDINALITY_DIVISOR, DICTIONARY_TRIAL_MIN_REPEAT, FASTLANES_SPARSE_MAX_VALUES,
     FSST_LOSSY_PHT_HASH_MULTIPLIER, FSST_LOSSY_PHT_HASH_SHIFT, FSST_MAX_AVERAGE_VALUE_LEN, FSST_MAX_SYMBOL_COUNT,
     FSST_MIN_SAMPLE_COUNT, FSST_VALUE_KEYS_MAX_PLAINTEXT_DIVISOR, MAX_RLE_EXPANSION_VALUES, PREFIX_KEY_BYTES,
     PREFIX_SUM_CHUNK, REPLAY_TRIP_DEN, REPLAY_TRIP_NUM, SIZE_OPTIMIZED_SAVINGS_DIVISOR, TRANSFORM_SAMPLE_RUNS,
@@ -828,7 +828,7 @@ fn encode_for_bitpack(values: &[u64], out: &mut Writer) {
     let max_delta = values.iter().map(|v| v.wrapping_sub(base)).max().unwrap_or(0);
     out.put_u64(base);
     bitpack_with(values.len(), bits_needed(max_delta), out, |i| {
-        values[i].wrapping_sub(base)
+        values.get(i).map_or(0, |value| value.wrapping_sub(base))
     });
 }
 
@@ -888,7 +888,10 @@ fn encode_delta_bitpack(values: &[u64], out: &mut Writer) {
     let first = values.first().copied().unwrap_or(0);
     out.put_u64(first);
     let len = values.len().saturating_sub(1);
-    let delta_at = |i: usize| zigzag(values[i + 1].wrapping_sub(values[i]) as i64);
+    let delta_at = |i: usize| match (values.get(i), values.get(i + 1)) {
+        (Some(previous), Some(next)) => zigzag(next.wrapping_sub(*previous) as i64),
+        _ => 0,
+    };
     let max = (0..len).map(delta_at).max().unwrap_or(0);
     bitpack_with(len, bits_needed(max), out, delta_at);
 }
@@ -920,6 +923,67 @@ fn decode_delta_bitpack<T: IntValue>(reader: &mut Reader<'_>) -> Result<Vec<T>, 
         prefix_sum(deltas, first);
     }
     Ok(values)
+}
+
+/// The values at ascending `rows` of a delta bit-packed block, without materialising the block: vectors are unpacked
+/// one at a time into a reused buffer, only up to the vector holding the last requested row, with the running total
+/// carried across them.
+fn take_delta_bitpack<T: IntValue>(body: &[u8], rows: &[usize]) -> Result<Vec<T>, FormatError> {
+    let mut reader = Reader::new(body);
+    let first = reader.u64("delta first")?;
+    let stream = read_packed_stream(&mut reader)?;
+    let mut out = Vec::with_capacity(rows.len());
+    if !rows.is_sorted() {
+        // Rows out of order: decode once and gather.
+        let values = decode_delta_bitpack::<T>(&mut Reader::new(body))?;
+        return rows
+            .iter()
+            .map(|&row| values.get(row).copied().ok_or(FormatError::RefOutOfRange { what: "take row" }))
+            .collect();
+    }
+    if rows.last().is_some_and(|&row| row > stream.count) {
+        return Err(FormatError::RefOutOfRange { what: "take row" });
+    }
+    let mut wanted = rows.iter().copied().peekable();
+    while wanted.next_if_eq(&0).is_some() {
+        out.push(T::from_code(first));
+    }
+    let mut buffer = [0u64; FASTLANES_VECTOR];
+    let bytes_per_vector = FASTLANES_LANES * fastlanes_words_per_lane(stream.width as usize) * 8;
+    let mut carry = first;
+    let mut start = 1usize;
+    let mut vectors = stream.packed.chunks(bytes_per_vector.max(1));
+    while let Some(&row) = wanted.peek() {
+        if stream.width != 0 {
+            let Some(packed) = vectors.next() else {
+                return Err(FormatError::RefOutOfRange { what: "take row" });
+            };
+            unpack_vectors(packed, stream.width, &mut buffer, |code| unzigzag(code) as u64);
+        }
+        let end = start + FASTLANES_VECTOR;
+        let mut position = start;
+        let mut next = row;
+        loop {
+            if next >= end {
+                break;
+            }
+            for delta in buffer.get(position - start..=next - start).unwrap_or(&[]) {
+                carry = carry.wrapping_add(*delta);
+            }
+            out.push(T::from_code(carry));
+            position = next + 1;
+            wanted.next();
+            match wanted.peek() {
+                Some(&n) => next = n,
+                None => return Ok(out),
+            }
+        }
+        for delta in buffer.get(position - start..).unwrap_or(&[]) {
+            carry = carry.wrapping_add(*delta);
+        }
+        start = end;
+    }
+    Ok(out)
 }
 
 /// Turns a run of differences into the values they describe, in place: each slot becomes `carry` plus every
@@ -1167,7 +1231,7 @@ fn encode_i64_with(transform: Transform, values: &[i64], out: &mut Writer) {
                 for (slot, value) in chunk.iter_mut().zip(slice) {
                     *slot = zigzag(*value);
                 }
-                out.put_u64_slice(&chunk[..slice.len()]);
+                out.put_u64_slice(chunk.get(..slice.len()).unwrap_or_default());
             }
         }
     }
@@ -1407,7 +1471,8 @@ fn encode_alp(values: &[f64], strategy: CascadeStrategy, out: &mut Writer) -> Op
     // size each escaped vector.
     for vector_index in &escaped {
         let start = *vector_index as usize * FASTLANES_VECTOR;
-        for value in &values[start..(start + FASTLANES_VECTOR).min(values.len())] {
+        let end = (start + FASTLANES_VECTOR).min(values.len());
+        for value in values.get(start..end).unwrap_or_default() {
             out.put_u64(value.to_bits());
         }
     }
@@ -1447,7 +1512,7 @@ fn apply_alp_escapes(reader: &mut Reader<'_>, escaped: &[u32], values: &mut [f64
             });
         }
         let end = (start + FASTLANES_VECTOR).min(values.len());
-        for slot in &mut values[start..end] {
+        for slot in values.get_mut(start..end).unwrap_or_default() {
             *slot = f64::from_bits(reader.u64("alp escaped value")?);
         }
     }
@@ -3076,16 +3141,6 @@ struct FsstShortCode {
     len: u8,
 }
 
-/// One symbol of three or more bytes in [`FsstNeedleEncoder`]'s hash table, keyed by its lossy-hash slot.
-#[derive(Clone, Copy)]
-struct FsstLongCode {
-    code: u8,
-    len: u8,
-    mask: u64,
-    slot: u64,
-    symbol: u64,
-}
-
 /// Compresses search terms to exactly the codes [`fsst::Compressor::compress`] writes over the same symbol table,
 /// without building the crate's 128 KiB two-byte table and lossy hash table. An equality scan compresses one or two
 /// needles per block, so rebuilding a full compressor for them cost more than comparing every row did.
@@ -3094,99 +3149,146 @@ struct FsstLongCode {
 /// (zero-padded past the end), takes a two-byte-table code outright when no longer symbol shares its first two
 /// bytes, and otherwise probes the hash slot of the next three bytes, keeping that symbol only when its non-null bytes
 /// match, before falling back to the two-byte table (a two-byte symbol, else a one-byte symbol, else an escape).
+///
+/// The tables are chained buckets over fixed arrays indexed by code, built in one pass with no sorting or allocation:
+/// a block's filter builds one encoder per needle, so its construction is on every lookup's path. Each bucket lists
+/// its codes latest first, which is the code the crate's table keeps when two symbols share a key.
 pub(crate) struct FsstNeedleEncoder {
     has_suffix_code: u8,
-    long: Vec<FsstLongCode>,
+    lengths: [u8; 256],
+    /// Bucket heads keyed by a long symbol's slot (low byte), holding code + 1 (0 ends a bucket).
+    long_head: [u8; 256],
+    long_next: [u8; 256],
+    long_slot: [u16; 256],
     one_byte: [FsstShortCode; 256],
-    two_byte: Vec<(u16, u8)>,
+    symbols: [u64; 256],
+    /// Bucket heads keyed by a two-byte symbol's first byte, holding code + 1 (0 ends a bucket).
+    two_head: [u8; 256],
+    two_next: [u8; 256],
+}
+
+/// `array[index]`: every table the needle encoder keeps holds one entry per byte value, so a `u8` index is always in
+/// bounds.
+fn at<T: Copy + Default>(array: &[T; 256], index: u8) -> T {
+    array.get(usize::from(index)).copied().unwrap_or_default()
+}
+
+/// Sets `array[index]`; see [`at`].
+fn put<T>(array: &mut [T; 256], index: u8, value: T) {
+    if let Some(slot) = array.get_mut(usize::from(index)) {
+        *slot = value;
+    }
+}
+
+/// The bits of a compared eight-byte window that a stored symbol covers: its non-null bytes, at least one.
+fn fsst_symbol_mask(symbol: u64) -> u64 {
+    let null_bytes = (symbol.leading_zeros() / 8) as usize;
+    u64::MAX >> (64 - 8 * (8 - null_bytes).max(1))
 }
 
 impl FsstNeedleEncoder {
     fn new(table: &FsstDecodeTable) -> Self {
-        let defined = || {
-            table
-                .symbols
-                .iter()
-                .copied()
-                .zip(table.lengths.iter().copied())
-                .take(table.symbol_count)
+        let mut encoder = Self {
+            has_suffix_code: 0,
+            lengths: table.lengths,
+            long_head: [0; 256],
+            long_next: [0; 256],
+            long_slot: [0; 256],
+            one_byte: [FsstShortCode {
+                code: fsst::ESCAPE_CODE,
+                escape: true,
+                len: 1,
+            }; 256],
+            symbols: table.symbols,
+            two_head: [0; 256],
+            two_next: [0; 256],
         };
-        let mut one_byte = [FsstShortCode {
-            code: fsst::ESCAPE_CODE,
-            escape: true,
-            len: 1,
-        }; 256];
-        let mut two_byte: Vec<(u16, u8)> = Vec::new();
-        let mut long = Vec::new();
-        for (code, (symbol, len)) in defined().enumerate() {
-            let code = code as u8;
+        // Long symbols' first two bytes, chained by first byte, to find the first two-byte code that is some longer
+        // symbol's prefix.
+        let mut prefix_head = [0u8; 256];
+        let mut prefix_next = [0u8; 256];
+        let defined = table
+            .symbols
+            .iter()
+            .copied()
+            .zip(table.lengths.iter().copied())
+            .take(table.symbol_count.min(FSST_MAX_SYMBOL_COUNT));
+        for ((symbol, len), code) in defined.clone().zip(0u8..) {
+            let link = code + 1;
+            let first = symbol as u8;
             match len {
-                1 => {
-                    if let Some(slot) = one_byte.get_mut((symbol & 0xFF) as usize) {
-                        *slot = FsstShortCode {
-                            code,
-                            escape: false,
-                            len: 1,
-                        };
-                    }
-                }
+                1 => put(
+                    &mut encoder.one_byte,
+                    first,
+                    FsstShortCode {
+                        code,
+                        escape: false,
+                        len: 1,
+                    },
+                ),
                 2 => {
-                    let first2 = symbol as u16;
-                    match two_byte.iter_mut().find(|(key, _)| *key == first2) {
-                        Some(entry) => entry.1 = code,
-                        None => two_byte.push((first2, code)),
-                    }
+                    put(&mut encoder.two_next, code, at(&encoder.two_head, first));
+                    put(&mut encoder.two_head, first, link);
                 }
                 _ => {
-                    let null_bytes = (symbol.leading_zeros() / 8) as usize;
-                    let value_len = (8 - null_bytes).max(1);
-                    long.push(FsstLongCode {
-                        code,
-                        len,
-                        mask: u64::MAX >> (64 - 8 * value_len),
-                        slot: fsst_lossy_pht_slot(symbol),
-                        symbol,
-                    });
+                    let slot = fsst_lossy_pht_slot(symbol) as u16;
+                    put(&mut encoder.long_slot, code, slot);
+                    put(&mut encoder.long_next, code, at(&encoder.long_head, slot as u8));
+                    put(&mut encoder.long_head, slot as u8, link);
+                    put(&mut prefix_next, code, at(&prefix_head, first));
+                    put(&mut prefix_head, first, link);
                 }
             }
         }
-        two_byte.sort_unstable_by_key(|(key, _)| *key);
-        long.sort_unstable_by_key(|entry| entry.slot);
-        let mut has_suffix_code = 0u8;
-        for (code, (symbol, len)) in defined().enumerate() {
+        for ((symbol, len), code) in defined.zip(0u8..) {
             if len != 2 {
                 break;
             }
             let first2 = symbol as u16;
-            if defined()
-                .skip(code)
-                .any(|(other, other_len)| other_len > 2 && other as u16 == first2)
-            {
-                has_suffix_code = code as u8;
-                break;
+            let mut link = at(&prefix_head, symbol as u8);
+            while let Some(other) = link.checked_sub(1) {
+                if other >= code && at(&encoder.symbols, other) as u16 == first2 {
+                    encoder.has_suffix_code = code;
+                    return encoder;
+                }
+                link = at(&prefix_next, other);
             }
         }
-        Self {
-            has_suffix_code,
-            long,
-            one_byte,
-            two_byte,
+        encoder
+    }
+
+    /// The latest two-byte code whose symbol is `key`.
+    fn two_byte_code(&self, key: u16) -> Option<u8> {
+        let mut link = at(&self.two_head, key as u8);
+        while let Some(code) = link.checked_sub(1) {
+            if at(&self.symbols, code) as u16 == key {
+                return Some(code);
+            }
+            link = at(&self.two_next, code);
         }
+        None
+    }
+
+    /// The long symbol stored in hash slot `slot`, as (code, length, symbol).
+    fn long_code(&self, slot: u16) -> Option<(u8, u8, u64)> {
+        let mut link = at(&self.long_head, slot as u8);
+        while let Some(code) = link.checked_sub(1) {
+            if at(&self.long_slot, code) == slot {
+                return Some((code, at(&self.lengths, code), at(&self.symbols, code)));
+            }
+            link = at(&self.long_next, code);
+        }
+        None
     }
 
     fn short_code(&self, word: u64) -> FsstShortCode {
-        let two_byte = self
-            .two_byte
-            .binary_search_by_key(&(word as u16), |(key, _)| *key)
-            .ok()
-            .and_then(|index| self.two_byte.get(index));
-        match two_byte {
-            Some(&(_, code)) => FsstShortCode {
+        match self.two_byte_code(word as u16) {
+            Some(code) => FsstShortCode {
                 code,
                 escape: false,
                 len: 2,
             },
-            None => self.one_byte.get((word & 0xFF) as usize).copied().unwrap_or(FsstShortCode {
+            None => self.one_byte.get(usize::from(word as u8)).copied().unwrap_or(FsstShortCode {
                 code: fsst::ESCAPE_CODE,
                 escape: true,
                 len: 1,
@@ -3205,16 +3307,13 @@ impl FsstNeedleEncoder {
             }
             let word = u64::from_le_bytes(bytes);
             let short = self.short_code(word);
-            if short.escape || short.code >= self.has_suffix_code {
-                let slot = fsst_lossy_pht_slot(word);
-                let found = self.long.binary_search_by_key(&slot, |entry| entry.slot).ok();
-                if let Some(&entry) = found.and_then(|index| self.long.get(index))
-                    && word & entry.mask == entry.symbol
-                {
-                    out.push(entry.code);
-                    position += entry.len as usize;
-                    continue;
-                }
+            if (short.escape || short.code >= self.has_suffix_code)
+                && let Some((code, len, symbol)) = self.long_code(fsst_lossy_pht_slot(word) as u16)
+                && word & fsst_symbol_mask(symbol) == symbol
+            {
+                out.push(code);
+                position += len as usize;
+                continue;
             }
             out.push(short.code);
             if short.escape {
@@ -3306,15 +3405,24 @@ impl FsstDecodeTable {
                 let slot = fsst_lossy_pht_slot(word) as usize;
                 let word_index = slot / u64::BITS as usize;
                 let bit = 1u64 << (slot % u64::BITS as usize);
-                if occupied_long_slots[word_index] & bit != 0 {
+                let occupied = occupied_long_slots.get_mut(word_index).ok_or(FormatError::Structural {
+                    rule: "fsst long-symbol slot beyond the decoder hash",
+                })?;
+                if *occupied & bit != 0 {
                     return Err(FormatError::Structural {
                         rule: "fsst long-symbol table collides in the decoder hash",
                     });
                 }
-                occupied_long_slots[word_index] |= bit;
+                *occupied |= bit;
             }
-            table.lengths[index] = len;
-            table.symbols[index] = word;
+            let (Some(length_slot), Some(symbol_slot)) = (table.lengths.get_mut(index), table.symbols.get_mut(index))
+            else {
+                return Err(FormatError::Structural {
+                    rule: "fsst symbol count beyond 255",
+                });
+            };
+            *length_slot = len;
+            *symbol_slot = word;
         }
         Ok(table)
     }
@@ -3888,6 +3996,19 @@ fn null_buffer(nulls: &NullStream) -> Option<NullBuffer> {
     }
 }
 
+/// Whether a block [`choose_string_transform`] sent to FSST repeats its values enough (at most one distinct value per
+/// [`DICTIONARY_TRIAL_MIN_REPEAT`] rows) for a dictionary trial encode to have a chance of being smaller.
+fn dictionary_trial_worthwhile(present: &[&str]) -> bool {
+    let limit = present.len() / DICTIONARY_TRIAL_MIN_REPEAT;
+    let mut distinct = AHashSet::with_capacity(limit + 1);
+    for value in present {
+        if distinct.insert(*value) && distinct.len() > limit {
+            return false;
+        }
+    }
+    true
+}
+
 fn choose_string_transform(present: &[&str]) -> Transform {
     if present.is_empty() {
         return Transform::RawString;
@@ -4009,7 +4130,7 @@ fn pick_trailing(bytes: Vec<u8>, threshold: usize, lz4: Vec<u8>, zstd_framed: Ve
 thread_local! {
     /// One [`trailing_sample`] scratch buffer per thread, reused for every large block that thread samples instead of
     /// a fresh up-to-[`TRAILING_SAMPLE_WINDOW_BYTES`]` * `[`TRAILING_SAMPLE_WINDOWS`]-byte allocation per call.
-    static TRAILING_SAMPLE_SCRATCH: RefCell<Vec<u8>> = RefCell::new(Vec::new());
+    static TRAILING_SAMPLE_SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Builds a small representative sample of `bytes` — concatenating [`TRAILING_SAMPLE_WINDOWS`] evenly spaced windows
@@ -4552,6 +4673,7 @@ fn encode_chosen_form(
     let mut side = SideStream::None;
     let mut fsst = None;
     let mut frame_breaks = Vec::new();
+    let mut dictionary_by_trial = false;
     let (transform, kind) = match data {
         ColumnData::U64(values) => {
             let transform = forced.unwrap_or_else(|| choose_u64_transform(values, strategy));
@@ -4613,15 +4735,39 @@ fn encode_chosen_form(
             // Collected once here instead of once per candidate: `choose_string_transform` and whichever encoder
             // runs both need the present rows, not the whole (null-carrying) column.
             let present = present_values(values);
-            let transform = forced.unwrap_or_else(|| choose_string_transform(&present));
-            let encoded = match transform {
+            let mut transform = forced.unwrap_or_else(|| choose_string_transform(&present));
+            let mut encoded = match transform {
                 Transform::DictionaryString => encode_dictionary_string(values, &present, strategy, shared, &mut out)
                     .map(|side| (side, None, Vec::new())),
                 Transform::FsstString => encode_fsst_string(values, &present, replay_fsst, &mut out),
                 _ => encode_raw_string(values, &present, &mut out).map(|()| (SideStream::None, None, Vec::new())),
             };
-            (side, fsst, frame_breaks) =
+            // A mid-cardinality block (too many distinct values in the sample for the dictionary rule, yet each value
+            // repeating) is trial-encoded as a dictionary too, and the smaller form kept: equality filters then test
+            // one dictionary entry and compare bitpacked codes instead of every row's compressed bytes.
+            if forced.is_none()
+                && transform == Transform::FsstString
+                && !random_access
+                && encoded.is_ok()
+                && dictionary_trial_worthwhile(&present)
+            {
+                let mut trial = Writer::new();
+                if let Ok(side) = encode_dictionary_string(values, &present, strategy, shared, &mut trial)
+                    && trial.len() < out.len()
+                {
+                    out = trial;
+                    transform = Transform::DictionaryString;
+                    encoded = Ok((side, None, Vec::new()));
+                    dictionary_by_trial = true;
+                }
+            }
+            #[expect(
+                clippy::expect_used,
+                reason = "the writer bounds a granule far below u32 arena offsets"
+            )]
+            let parts =
                 encoded.expect("string-block arena offsets fit u32: the writer bounds a granule far below that");
+            (side, fsst, frame_breaks) = parts;
             (transform, ValueKind::String)
         }
     };
@@ -4638,7 +4784,9 @@ fn encode_chosen_form(
         // A trailing stage would exceed the declared maximum cascade depth, so it is not added — however well it
         // would have sampled.
         (Compression::None, body)
-    } else if matches!(transform, Transform::FsstString | Transform::DeltaBitpack | Transform::ForBitpack) {
+    } else if dictionary_by_trial
+        || matches!(transform, Transform::FsstString | Transform::DeltaBitpack | Transform::ForBitpack)
+    {
         // Kept only when it at least halves the block: see `FSST_TRAILING_MAX_RATIO_NUM`. These transforms are already
         // compact and answer filters straight from their bytes, which a trailing codec would force a reader to unpack.
         let fallback = body.clone();

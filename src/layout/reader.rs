@@ -418,7 +418,7 @@ fn append_presence_bits(dst: &mut Vec<u8>, dst_start_bit: usize, src: &[u8], len
     if dst.len() < needed {
         dst.resize(needed, 0);
     }
-    if dst_start_bit % 8 != 0 {
+    if !dst_start_bit.is_multiple_of(8) {
         // Not byte-aligned (a preceding page's own row count wasn't a multiple of 8): shift-merge one bit at a time.
         for bit in 0..len {
             if src.get(bit / 8).is_some_and(|byte| byte & (1 << (bit % 8)) != 0) {
@@ -706,7 +706,7 @@ fn validate_stripe_proofs(footer: &Footer, proof_trees: &[u8]) -> Result<(), For
             });
         }
         let group = proof.chunk_group_bytes as usize;
-        if group < blake3::CHUNK_LEN || !group.is_power_of_two() || group % blake3::CHUNK_LEN != 0 {
+        if group < blake3::CHUNK_LEN || !group.is_power_of_two() || !group.is_multiple_of(blake3::CHUNK_LEN) {
             return Err(FormatError::Structural {
                 rule: "stripe proof chunk group must be a power-of-two BLAKE3 chunk multiple",
             });
@@ -1657,6 +1657,10 @@ impl ColumnarMarks {
 /// an already-decoded mark or page directory entry does not, and that read is the first thing every column block
 /// read does — so once a stripe is warm, concurrent readers stop serializing on it.
 #[derive(Debug)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "one value per open reader; boxing the columnar state would add an indirection to every mark read"
+)]
 enum Marks {
     Columnar(RwLock<ColumnarMarks>),
     Eager(HashMap<(u32, u32, u32), ColumnMark>),
@@ -2107,10 +2111,13 @@ impl OeFile {
         // strictly ascending (and therefore non-overlapping, since each spans exactly `row_count` rows) would make the
         // search silently miss rows or return the wrong granule. Reject such a file instead of misreading it.
         if footer.granules.windows(2).any(|pair| {
-            pair[0]
+            let [previous, next] = pair else {
+                return false;
+            };
+            previous
                 .first_row_ordinal
-                .checked_add(u64::from(pair[0].row_count))
-                .is_none_or(|end| end > pair[1].first_row_ordinal)
+                .checked_add(u64::from(previous.row_count))
+                .is_none_or(|end| end > next.first_row_ordinal)
         }) {
             return Err(FormatError::Structural {
                 rule: "granule directory must be strictly ascending by first_row_ordinal with no overlap",
@@ -2771,8 +2778,11 @@ impl OeFile {
             // alphabet, so byte-identical code streams under two columns still decode to different values. Those
             // decodes are never shared — each aliasing column decodes its own copy of the shared bytes.
             let column_free_decode = mark.codec_pipeline_id.side_stream() != Ok(SideStream::FileScopeDictionary);
-            let shared_key = (column_free_decode && self.aliased_extents.contains(&extent))
-                .then(|| (extent.0, extent.1, mark.codec_pipeline_id.0));
+            let shared_key = (column_free_decode && self.aliased_extents.contains(&extent)).then_some((
+                extent.0,
+                extent.1,
+                mark.codec_pipeline_id.0,
+            ));
             if let Some(key) = shared_key {
                 let tick = self.cache_access_counter.fetch_add(1, Ordering::Relaxed);
                 let hit = self.aliased_extent_cache.get_mut(&key).map(|mut slot| {
@@ -3784,13 +3794,15 @@ impl OeFile {
     /// [`PayloadRead::None`] in its position without failing the batch.
     pub fn read_payloads(&self, refs: &[PayloadRef]) -> Result<PayloadBatch, FormatError> {
         let mut order: Vec<usize> = (0..refs.len()).collect();
-        order.sort_by_key(|&index| refs[index].row_ordinal);
+        order.sort_by_key(|&index| refs.get(index).map(|payload_ref| payload_ref.row_ordinal));
         let mut payloads = vec![PayloadRead::None; refs.len()];
         // The current group's accelerators — resolved once per run of ascending rows that share a granule, and
         // served to every one of them (see `PayloadGroup`).
         let mut group: Option<PayloadGroup<'_>> = None;
         for (from, &index) in order.iter().enumerate() {
-            let row_ordinal = refs[index].row_ordinal;
+            let Some(row_ordinal) = refs.get(index).map(|payload_ref| payload_ref.row_ordinal) else {
+                continue;
+            };
             let in_group = group.as_ref().is_some_and(|group| {
                 group.granule.first_row_ordinal <= row_ordinal
                     && group
@@ -3807,7 +3819,10 @@ impl OeFile {
             }
             if let Some(group) = group.as_mut() {
                 let row_in_granule = row_ordinal - group.granule.first_row_ordinal;
-                payloads[index] = self.payload_in_group(group, row_in_granule)?;
+                let payload = self.payload_in_group(group, row_in_granule)?;
+                if let Some(slot) = payloads.get_mut(index) {
+                    *slot = payload;
+                }
             }
         }
         Ok(PayloadBatch { payloads })
@@ -3882,10 +3897,10 @@ impl OeFile {
         if flags & u64::from(crate::artifacts::batch::PAYLOAD_FLAG_EXTERNAL_REF) != 0 {
             return Ok(PayloadRead::External(owned_utf8(&bytes, "external payload reference")?));
         }
-        if group.dictionary.is_none() {
-            group.dictionary = Some(self.granule_dictionary(group.payload)?);
-        }
-        let dictionary = group.dictionary.as_ref().expect("resolved above");
+        let dictionary = match &mut group.dictionary {
+            Some(dictionary) => &*dictionary,
+            slot @ None => &*slot.insert(self.granule_dictionary(group.payload)?),
+        };
         let mut value = VariantRef::new(&bytes).decode(dictionary)?;
         // Merge moves back: shredded paths, then declared free-text fields.
         if let VariantValue::Object(fields) = &mut value {
@@ -3912,11 +3927,12 @@ impl OeFile {
         column_id: u32,
         row_in_granule: u64,
     ) -> Result<Option<VariantValue>, FormatError> {
-        if !group.field_blocks.contains_key(&column_id) {
-            let block = self.path_block(column_id, group.granule.granule_id, &group.rows)?;
-            group.field_blocks.insert(column_id, block);
-        }
-        let block = group.field_blocks.get(&column_id).expect("resolved above");
+        let block = match group.field_blocks.entry(column_id) {
+            hashbrown::hash_map::Entry::Occupied(entry) => &*entry.into_mut(),
+            hashbrown::hash_map::Entry::Vacant(entry) => {
+                &*entry.insert(self.path_block(column_id, group.granule.granule_id, &group.rows)?)
+            }
+        };
         self.value_in_block(block, column_id, row_in_granule)
     }
 
@@ -3949,14 +3965,14 @@ impl OeFile {
     pub fn payload_path(&self, row_ordinal: u64, path: &str) -> Result<Option<VariantValue>, FormatError> {
         let granule = self.granule_of_row(row_ordinal)?;
         let row_in_granule = row_ordinal - granule.first_row_ordinal;
-        if let Some(entry) = self.footer.shredded.iter().find(|entry| entry.path == path) {
-            if let Some(value) = self.shredded_value_for_row(entry.column_id, granule, row_in_granule)? {
-                return Ok(Some(value));
-            }
-            // A shredded path may still carry this row in the residual: a value the typed column could not reproduce
-            // exactly (a differently-scaled decimal, a timestamp on an integer column) stays in the residual instead of
-            // being moved. So a missing column value means "look in the residual", not "absent".
+        if let Some(entry) = self.footer.shredded.iter().find(|entry| entry.path == path)
+            && let Some(value) = self.shredded_value_for_row(entry.column_id, granule, row_in_granule)?
+        {
+            return Ok(Some(value));
         }
+        // A shredded path may still carry this row in the residual: a value the typed column could not reproduce
+        // exactly (a differently-scaled decimal, a timestamp on an integer column) stays in the residual instead of
+        // being moved. So a missing column value means "look in the residual", not "absent".
         if let Some(entry) = self.footer.freetext.iter().find(|entry| entry.declared_field == path) {
             return self.freetext_value_for_row(entry.column_id, granule, row_in_granule);
         }
@@ -4008,11 +4024,13 @@ impl OeFile {
             .find(|entry| entry.declared_field == path)
             .map(|entry| entry.column_id);
         let mut order: Vec<usize> = (0..refs.len()).collect();
-        order.sort_by_key(|&index| refs[index].row_ordinal);
+        order.sort_by_key(|&index| refs.get(index).map(|payload_ref| payload_ref.row_ordinal));
         let mut values = vec![None; refs.len()];
         let mut group: Option<PathGroup<'_>> = None;
         for (from, &index) in order.iter().enumerate() {
-            let row_ordinal = refs[index].row_ordinal;
+            let Some(row_ordinal) = refs.get(index).map(|payload_ref| payload_ref.row_ordinal) else {
+                continue;
+            };
             let in_group = group.as_ref().is_some_and(|group| {
                 group.granule.first_row_ordinal <= row_ordinal
                     && group
@@ -4033,7 +4051,10 @@ impl OeFile {
             }
             if let Some(group) = group.as_mut() {
                 let row_in_granule = row_ordinal - group.granule.first_row_ordinal;
-                values[index] = self.payload_path_in_granule(group, row_in_granule, path)?;
+                let value = self.payload_path_in_granule(group, row_in_granule, path)?;
+                if let Some(slot) = values.get_mut(index) {
+                    *slot = value;
+                }
             }
         }
         Ok(values)
@@ -4096,8 +4117,8 @@ impl OeFile {
             }
             None => false,
         };
-        if addressable {
-            let raw = self.read_column_raw_with_mark(granule_id, mark.as_ref().expect("addressable implies Some"))?;
+        if let Some(mark) = mark.as_ref().filter(|_| addressable) {
+            let raw = self.read_column_raw_with_mark(granule_id, mark)?;
             let rank = PresenceRank::new(&raw.presence);
             let taken = if rows.len() > 1 {
                 self.take_located_rows(&rank, &raw, column_id, rows)

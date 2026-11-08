@@ -77,7 +77,7 @@ impl PortableDecoder for SimulatedDecoder {
 
 /// Encodes `values` into the toy big-endian optional block the examples and tests read back through a portable decoder.
 pub fn encode_demo_block(values: &[u64]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(values.len() * size_of::<u64>());
+    let mut out = Vec::with_capacity(std::mem::size_of_val(values));
     for value in values {
         out.extend_from_slice(&value.to_be_bytes());
     }

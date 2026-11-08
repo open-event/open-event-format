@@ -491,7 +491,7 @@ fn encode_object_into<'a>(
         && depth < MAX_DEPTH
         && let Some((placed, data_len)) = direct_scalar_object_geometry(fields.clone(), dictionary)?
     {
-        write_object_header(&placed[..field_count], data_len, out);
+        write_object_header(placed.get(..field_count).unwrap_or_default(), data_len, out);
         for (_, value) in fields {
             // Geometry admitted only scalars, and the depth check above makes this encode infallible.
             encode_into(value, dictionary, scratch, out, depth + 1)?;
@@ -502,12 +502,15 @@ fn encode_object_into<'a>(
     encode_object_buffered(fields, field_count, dictionary, scratch, out, depth)
 }
 
+/// A scalar-only object's `(field id, value offset)` table and its data length.
+type ScalarObjectGeometry = ([(u32, u32); DIRECT_SCALAR_OBJECT_MAX_FIELDS], usize);
+
 /// Calculates the exact body geometry for a bounded scalar-only object. The fixed stack table is why the direct path
 /// has an explicit field threshold: no heap buffer replaces the body copy it is intended to remove.
 fn direct_scalar_object_geometry<'a>(
     fields: impl Iterator<Item = (&'a str, &'a VariantValue)>,
     dictionary: &KeyDictionary,
-) -> Result<Option<([(u32, u32); DIRECT_SCALAR_OBJECT_MAX_FIELDS], usize)>, FormatError> {
+) -> Result<Option<ScalarObjectGeometry>, FormatError> {
     let mut placed = [(0, 0); DIRECT_SCALAR_OBJECT_MAX_FIELDS];
     let mut data_len = 0usize;
     let mut cursor = 0usize;

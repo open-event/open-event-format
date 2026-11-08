@@ -227,10 +227,14 @@ impl BlockStore for SimBlockStore {
         }
         let mut out = Vec::with_capacity(len as usize);
         if start < durable_len {
-            out.extend_from_slice(&state.durable[start..durable_len]);
+            out.extend_from_slice(state.durable.get(start..durable_len).ok_or(FileError::OutOfBounds)?);
         }
         let pending_start = start.saturating_sub(durable_len);
-        out.extend_from_slice(&pending[pending_start..end - durable_len]);
+        out.extend_from_slice(
+            pending
+                .get(pending_start..end - durable_len)
+                .ok_or(FileError::OutOfBounds)?,
+        );
         Ok(out)
     }
 

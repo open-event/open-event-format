@@ -250,9 +250,9 @@ pub fn precheck_header(frame: &[u8]) -> Result<OejFrameHeaderV1, FormatError> {
     // zero bytes standing in for the crc and blake3 fields, then bytes 168..192 (already checked all-zero above) —
     // so every frame replayed pays no copy of its header just to zero two fields ahead of the checksum.
     let mut crc = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc64Nvme);
-    crc.update(&header_bytes[..HEADER_CRC64_OFFSET]);
+    crc.update(slice(header_bytes, 0, HEADER_CRC64_OFFSET, "frame header")?);
     crc.update(&[0u8; 40]);
-    crc.update(&header_bytes[168..192]);
+    crc.update(slice(header_bytes, 168, 24, "frame header")?);
     if crc.finalize() != header_crc64 {
         return Err(FormatError::HeaderCrcMismatch);
     }
@@ -361,9 +361,13 @@ pub fn decode_frame(frame: &[u8]) -> Result<(OejFrameHeaderV1, &[u8]), FormatErr
     // as zero; covers header, payload, and padding. Hashed incrementally so the up-to-1 MiB frame is never copied just
     // to zero one field. `precheck_header` already sliced the first 192 bytes, so both ranges are in bounds.
     let mut hasher = blake3::Hasher::new();
-    hasher.update(&frame[..136]);
+    let (head, tail) = frame
+        .get(..136)
+        .zip(frame.get(168..))
+        .ok_or(FormatError::Truncated { what: "frame header" })?;
+    hasher.update(head);
     hasher.update(&[0u8; BLAKE3_LEN]);
-    hasher.update_rayon(&frame[168..]);
+    hasher.update_rayon(tail);
     if hasher.finalize().as_bytes() != &header.frame_blake3 {
         return Err(FormatError::Blake3Mismatch { scope: "frame" });
     }

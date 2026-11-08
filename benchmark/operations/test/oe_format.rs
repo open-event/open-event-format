@@ -150,7 +150,7 @@ fn min_and_median(samples: &mut [u64]) -> (u64, u64) {
 #[cfg(unix)]
 fn open_timing_by_stripe_count() {
     const REPEATS: usize = 40;
-    let mut timed = |label: String, mut work: Box<dyn FnMut() + '_>| {
+    let timed = |label: String, mut work: Box<dyn FnMut() + '_>| {
         let (mut wall, mut cpu) = (Vec::new(), Vec::new());
         for _ in 0..REPEATS {
             let cpu_started = crate::allocation::process_cpu_nanos().unwrap();

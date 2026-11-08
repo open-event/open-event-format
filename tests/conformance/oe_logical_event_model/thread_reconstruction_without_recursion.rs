@@ -68,7 +68,7 @@ fn root_marked_by_absence() {
     // Absence is the marker: row 0's relationship slots are simply not present.
     let root_column = file.read_column(oe::columns::column_ids::ROOT_REF, 0).unwrap();
     assert!(
-        !root_column.presence.first().is_some_and(|byte| byte & 1 != 0),
+        root_column.presence.first().is_none_or(|byte| byte & 1 == 0),
         "row 0 carries no root reference"
     );
 }

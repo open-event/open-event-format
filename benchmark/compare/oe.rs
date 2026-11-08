@@ -8,7 +8,7 @@ use anyhow::{Result, anyhow};
 use oe::artifacts::batch::{EventInput, PayloadInput, build_batch};
 use oe::artifacts::frame::{FrameBuildInput, build_frame};
 use oe::columns::{FreetextDeclaration, PromotionPlan, column_ids};
-use oe::encoding::{ColumnData, SideStream};
+use oe::encoding::{ColumnData, SideStream, decode_block, take_block_rows};
 use oe::encoding::predicate::{
     NumericPredicate, StringPredicate, filter_numeric_block_or_decode, filter_string_block_or_decode,
 };
@@ -23,6 +23,9 @@ use oe::security::FooterEncryption;
 use oe::typed_id::TypedIdTestExt;
 use oe::writer::build::{BuildLifecycle, OeBuildConfig, OeRow, SharedStrings, build_oe_file};
 use std::collections::BTreeMap;
+
+/// Below one picked row in this many, a granule's event types are read row by row rather than filtered whole.
+const SPARSE_TAKE_DIVISOR: usize = 8;
 
 pub struct Oe {
     pub lazy: bool,
@@ -197,6 +200,19 @@ impl Format for Oe {
     }
 }
 
+/// Every value as 32 lowercase hex digits, laid end to end in one string.
+fn hex_arena(values: &[u128]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = Vec::with_capacity(values.len() * 32);
+    for value in values {
+        for byte in value.to_be_bytes() {
+            out.push(DIGITS[usize::from(byte >> 4)]);
+            out.push(DIGITS[usize::from(byte & 0xF)]);
+        }
+    }
+    String::from_utf8(out).unwrap_or_default()
+}
+
 struct OeReader {
     file: OeFile,
 }
@@ -264,7 +280,7 @@ impl OeReader {
         for granule in self.file.granules_for_entity_hash(low) {
             let id = granule.granule_id;
             let raw = self.file.read_column_raw(column_ids::ENTITY_ID, id)?;
-            let mut keep = if raw.pipeline.side_stream()? == SideStream::FileScopeDictionary {
+            let keep = if raw.pipeline.side_stream()? == SideStream::FileScopeDictionary {
                 // The block's codes point into the file's shared alphabet, which only the reader resolves.
                 match self.file.read_column(column_ids::ENTITY_ID, id)?.data {
                     ColumnData::Strings(values) => entity_test.filter_decoded(&values),
@@ -273,32 +289,55 @@ impl OeReader {
             } else {
                 filter_string_block_or_decode(raw.pipeline, raw.body, &entity_test)?
             };
-            if !keep.contains(&true) {
+            let mut picked: Vec<usize> = keep.iter().enumerate().filter(|(_, k)| **k).map(|(i, _)| i).collect();
+            if picked.is_empty() {
                 continue;
             }
             if let Some(test) = &type_test {
                 let raw = self.file.read_column_raw(column_ids::EVENT_TYPE_ID, id)?;
-                for (flag, v) in keep.iter_mut().zip(filter_numeric_block_or_decode(raw.pipeline, raw.body, test)?) {
-                    *flag &= v;
+                if picked.len() * SPARSE_TAKE_DIVISOR < keep.len() {
+                    // A quiet entity's few rows are tested alone, each event type read straight from its packed lane.
+                    let verdicts = test.filter_decoded(&take_block_rows(raw.pipeline, raw.body, &picked)?);
+                    let mut verdict = verdicts.iter();
+                    picked.retain(|_| verdict.next().copied().unwrap_or(false));
+                } else {
+                    let verdicts = filter_numeric_block_or_decode(raw.pipeline, raw.body, test)?;
+                    picked.retain(|&row| verdicts.get(row).copied().unwrap_or(false));
                 }
-            }
-            let picked: Vec<usize> = keep.iter().enumerate().filter(|(_, k)| **k).map(|(i, _)| i).collect();
-            if picked.is_empty() {
-                continue;
+                if picked.is_empty() {
+                    continue;
+                }
             }
             let mut partial = Partial { rows: picked.len() as u64, sums: Vec::new(), tail: Vec::new() };
             for (name, column) in query.fold.iter().zip(&fold_ids) {
-                let ColumnData::I64(values) = self.file.read_column(*column, id)?.data else {
+                let ColumnData::I64(values) = self.take_column(*column, id, &picked, keep.len())? else {
                     return Ok(None);
                 };
-                partial.sums.push(picked.iter().map(|&p| values[p] as i128).sum());
+                partial.sums.push(values.iter().map(|&v| v as i128).sum());
                 if let (Some(n), "occurred_at") = (query.last_n, *name) {
-                    partial.tail = picked[picked.len().saturating_sub(n)..].iter().map(|&p| values[p]).collect();
+                    partial.tail = values[values.len().saturating_sub(n)..].to_vec();
                 }
             }
             total.add(&partial, query.last_n);
         }
         Ok(Some(total))
+    }
+
+    /// The values at ascending `rows` of one column block: read straight from the encoded block when it has no nulls
+    /// (a sparse pick unpacks only what it needs), otherwise decoded through the reader and gathered.
+    fn take_column(&self, column: u32, granule: u32, rows: &[usize], row_count: usize) -> Result<ColumnData> {
+        if let Ok(raw) = self.file.read_column_raw(column, granule)
+            && raw.presence.is_empty()
+        {
+            if rows.len() == row_count {
+                return Ok(decode_block(raw.pipeline, raw.body)?);
+            }
+            return Ok(take_block_rows(raw.pipeline, raw.body, rows)?);
+        }
+        let ColumnData::I64(values) = self.file.read_column(column, granule)?.data else {
+            return Err(anyhow!("fold column is not i64"));
+        };
+        Ok(ColumnData::I64(rows.iter().map(|&row| values[row]).collect()))
     }
 
     fn column_id(&self, name: &str) -> Result<u32> {
@@ -398,11 +437,11 @@ impl Opened for OeReader {
                 .iter()
                 .map(|id| self.file.read_column(*id, granule.granule_id).map(|read| read.data))
                 .collect::<Result<Vec<ColumnData>, _>>()?;
-            let hex: Vec<Vec<String>> = reads
+            let hex: Vec<String> = reads
                 .iter()
                 .map(|data| match data {
-                    ColumnData::U128(values) => values.iter().map(|v| format!("{v:032x}")).collect(),
-                    _ => Vec::new(),
+                    ColumnData::U128(values) => hex_arena(values),
+                    _ => String::new(),
                 })
                 .collect();
             let columns: Vec<(&str, Col)> = names
@@ -423,7 +462,12 @@ impl Opened for OeReader {
                             };
                             Col::Str(values.iter().map(|v| dictionary[*v as usize].as_str()).collect())
                         }
-                        ColumnData::U128(_) => Col::Str(hex.iter().map(String::as_str).collect()),
+                        ColumnData::U128(_) => Col::Str(
+                            hex.as_bytes()
+                                .chunks_exact(32)
+                                .map(|digits| std::str::from_utf8(digits).unwrap_or(""))
+                                .collect(),
+                        ),
                         ColumnData::Decimal { .. } => panic!("unexpected decimal column {name}"),
                     };
                     (*name, col)

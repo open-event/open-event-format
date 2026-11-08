@@ -1,7 +1,13 @@
 #![deny(unsafe_code)]
 #![cfg_attr(
     test,
-    allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::type_complexity
+    )
 )]
 
 //! Stores a stream of events on disk so they can be written once and queried fast, and never lost or corrupted.

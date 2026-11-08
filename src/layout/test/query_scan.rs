@@ -491,7 +491,7 @@ fn entity_and_external_id_hits_route_to_point_reads() {
         .collect();
     let selection = file.selection_for_external_ids(&locations);
     let everything = plan_query(
-        &ExprQuery::from(Query {
+        ExprQuery::from(Query {
             answerable_from_aggregate: false,
             filter: Filter::default(),
         }),

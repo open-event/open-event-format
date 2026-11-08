@@ -92,7 +92,7 @@ fn children_of_an_event_resolve_by_filter() {
     // the referencing event alone.
     let parent_column = file.read_column(column_ids::PARENT_REF, 0).unwrap();
     assert!(
-        !parent_column.presence.first().is_some_and(|byte| byte & 1 != 0),
+        parent_column.presence.first().is_none_or(|byte| byte & 1 == 0),
         "row 0 (the parent) carries no relationship value of its own"
     );
 }

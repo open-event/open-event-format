@@ -156,7 +156,12 @@ fn a_subject_keys_job_requires_the_tenant_dek_lease_too() {
     };
 
     assert!(
-        !is_eligible_for_job(tenant, KeyScope::SubjectKeys, &region, &[subject_lease.clone()]),
+        !is_eligible_for_job(
+            tenant,
+            KeyScope::SubjectKeys,
+            &region,
+            std::slice::from_ref(&subject_lease)
+        ),
         "a subject-key lease alone must not satisfy a SubjectKeys job"
     );
     assert!(

@@ -244,7 +244,7 @@ pub fn decode_presence<'a>(reader: &mut Reader<'a>, row_count: u32) -> Result<Co
             // a per-row loop over a full granule costs more than the bitmap it produces. The last byte keeps only
             // the bits the row count reaches, exactly as setting rows `0..rows` one by one would leave it.
             let mut bitmap = vec![0xFFu8; rows.div_ceil(8)];
-            if rows % 8 != 0
+            if !rows.is_multiple_of(8)
                 && let Some(last) = bitmap.last_mut()
             {
                 *last = (1u8 << (rows % 8)) - 1;
@@ -299,7 +299,9 @@ pub fn decode_presence<'a>(reader: &mut Reader<'a>, row_count: u32) -> Result<Co
                         what: "presence row beyond the block's row count",
                     });
                 }
-                bitmap[row / 8] |= 1 << (row % 8);
+                if let Some(byte) = bitmap.get_mut(row / 8) {
+                    *byte |= 1 << (row % 8);
+                }
             }
             Ok(Cow::Owned(bitmap))
         }
@@ -321,14 +323,20 @@ fn fill_bit_range(bitmap: &mut [u8], start: usize, end: usize) {
     let low_mask = 0xFFu8 << (start % 8);
     if start_byte == end_byte {
         let high_mask = 0xFFu8 >> (7 - (end - 1) % 8);
-        bitmap[start_byte] |= low_mask & high_mask;
+        if let Some(byte) = bitmap.get_mut(start_byte) {
+            *byte |= low_mask & high_mask;
+        }
         return;
     }
-    bitmap[start_byte] |= low_mask;
-    for byte in &mut bitmap[start_byte + 1..end_byte] {
-        *byte = 0xFF;
+    if let Some(byte) = bitmap.get_mut(start_byte) {
+        *byte |= low_mask;
     }
-    bitmap[end_byte] |= 0xFFu8 >> (7 - (end - 1) % 8);
+    if let Some(interior) = bitmap.get_mut(start_byte + 1..end_byte) {
+        interior.fill(0xFF);
+    }
+    if let Some(byte) = bitmap.get_mut(end_byte) {
+        *byte |= 0xFFu8 >> (7 - (end - 1) % 8);
+    }
 }
 
 /// The offset a per-row `(offset, len)` slot stores for a value that is present but empty.

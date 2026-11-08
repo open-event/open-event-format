@@ -201,7 +201,7 @@ impl LearnedPositionIndex {
 
     fn model_eval(&self, key: i64) -> u64 {
         let i = self.segments.partition_point(|s| s.key_lo < key);
-        let seg_index = if i < self.segments.len() && self.segments[i].key_lo == key {
+        let seg_index = if self.segments.get(i).is_some_and(|seg| seg.key_lo == key) {
             i
         } else if i == 0 {
             // Below every stored key: the boundary is the first stored key's row.

@@ -34,6 +34,7 @@ use crate::file::bytes::{Reader, slice};
 use aho_corasick::{AhoCorasick, MatchKind};
 use memchr::memmem::Finder;
 use multiversion::multiversion;
+use std::borrow::Cow;
 use std::sync::Arc;
 
 /// One end of a range filter: the value to compare against, and whether a row equal to that value is itself a match
@@ -65,6 +66,10 @@ pub struct ContainsMatcher {
 /// `memmem`'s runtime-selected SIMD finder is materially cheaper than a general multi-pattern automaton. Empty and
 /// multi-needle/case-insensitive queries retain their exact existing semantics.
 #[derive(Clone, Debug)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the inline finder keeps the single-needle hot path free of an extra indirection"
+)]
 enum ContainsSearch {
     MatchAll,
     Multiple(Arc<AhoCorasick>),
@@ -127,8 +132,8 @@ impl ContainsMatcher {
 
     fn matches_bytes(&self, value: &[u8]) -> bool {
         match &self.search {
-            ContainsSearch::MatchAll => return true,
-            ContainsSearch::Single(finder) => return finder.find(value).is_some(),
+            ContainsSearch::MatchAll => true,
+            ContainsSearch::Single(finder) => finder.find(value).is_some(),
             ContainsSearch::Multiple(automaton) => self.matches_automaton(automaton, value),
         }
     }
@@ -164,11 +169,15 @@ impl ContainsMatcher {
     /// runs past its end straddles two neighbours that are only adjacent because they share a buffer, and is no match.
     fn mark_arena(&self, text: &[u8], bounds: &[usize]) -> Vec<bool> {
         match &self.search {
-            ContainsSearch::MatchAll => return vec![true; bounds.len().saturating_sub(1)],
+            ContainsSearch::MatchAll => vec![true; bounds.len().saturating_sub(1)],
             ContainsSearch::Single(finder) => {
                 let mut marks = vec![false; bounds.len().saturating_sub(1)];
-                visit_single_matches(finder, text, bounds, |value| marks[value] = true);
-                return marks;
+                visit_single_matches(finder, text, bounds, |value| {
+                    if let Some(mark) = marks.get_mut(value) {
+                        *mark = true;
+                    }
+                });
+                marks
             }
             ContainsSearch::Multiple(automaton) => self.mark_arena_automaton(automaton, text, bounds),
         }
@@ -227,7 +236,7 @@ impl ContainsMatcher {
 fn visit_single_matches(finder: &Finder<'_>, text: &[u8], bounds: &[usize], mut visit: impl FnMut(usize)) {
     let mut search_from = 0;
     while search_from <= text.len() {
-        let Some(relative) = finder.find(&text[search_from..]) else {
+        let Some(relative) = text.get(search_from..).and_then(|rest| finder.find(rest)) else {
             break;
         };
         let start = search_from + relative;
@@ -276,6 +285,10 @@ impl Eq for ContainsMatcher {}
 /// `Contains` asks for every one of its needles, and is case-sensitive unless its matcher was built to ignore ASCII
 /// case. A null row never satisfies any of these — comparing with an unknown value yields no match, matching SQL.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the contains matcher is held inline so the scan kernels read it without an extra indirection"
+)]
 pub enum StringPredicate {
     Contains(ContainsMatcher),
     Equals(String),
@@ -626,6 +639,49 @@ fn filter_dictionary(body: &[u8], side: SideStream, predicate: &StringPredicate)
     let mut reader = Reader::new(body);
     let nulls = super::NullStream::read(&mut reader)?;
     let dict_count = reader.u32("dictionary count")? as usize;
+    if let StringPredicate::Equals(needle) = predicate {
+        // A point lookup needs only the one entry equal to the needle: compared as bytes (compressed under the
+        // block's own symbol table when the entries are FSST), never decoded or UTF-8-validated entry by entry.
+        let term: Cow<'_, [u8]> = if side == SideStream::FsstDictionaryValues {
+            let encoder = super::FsstDecodeTable::read(&mut reader)?.needle_encoder();
+            Cow::Owned(encoder.compress(needle.as_bytes()))
+        } else {
+            Cow::Borrowed(needle.as_bytes())
+        };
+        // The offset table is walked in place, one `u32` per boundary, so a lookup allocates nothing for it.
+        let table = reader.take(dict_count.saturating_add(1).saturating_mul(4), "string offset")?;
+        let (entries, _) = table.as_chunks::<4>();
+        let data_len = entries.last().map_or(0, |entry| u32::from_le_bytes(*entry) as usize);
+        let data = reader.take(data_len, "dictionary data")?;
+        let want = term.len();
+        let mut code = None;
+        let mut start = entries.first().map_or(0, |entry| u32::from_le_bytes(*entry) as usize);
+        for (index, entry) in entries.iter().skip(1).enumerate() {
+            let end = u32::from_le_bytes(*entry) as usize;
+            if end < start {
+                return Err(FormatError::Structural {
+                    rule: "dictionary offsets must be non-decreasing",
+                });
+            }
+            // Entries are distinct (and plain ones sorted), so the first hit is the only one.
+            if end - start == want && data.get(start..end).is_some_and(|value| value == &*term) {
+                code = Some(index as u64);
+                break;
+            }
+            start = end;
+        }
+        let stream = read_packed_stream(&mut reader)?;
+        let present = match code {
+            None => vec![false; stream.count],
+            Some(code) => {
+                let mut present = vec![false; stream.padded_count()];
+                stream.unpack_into(&mut present, |value| value == code);
+                present.truncate(stream.count);
+                present
+            }
+        };
+        return weave_present(&nulls, present);
+    }
     let owned: Vec<String>;
     let mut dictionary: Vec<&str> = Vec::with_capacity(reader.capacity_hint(dict_count, 1));
     if side == SideStream::FsstDictionaryValues {

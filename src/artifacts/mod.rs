@@ -67,6 +67,6 @@ pub const MAGIC_LEN: usize = 4;
 /// and a recycled block are the common callers, both wanting this over ranges up to tens of KiB.
 pub(crate) fn is_all_zero(bytes: &[u8]) -> bool {
     let mut chunks = bytes.chunks_exact(8);
-    (&mut chunks).all(|chunk| u64::from_ne_bytes(chunk.try_into().unwrap_or_default()) == 0)
+    chunks.all(|chunk| u64::from_ne_bytes(chunk.try_into().unwrap_or_default()) == 0)
         && chunks.remainder().iter().all(|&byte| byte == 0)
 }

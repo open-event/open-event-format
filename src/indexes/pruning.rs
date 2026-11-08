@@ -141,7 +141,10 @@ impl InList {
         let (mut lo, mut hi) = (0, values.len());
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            if clause_matches(&probe(PredicateKind::Range, i128::MIN, values[mid])) {
+            let Some(&listed) = values.get(mid) else {
+                break;
+            };
+            if clause_matches(&probe(PredicateKind::Range, i128::MIN, listed)) {
                 hi = mid;
             } else {
                 lo = mid + 1;

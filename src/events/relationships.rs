@@ -65,6 +65,10 @@ impl RelationshipKind {
     }
 
     /// The kind a stored tag names, or `None` when the tag is not in the registry.
+    #[allow(
+        clippy::should_implement_trait,
+        reason = "an unknown tag is `None`, not a parse error"
+    )]
     pub fn from_str(tag: &str) -> Option<Self> {
         match tag {
             "auth" => Some(RelationshipKind::Auth),
@@ -129,6 +133,10 @@ impl TargetIdSpace {
     }
 
     /// The space a stored tag names, or `None` when the tag is not in the registry.
+    #[allow(
+        clippy::should_implement_trait,
+        reason = "an unknown tag is `None`, not a parse error"
+    )]
     pub fn from_str(tag: &str) -> Option<Self> {
         match tag {
             "event_id" => Some(TargetIdSpace::EventId),

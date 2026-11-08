@@ -80,6 +80,10 @@ pub const DECODE_OPTIMIZED_THRESHOLD_NUM: usize = 3;
 /// distinct values are at most this fraction (1/4, 25%) of the sample; above that, FSST or raw wins.
 pub const DICTIONARY_MAX_CARDINALITY_DIVISOR: usize = 4;
 
+/// A block sent to FSST is also trial-encoded as a dictionary when each distinct value repeats at least this many
+/// times on average across the whole block; the smaller encoding is kept.
+pub const DICTIONARY_TRIAL_MIN_REPEAT: usize = 2;
+
 /// fsst-rs's lossy perfect-hash multiplier (`fsst::lossy_pht::HASH_MULTIPLIER`), pinned with fsst-rs 0.5.11. Used by
 /// [`super::fsst_lossy_pht_slot`] to reproduce the slot a symbol lands in inside the crate's lossy hash table.
 pub const FSST_LOSSY_PHT_HASH_MULTIPLIER: u64 = 2_971_215_073;
@@ -89,8 +93,9 @@ pub const FSST_LOSSY_PHT_HASH_MULTIPLIER: u64 = 2_971_215_073;
 pub const FSST_LOSSY_PHT_HASH_SHIFT: u32 = 15;
 
 /// [`super::choose_string_transform`] picks FSST for a high-cardinality sample only when the average value length is
-/// at or under this many bytes; longer values are stored raw instead.
-pub const FSST_MAX_AVERAGE_VALUE_LEN: usize = 64;
+/// at or under this many bytes (short free text such as chat messages compresses well under FSST and decodes several
+/// times faster than a Zstandard-framed raw arena); longer values are stored raw instead.
+pub const FSST_MAX_AVERAGE_VALUE_LEN: usize = 160;
 
 /// The most symbols an FSST table may declare before [`super::read_fsst_compressor`] refuses it — the ceiling
 /// fsst-rs itself would abort on.

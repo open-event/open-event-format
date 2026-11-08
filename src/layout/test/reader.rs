@@ -254,7 +254,7 @@ fn tail_range_sizes_exact_and_speculative_fetches() {
     assert_eq!((no_tree.exact, no_tree.len, no_tree.start), (true, 300, 9_700));
 
     let big = tail_range(10 * SPECULATIVE_TAIL_BYTES, None, None);
-    assert_eq!(big.exact, false);
+    assert!(!big.exact);
     assert_eq!(big.len, SPECULATIVE_TAIL_BYTES);
 
     // A file smaller than the speculative window is fetched whole.
@@ -526,7 +526,7 @@ fn freetext_row(i: u64, note: Option<&str>) -> OeRow {
 #[test]
 fn freetext_point_lookup_matches_whole_granule_decode_and_falls_back_identically() {
     let rows: Vec<_> = (0..20)
-        .map(|i| freetext_row(i, (!i.is_multiple_of(5)).then(|| "free text body")))
+        .map(|i| freetext_row(i, (!i.is_multiple_of(5)).then_some("free text body")))
         .collect();
     let config = OeBuildConfig {
         analytical_columns: Vec::new(),
@@ -599,7 +599,7 @@ fn freetext_point_lookup_matches_whole_granule_decode_and_falls_back_identically
 #[test]
 fn payload_path_and_payload_agree_on_a_freetext_declared_field() {
     let rows: Vec<_> = (0..12)
-        .map(|i| freetext_row(i, (!i.is_multiple_of(4)).then(|| "free text body")))
+        .map(|i| freetext_row(i, (!i.is_multiple_of(4)).then_some("free text body")))
         .collect();
     let config = OeBuildConfig {
         analytical_columns: Vec::new(),

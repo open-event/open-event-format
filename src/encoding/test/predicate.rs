@@ -100,7 +100,7 @@ fn long_shared_prefix(rows: usize) -> Vec<Option<String>> {
 }
 
 fn long_opaque(rows: usize) -> Vec<Option<String>> {
-    let filler = "x".repeat(80);
+    let filler = "x".repeat(200);
     (0..rows).map(|i| Some(format!("{filler}-{i}"))).collect()
 }
 
@@ -1229,7 +1229,7 @@ fn for_encoded_i64_splits_signed_ranges_across_the_zigzag_parity() {
         NumericPredicate::Equals(i128::from(i64::MAX) + 1), // beyond the domain
         NumericPredicate::NotEquals(hit),
         NumericPredicate::NotEquals(i128::MIN),
-        NumericPredicate::InSet(vec![hit, 0, -1, i128::from(i64::MIN), i128::from(u64::MAX) as i128 + 9]),
+        NumericPredicate::InSet(vec![hit, 0, -1, i128::from(i64::MIN), i128::from(u64::MAX) + 9]),
         range(Some((-500, true)), Some((500, true))), // straddles zero: even and odd halves both live
         range(Some((-500, false)), Some((500, false))),
         range(Some((-99_000, true)), Some((-3, false))), // wholly negative: odd codes only
@@ -2166,4 +2166,24 @@ fn a_contiguous_integer_in_list_becomes_one_range_check() {
     let values: Vec<u64> = (0..100).collect();
     let mask = NumericPredicate::InSet(set).filter_decoded(&ColumnData::U64(values.clone()));
     assert_eq!(mask, values.iter().map(|v| (10..=60).contains(v)).collect::<Vec<_>>());
+}
+
+/// Room-id-shaped values, each repeating about three times: too many distinct values in the sample for the plain
+/// dictionary rule, yet repetitive enough that the dictionary trial wins over FSST.
+fn mid_cardinality(rows: usize) -> Vec<Option<String>> {
+    (0..rows)
+        .map(|i| (i % 11 != 5).then(|| format!("!room{:06}:example.org", (i * 7919) % (rows / 3))))
+        .collect()
+}
+
+#[test]
+fn mid_cardinality_strings_win_the_dictionary_trial_and_filter_on_codes() {
+    let values = mid_cardinality(4096);
+    assert_eq!(transform_of(&values, false), Transform::DictionaryString);
+    let present = values.iter().flatten().next().unwrap().clone();
+    assert!(check(&values, &equals(&present), false));
+    assert!(check(&values, &equals("!room999999:example.org"), false));
+    assert!(check(&values, &equals(""), false));
+    // Random-access blocks keep their FSST layout: the trial runs only where no seekable framing is wanted.
+    assert_eq!(transform_of(&values, true), Transform::FsstString);
 }
