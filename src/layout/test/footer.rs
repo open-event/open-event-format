@@ -221,6 +221,106 @@ fn external_id_index_and_reference_filters_round_trip_through_encode_decode() {
     assert!(decoded.external_ids.is_empty());
 }
 
+fn external_id_round_trip(entries: Vec<ExternalIdEntry>) {
+    let mut footer = minimal_footer();
+    footer.external_ids = entries;
+    let decoded = decode_footer(&encode_footer(&footer)).expect("footer decodes without error");
+    assert_eq!(decoded.external_ids, footer.external_ids);
+    let mut out = Writer::new();
+    encode_external_ids_packed(&footer.external_ids, &mut out);
+    assert_eq!(
+        decode_external_ids_packed(out.bytes()).expect("packed index decodes"),
+        footer.external_ids
+    );
+}
+
+fn entry(id_hash: u64, row_ordinal: u64) -> ExternalIdEntry {
+    ExternalIdEntry { id_hash, row_ordinal }
+}
+
+#[test]
+fn packed_external_id_index_round_trips_edge_cases() {
+    external_id_round_trip(Vec::new());
+    external_id_round_trip(vec![entry(42, 7)]);
+    external_id_round_trip(vec![entry(0, 0)]);
+    external_id_round_trip(vec![entry(5, 1), entry(5, 2), entry(5, 9), entry(6, 0)]);
+    external_id_round_trip(vec![
+        entry(0, 0),
+        entry(1, 1),
+        entry(u64::MAX - 1, 2),
+        entry(u64::MAX, u64::MAX),
+    ]);
+    external_id_round_trip(vec![entry(u64::MAX, 3)]);
+    // Many blocks with varied gaps, including a run of zero-width deltas.
+    let mut hash = 0u64;
+    let entries: Vec<_> = (0..1000u64)
+        .map(|i| {
+            let gap = if (200..400).contains(&i) {
+                0
+            } else {
+                i.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 12
+            };
+            hash = hash.wrapping_add(gap);
+            entry(hash, i * 3)
+        })
+        .collect();
+    external_id_round_trip(entries);
+}
+
+#[test]
+fn packed_external_id_index_is_compact_and_rejects_hostile_input() {
+    let mut sorted: Vec<_> = (0..10_000u64)
+        .map(|i| entry(i.wrapping_mul(0x9E37_79B9_7F4A_7C15), i))
+        .collect();
+    sorted.sort_by_key(|e| (e.id_hash, e.row_ordinal));
+    let mut out = Writer::new();
+    encode_external_ids_packed(&sorted, &mut out);
+    assert!(out.len() < sorted.len() * 10, "packed index is {} bytes", out.len());
+    let bytes = out.into_bytes();
+    // A forged count, truncation, trailing bytes and an oversized width are all refused.
+    let mut forged = bytes.clone();
+    forged.splice(0..4, u32::MAX.to_le_bytes());
+    assert!(decode_external_ids_packed(&forged).is_err());
+    for len in 0..64 {
+        assert!(decode_external_ids_packed(bytes.get(..len).unwrap_or_default()).is_err());
+    }
+    assert!(decode_external_ids_packed(bytes.get(..bytes.len() - 1).unwrap_or_default()).is_err());
+    let mut trailing = bytes.clone();
+    trailing.push(0);
+    assert!(decode_external_ids_packed(&trailing).is_err());
+    let mut wide = vec![2, 0, 0, 0, 65];
+    wide.extend_from_slice(&[0; 9]);
+    assert!(decode_external_ids_packed(&wide).is_err());
+}
+
+#[test]
+fn legacy_external_id_section_still_decodes() {
+    let mut footer = minimal_footer();
+    footer.external_ids = vec![entry(3, 0), entry(9, 4), entry(u64::MAX, 1)];
+    let packed = encode_sections(&footer);
+    let mut legacy = SectionArea {
+        bytes: Writer::new(),
+        directory: Vec::new(),
+    };
+    for (id, range) in &packed.directory {
+        if *id == sections::EXTERNAL_IDS_PACKED {
+            legacy.push(sections::EXTERNAL_IDS, |out| {
+                out.put_u32(footer.external_ids.len() as u32);
+                for e in &footer.external_ids {
+                    out.put_u64(e.id_hash);
+                    out.put_u64(e.row_ordinal);
+                }
+            });
+        } else {
+            let bytes = packed.bytes.bytes().get(range.clone()).unwrap_or_default().to_vec();
+            legacy.push(*id, |out| out.put_slice(&bytes));
+        }
+    }
+    assert!(legacy.directory.iter().any(|(id, _)| *id == sections::EXTERNAL_IDS));
+    let decoded = decode_footer(&assemble_footer(&footer, legacy)).expect("legacy footer decodes");
+    assert_eq!(decoded.external_ids, footer.external_ids);
+}
+
 #[test]
 fn inbox_recipient_directory_round_trips_and_rejects_a_forged_count() {
     let mut footer = minimal_footer();
