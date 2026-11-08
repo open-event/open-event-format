@@ -188,6 +188,7 @@ fn publish_in_place_of(
     let output = OeFileEntry {
         coverage,
         feature_metadata: None,
+        field_deletion_vectors: Vec::new(),
         file_seal: built.file_seal,
         file_id: built.file_id,
         file_type: FileType::OeFile,

@@ -145,6 +145,7 @@ fn open_remote(source: &Arc<CountingSource>, built: &BuiltOe) -> OeFile {
             last_sequence: built.footer.exact_counts.row_count,
         },
         feature_metadata: None,
+        field_deletion_vectors: Vec::new(),
         file_seal: built.file_seal,
         file_id: built.file_id,
         file_type: FileType::OeFile,

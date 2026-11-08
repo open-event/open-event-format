@@ -19,6 +19,7 @@ fn make_entry(file_id: u128, range: SequenceRange) -> OeFileEntry {
     OeFileEntry {
         coverage: range,
         feature_metadata: None,
+        field_deletion_vectors: Vec::new(),
         file_seal: [0u8; 32],
         file_id,
         file_type: FileType::OeFile,

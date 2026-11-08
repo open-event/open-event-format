@@ -109,6 +109,7 @@ pub(crate) fn active_entry(built: &BuiltOe, first: u64, last: u64) -> OeFileEntr
             last_sequence: last,
         },
         feature_metadata: None,
+        field_deletion_vectors: Vec::new(),
         file_seal: built.file_seal,
         file_id: built.file_id,
         file_type: FileType::OeFile,

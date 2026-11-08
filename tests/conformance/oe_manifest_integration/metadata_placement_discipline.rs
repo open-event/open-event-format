@@ -25,6 +25,7 @@ fn large_rollup_not_in_manifest() {
     let entry = OeFileEntry {
         coverage: range,
         feature_metadata: None,
+        field_deletion_vectors: Vec::new(),
         file_seal: [0u8; 32],
         file_id: 0xAA,
         file_type: FileType::OeFile,

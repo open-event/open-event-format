@@ -20,6 +20,7 @@ fn entry() -> OeFileEntry {
         deletion_vector: None,
         entity_summary: None,
         feature_metadata: None,
+        field_deletion_vectors: Vec::new(),
         file_seal: [0; 32],
         file_id: FILE_ID,
         file_type: FileType::OeFile,
