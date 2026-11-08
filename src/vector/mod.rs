@@ -21,7 +21,8 @@ mod search;
 mod segment;
 
 pub use catalogue::{
-    SegmentDeletesRef, VectorSegmentEntry, load_segment_deletes, publish_segment_deletes, segment_deletes_object_key,
+    SegmentDeletesRef, VectorSegmentEntry, load_segment_deletes, publish_segment_deletes, search_catalogued_segments,
+    segment_deletes_object_key,
 };
 pub use constant::{
     DEFAULT_OVERSAMPLE, EMBEDDING_COLUMN_ID, EVENT_ID_COLUMN, GRANULE_ROWS, ROOM_ID_COLUMN, SENDER_COLUMN,

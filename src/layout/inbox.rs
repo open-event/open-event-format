@@ -19,6 +19,7 @@ use crate::deletes::{DeletionVector, RowSelection};
 use crate::encoding::ColumnData;
 use crate::error::{FormatError, InboxError};
 use crate::events::{EventEnvelope, SequencePoint, TenantId};
+use crate::field_deletion_store::FieldRedactions;
 use std::vec::IntoIter;
 
 /// Who an inbox row is addressed to: the row's entity, by the two identity hashes every row stores beside its entity
@@ -64,7 +65,15 @@ pub fn read_inbox(
             continue;
         }
         let deleted = deletes.deletion_vector(tenant_id, file.header().file_id)?;
-        read_rows(file, &granules, recipient, acked, deleted.as_ref(), &mut events)?;
+        let redactions = deletes.field_redactions(tenant_id, file.header().file_id)?;
+        read_rows(
+            file,
+            &granules,
+            recipient,
+            acked,
+            (deleted.as_ref(), redactions.as_ref()),
+            &mut events,
+        )?;
     }
     events.sort_by_key(|event| event.point);
     Ok(events)
@@ -132,7 +141,7 @@ fn read_rows(
     granules: &[&GranuleEntry],
     recipient: Recipient,
     acked: Option<SequencePoint>,
-    deleted: Option<&DeletionVector>,
+    (deleted, redactions): (Option<&DeletionVector>, Option<&FieldRedactions>),
     out: &mut Vec<EntityEvent>,
 ) -> Result<(), FormatError> {
     // The key columns come through the live scan: a granule the deletion vector empties is never decoded, and one it
@@ -145,53 +154,61 @@ fn read_rows(
         column_ids::ENTITY_ID_HASH_LOW,
         column_ids::ENTITY_ID_HASH_HIGH,
     ];
-    file.scan_projected_serial_live(&columns, &granule_ids, deleted.unwrap_or(&no_deletes), |batch, selection| {
-        let rows = batch.row_count as usize;
-        let first_row_ordinal = file
-            .footer()
-            .granules
-            .iter()
-            .find(|granule| granule.granule_id == batch.granule_id)
-            .map(|granule| granule.first_row_ordinal)
-            .ok_or(FormatError::RefOutOfRange {
-                what: "scanned granule missing from the granule directory",
+    file.scan_projected_serial_live(
+        &columns,
+        &granule_ids,
+        deleted.unwrap_or(&no_deletes),
+        |batch, selection| {
+            let rows = batch.row_count as usize;
+            let first_row_ordinal = file
+                .footer()
+                .granules
+                .iter()
+                .find(|granule| granule.granule_id == batch.granule_id)
+                .map(|granule| granule.first_row_ordinal)
+                .ok_or(FormatError::RefOutOfRange {
+                    what: "scanned granule missing from the granule directory",
+                })?;
+            let [epochs, sequences, lows, highs] = <[Vec<u64>; 4]>::try_from(
+                batch
+                    .columns
+                    .into_iter()
+                    .map(|column| scanned_u64s(column, rows))
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+            .map_err(|_| FormatError::Structural {
+                rule: "a scan batch holds one block per projected column",
             })?;
-        let [epochs, sequences, lows, highs] = <[Vec<u64>; 4]>::try_from(
-            batch
-                .columns
-                .into_iter()
-                .map(|column| scanned_u64s(column, rows))
-                .collect::<Result<Vec<_>, _>>()?,
-        )
-        .map_err(|_| FormatError::Structural {
-            rule: "a scan batch holds one block per projected column",
-        })?;
-        let mut envelopes = None;
-        let keys = epochs.iter().zip(&sequences).zip(lows.iter().zip(&highs));
-        for (row_in_granule, ((&epoch, &sequence), (&low, &high))) in keys.enumerate() {
-            let point = SequencePoint { epoch, sequence };
-            let row_ordinal = first_row_ordinal + row_in_granule as u64;
-            let live = match &selection {
-                RowSelection::All => true,
-                RowSelection::None => false,
-                RowSelection::Some(keep) => keep.get(row_in_granule).copied().unwrap_or(false),
-            };
-            if !live
-                || low != recipient.entity_id_hash_low
-                || high != recipient.entity_id_hash_high
-                || acked.is_some_and(|acked| point <= acked)
-            {
-                continue;
+            let mut envelopes = None;
+            let keys = epochs.iter().zip(&sequences).zip(lows.iter().zip(&highs));
+            for (row_in_granule, ((&epoch, &sequence), (&low, &high))) in keys.enumerate() {
+                let point = SequencePoint { epoch, sequence };
+                let row_ordinal = first_row_ordinal + row_in_granule as u64;
+                let live = match &selection {
+                    RowSelection::All => true,
+                    RowSelection::None => false,
+                    RowSelection::Some(keep) => keep.get(row_in_granule).copied().unwrap_or(false),
+                };
+                if !live
+                    || low != recipient.entity_id_hash_low
+                    || high != recipient.entity_id_hash_high
+                    || acked.is_some_and(|acked| point <= acked)
+                {
+                    continue;
+                }
+                let envelope = take_envelope(file, batch.granule_id, &mut envelopes, row_in_granule)?;
+                out.push(EntityEvent {
+                    envelope,
+                    payload: match redactions {
+                        Some(redactions) => file.payload_redacted(row_ordinal, redactions)?,
+                        None => file.payload(row_ordinal)?,
+                    },
+                    point,
+                });
             }
-            let envelope = take_envelope(file, batch.granule_id, &mut envelopes, row_in_granule)?;
-            out.push(EntityEvent {
-                envelope,
-                payload: file.payload(row_ordinal)?,
-                point,
-            });
-        }
-        Ok(())
-    })
+            Ok(())
+        },
+    )
 }
 
 /// A scanned key column's values, one `u64` per row.

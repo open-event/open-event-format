@@ -164,6 +164,30 @@ pub fn load_segment_deletes(
     Ok(deletes)
 }
 
+/// [`search_segments_with_deletes`](super::search_segments_with_deletes) with each segment's deletes read from the
+/// vector segment catalogue of `manifest`: `segments[i]` is the segment catalogued as `segment_ids[i]`, and its deletes
+/// load through [`load_segment_deletes`] (nothing deleted for an uncatalogued segment or one without deletes). Fails
+/// when the two slices differ in length or any deletes object is missing or fails verification.
+pub fn search_catalogued_segments<S: super::segment::SegmentSource>(
+    store: &dyn ObjectStore,
+    manifest: &ManifestGeneration,
+    segments: &[super::segment::SegmentReader<S>],
+    segment_ids: &[u128],
+    search: &super::search::VectorSearch<'_>,
+) -> Result<Vec<super::search::SearchHit>, VectorError> {
+    if segments.len() != segment_ids.len() {
+        return Err(VectorError::Unavailable {
+            detail: "each searched segment needs exactly one catalogue id".to_owned(),
+        });
+    }
+    let deletes = segment_ids
+        .iter()
+        .map(|&id| load_segment_deletes(store, manifest, id))
+        .collect::<Result<Vec<_>, _>>()?;
+    let refs: Vec<Option<&SegmentDeletes>> = deletes.iter().map(Some).collect();
+    super::search::search_segments_with_deletes(segments, &refs, search)
+}
+
 #[cfg(test)]
 #[path = "test/catalogue.rs"]
 mod tests;

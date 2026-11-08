@@ -473,3 +473,137 @@ fn compaction_carries_provenance_relationships_and_lineage_over() {
         (1..=9).map(rich_row).collect::<Vec<_>>()
     );
 }
+
+// --- Field-level deletion vectors and external deletion vectors -------------------------------------------------------
+
+fn body_redaction(ordinals: &[u64]) -> crate::deletes::FieldDeletionVector {
+    let mut vector = crate::deletes::FieldDeletionVector::new(vec!["body".to_owned()]);
+    ordinals.iter().for_each(|&ordinal| vector.mark_affected(ordinal));
+    vector
+}
+
+#[test]
+fn read_build_rows_redacted_nulls_redacted_fields_and_drops_the_raw_payload() {
+    use crate::field_deletion_store::FieldRedactions;
+    use crate::writer::build::{BuildInput, BuildRow};
+    let mut rows: Vec<BuildRow> = OeRow::into_build_rows((1..=3).map(rich_row).collect());
+    for (index, row) in rows.iter_mut().enumerate() {
+        row.raw_payload = Some(format!("{{\"n\":{index}}}").into_bytes());
+    }
+    let file = open_built(&build_oe_file(rows, &lineage_config()).unwrap());
+    let redactions = FieldRedactions {
+        vectors: vec![body_redaction(&[1])],
+    };
+    let plain = read_build_rows(&file).unwrap();
+    let read = read_build_rows_redacted(&file, &redactions).unwrap();
+    assert_eq!(read[0], plain[0]);
+    assert_eq!(read[2], plain[2]);
+    assert!(read[1].raw_payload.is_none() && plain[1].raw_payload.is_some());
+    assert_eq!(file.raw_payload_redacted(1, &redactions).unwrap(), None);
+    assert!(file.raw_payload_redacted(0, &redactions).unwrap().is_some());
+    let PayloadRead::Value(VariantValue::Object(fields)) = file.payload_redacted(1, &redactions).unwrap() else {
+        panic!("an object payload");
+    };
+    if let Some(body) = fields.get("body") {
+        assert_eq!(body, &VariantValue::Null);
+    }
+    assert_ne!(file.payload_redacted(0, &redactions).unwrap(), PayloadRead::None);
+}
+
+#[test]
+fn compaction_applies_field_redactions_and_external_deletion_vectors() {
+    let objects = SimObjectStore::new();
+    let mut published = SimulatedPublishedSet::new();
+    let clock = FixedClock::at(START_NANOS);
+    let first = build_oe_file(rows_of(1..=3), &build_config()).unwrap();
+    let second = build_oe_file(rows_of(4..=5), &build_config()).unwrap();
+    publish_built(&first, 1, 3, &mut published, &objects);
+    publish_built(&second, 4, 5, &mut published, &objects);
+
+    // Delete sequence 2 through a deletion vector stored as an external object, and redact `body` of sequence 3 and 4.
+    let (head_id, mut head) = published.head().unwrap();
+    head.generation = head_id + 1;
+    head.footer_mirror = None;
+    let mut deleted = crate::deletes::DeletionVector::new();
+    deleted.mark_deleted(1);
+    head.publish_deletions_with_limit(first.file_id, &deleted, None, &objects, 0)
+        .unwrap();
+    assert!(head.files[0].deletion_vector.as_ref().unwrap().is_external());
+    head.publish_field_deletions(first.file_id, &body_redaction(&[2]))
+        .unwrap();
+    head.publish_field_deletions(second.file_id, &body_redaction(&[0]))
+        .unwrap();
+    published.put_generation(head.clone()).unwrap();
+    published.advance_head(head_id, head_id + 1).unwrap();
+
+    // Before compaction, an entity scan through the manifest hides the redacted field.
+    let resolver = crate::corrections::CorrectionResolver::new([]);
+    let manifest_deletes = crate::deletion_store::ManifestDeletes {
+        corrections: &resolver,
+        manifest: &head,
+        objects: Some(&objects),
+    };
+    let first_file = open_built(&first);
+    let scan = |low: u64, file: &OeFile, deletes: &dyn crate::layout::entity_scan::DeletesAndCorrections| {
+        crate::layout::entity_scan::EntityScan {
+            direction: crate::layout::footer::SortDirection::Ascending,
+            entity_id_hash_high: 1,
+            entity_id_hash_low: low,
+            limit: None,
+            sequence_range: crate::events::SequencePoint { epoch: 0, sequence: 0 }..=crate::events::SequencePoint {
+                epoch: u64::MAX,
+                sequence: u64::MAX,
+            },
+            tenant_id: tenant(),
+        }
+        .run(&[file], &crate::artifacts::overlay::LiveOverlayStore::new(), deletes)
+        .unwrap()
+    };
+    let redacted = scan(3, &first_file, &manifest_deletes);
+    assert_eq!(redacted.len(), 1);
+    let PayloadRead::Value(VariantValue::Object(fields)) = &redacted[0].payload else {
+        panic!("an object payload");
+    };
+    assert_eq!(fields.get("body"), Some(&VariantValue::Null));
+    assert_eq!(fields.get("n"), Some(&VariantValue::Int(3)));
+    assert!(
+        scan(2, &first_file, &manifest_deletes).is_empty(),
+        "the external deletion vector drops the row"
+    );
+    let untouched = scan(1, &first_file, &manifest_deletes);
+    assert_eq!(untouched[0].payload, PayloadRead::Value(payload_of(1)));
+
+    let job = CompactionJob {
+        expected_output_bytes: (first.bytes.len() + second.bytes.len()) as u64,
+        file_ids: vec![first.file_id, second.file_id],
+    };
+    let output = execute_compaction(
+        &mut OePublisher::default(),
+        &job,
+        &build_config(),
+        &mut published,
+        &objects,
+        &mut NoopPeerNotices::default(),
+        &clock,
+    )
+    .unwrap();
+    assert!(output.entry.deletion_vector.is_none());
+    assert!(output.entry.field_deletion_vectors.is_empty());
+    let merged = OeFile::open(output.file_bytes.clone(), Some(&output.entry.file_seal)).unwrap();
+    let rows = read_event_rows(&merged).unwrap();
+    assert_eq!(
+        rows.iter().map(|row| row.sequence).collect::<Vec<_>>(),
+        vec![1, 3, 4, 5]
+    );
+    for row in &rows {
+        let PayloadInput::Variant(VariantValue::Object(fields)) = &row.event.payload else {
+            panic!("an object payload");
+        };
+        let expected_body = if matches!(row.sequence, 3 | 4) {
+            VariantValue::Null
+        } else {
+            VariantValue::String(format!("message {}", row.sequence))
+        };
+        assert_eq!(fields.get("body"), Some(&expected_body), "sequence {}", row.sequence);
+    }
+}

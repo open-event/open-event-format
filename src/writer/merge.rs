@@ -29,6 +29,7 @@ use crate::error::FormatError;
 use crate::events::provenance::{SignatureScheme, SignedEventProvenance, hex_bytes};
 use crate::events::relationships::{EventRelationships, RelationshipKind};
 use crate::events::{EventEnvelope, EventFlags, EventId, StreamId, TimestampValue};
+use crate::field_deletion_store::FieldRedactions;
 use crate::invariants::PublishedSet;
 use crate::layout::Profile;
 use crate::layout::reader::{OeFile, PayloadRead};
@@ -147,7 +148,11 @@ fn provenance_at(
 }
 
 /// Reads every row of `file` back, every column the builder writes from a row included.
-fn read_stored_rows(file: &OeFile) -> Result<Vec<StoredRow>, FormatError> {
+///
+/// With `redactions`, every row a field-level deletion vector touches comes back redacted: its redacted payload fields
+/// as `Null` (an external payload reference, which cannot be redacted in place, as no payload) and its raw payload
+/// dropped, so the rows can be rebuilt into a file that needs no field deletion vector.
+fn read_stored_rows(file: &OeFile, redactions: Option<&FieldRedactions>) -> Result<Vec<StoredRow>, FormatError> {
     let footer = file.footer();
     let tenant_id = file.header().tenant_id;
     let dictionaries = &footer.dictionaries;
@@ -245,7 +250,14 @@ fn read_stored_rows(file: &OeFile) -> Result<Vec<StoredRow>, FormatError> {
             let at = |values: &[u64]| values.get(row).copied().ok_or_else(missing);
             let text = |values: &[Option<String>]| values.get(row).cloned().ok_or_else(missing);
             let event_id = *event_ids.get(row).ok_or_else(missing)?;
-            let payload = match file.payload(granule.first_row_ordinal + row as u64)? {
+            let ordinal = granule.first_row_ordinal + row as u64;
+            let payload = file.payload(ordinal)?;
+            let redacted = redactions.is_some_and(|redactions| redactions.withholds_raw_payload(ordinal));
+            let payload = match redactions {
+                Some(redactions) if redacted => redactions.redact_payload(ordinal, payload),
+                _ => payload,
+            };
+            let payload = match payload {
                 PayloadRead::Value(value) => PayloadInput::Variant(value),
                 PayloadRead::External(reference) => PayloadInput::ExternalRef(reference),
                 PayloadRead::None => PayloadInput::None,
@@ -308,7 +320,9 @@ fn read_stored_rows(file: &OeFile) -> Result<Vec<StoredRow>, FormatError> {
             };
             rows.push(StoredRow {
                 external_id: next_text(&mut external_ids)?.map(|hex| hex_of(&hex)).transpose()?,
-                raw_payload: next_text(&mut raw_payloads)?.map(String::into_bytes),
+                raw_payload: next_text(&mut raw_payloads)?
+                    .filter(|_| !redacted)
+                    .map(String::into_bytes),
                 row: OeRow {
                     epoch: at(&epochs)?,
                     event: EventInput {
@@ -337,7 +351,7 @@ fn read_stored_rows(file: &OeFile) -> Result<Vec<StoredRow>, FormatError> {
 /// A [`OeRow`] has no place for an event's source form, so a file that stores raw payloads or external ids is
 /// refused with [`FormatError::Structural`]; read it with [`read_build_rows`] instead.
 pub fn read_event_rows(file: &OeFile) -> Result<Vec<OeRow>, FormatError> {
-    read_stored_rows(file)?
+    read_stored_rows(file, None)?
         .into_iter()
         .map(|stored| {
             if stored.external_id.is_some() || stored.raw_payload.is_some() {
@@ -354,8 +368,17 @@ pub fn read_event_rows(file: &OeFile) -> Result<Vec<OeRow>, FormatError> {
 /// [`read_event_rows`] returns plus the source form (raw payload and external id). Building these rows again under the
 /// same configuration reproduces the file's logical rows column for column.
 pub fn read_build_rows(file: &OeFile) -> Result<Vec<BuildRow>, FormatError> {
+    read_build_rows_redacted(file, &FieldRedactions::default())
+}
+
+/// [`read_build_rows`] with `redactions` (the file's field-level deletion vectors) applied physically: each affected
+/// row's redacted payload fields come back as `Null`, an external payload reference as no payload, and its raw payload
+/// is dropped. Rebuilding these rows yields a file whose stored columns no longer hold the redacted values, so it
+/// needs no field deletion vector.
+pub fn read_build_rows_redacted(file: &OeFile, redactions: &FieldRedactions) -> Result<Vec<BuildRow>, FormatError> {
     let mut shared = SharedStrings::default();
-    Ok(read_stored_rows(file)?
+    let redactions = (!redactions.is_empty()).then_some(redactions);
+    Ok(read_stored_rows(file, redactions)?
         .into_iter()
         .map(|stored| {
             let mut row = shared.build_row(stored.row);
@@ -389,11 +412,20 @@ pub(crate) fn open_stored_input(
 ///
 /// The inputs must still be `Active` in the head generation; their stored bytes are checked against the seal their
 /// entries record before any row is read. Event-file inputs merge in `(epoch, sequence)` order with every row their
-/// deletion vectors remove dropped. Graph-file inputs (a job from
+/// deletion vectors remove dropped (an external deletion-vector object is fetched from `objects`) and every field their
+/// field-level deletion vectors redact physically nulled, with the raw payload of each affected row dropped (see
+/// [`read_build_rows_redacted`]); the output therefore starts with neither kind of vector. Graph-file inputs (a job from
 /// [`plan_graph_compaction_cycle`](crate::lifecycle::plan_graph_compaction_cycle)) must be one subject's files that
 /// follow on; they merge in event order with the graph rebuilt from them and every later `Active` file of the subject,
-/// and the output is a graph file whatever `config`'s profile. A graph input with a deletion vector is refused, since
-/// dropping a row would renumber the subject's events. Nothing is published when an input is missing, fails its seal,
+/// and the output is a graph file whatever `config`'s profile.
+///
+/// A graph input with a row-level deletion vector is refused. Dropping a row would renumber the subject's events, and
+/// that cannot be kept consistent within one compaction: a graph file addresses events by subject-wide event SN, the
+/// subject's later `Active` files (which this job does not rewrite) name parents in the merged range by those SNs, the
+/// output must cover the same contiguous SN range as its inputs ([`rebuild_graph_input`] refuses a gap), and the
+/// manifest entries of every later file record their SN ranges. Renumbering would mean rewriting every later file of
+/// the subject in the same generation; instead the deleted rows stay in the graph file and readers hide them through
+/// the deletion vector. A graph input's field-level redactions are applied, since they leave every row in place. Nothing is published when an input is missing, fails its seal,
 /// or does not read back (see [`read_build_rows`]). The replaced inputs stay in the store until
 /// [`sweep_retired_files`](super::retire::sweep_retired_files) deletes them.
 pub fn execute_compaction(
@@ -435,8 +467,11 @@ pub fn execute_compaction(
     if graph_inputs == 0 {
         for entry in &entries {
             let file = open_stored_input(entry.file_id, &entry.file_seal, &config, objects)?;
-            let deletes = entry.load_deletion_vector().map_err(PublishFailure::Format)?;
-            let file_rows = read_build_rows(&file).map_err(PublishFailure::Format)?;
+            let deletes = entry
+                .load_deletion_vector_from(objects)
+                .map_err(PublishFailure::Format)?;
+            let redactions = entry.load_field_deletion_vectors().map_err(PublishFailure::Format)?;
+            let file_rows = read_build_rows_redacted(&file, &redactions).map_err(PublishFailure::Format)?;
             // Rows come back in primary-rowset ordinal order, the domain saved deletion vectors address, so a merge
             // physically drops every row the input's current deletion vector removes.
             rows.extend(
@@ -474,7 +509,8 @@ pub fn execute_compaction(
                 ));
             }
             let file = open_stored_input(entry.file_id, &entry.file_seal, &config, objects)?;
-            rows.extend(read_build_rows(&file).map_err(PublishFailure::Format)?);
+            let redactions = entry.load_field_deletion_vectors().map_err(PublishFailure::Format)?;
+            rows.extend(read_build_rows_redacted(&file, &redactions).map_err(PublishFailure::Format)?);
             sources.push(file);
         }
         let mut later_entries: Vec<&OeFileEntry> = head

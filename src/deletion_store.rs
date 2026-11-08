@@ -472,6 +472,25 @@ impl DeletesAndCorrections for ManifestDeletes<'_> {
         })
     }
 
+    fn field_redactions(
+        &self,
+        tenant_id: TenantId,
+        file_id: u128,
+    ) -> Result<Option<crate::field_deletion_store::FieldRedactions>, EntityScanError> {
+        let Some(entry) = self
+            .manifest
+            .files
+            .iter()
+            .find(|entry| entry.file_id == file_id && entry.tenant_id == tenant_id)
+        else {
+            return Ok(None);
+        };
+        if entry.field_deletion_vectors.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(entry.load_field_deletion_vectors()?))
+    }
+
     fn is_correction(&self, _tenant_id: TenantId, point: SequencePoint) -> Result<bool, EntityScanError> {
         Ok(self.corrections.is_correction_at(point))
     }

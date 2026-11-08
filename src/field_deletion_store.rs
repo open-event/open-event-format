@@ -10,11 +10,14 @@
 //!
 //! See: oe-deletes-and-corrections/spec.md
 
+use crate::columns::column_ids;
 use crate::deletes::{
     DeletionVector, FieldDeletionVector, FieldDeletionVectorRef, decode_deletion_vector, encode_deletion_vector,
 };
 use crate::error::FormatError;
 use crate::events::SequenceRange;
+use crate::events::variant::VariantValue;
+use crate::layout::reader::{OeFile, PayloadRead};
 use crate::lifecycle::{ManifestGeneration, OeFileEntry};
 
 /// Domain-separation context for a stored field deletion vector's BLAKE3 digest.
@@ -163,6 +166,111 @@ impl FieldRedactions {
     /// True when row `ordinal`'s raw payload must be withheld because some field of it is redacted.
     pub fn withholds_raw_payload(&self, ordinal: u64) -> bool {
         self.vectors.iter().any(|vector| vector.withholds_raw_payload(ordinal))
+    }
+
+    /// True when no row of the file has a redacted field.
+    pub fn is_empty(&self) -> bool {
+        self.vectors.iter().all(|vector| vector.affected_count() == 0)
+    }
+
+    /// The field paths redacted at row `ordinal`, sorted and unique (empty when the row is untouched).
+    pub fn redacted_columns_at(&self, ordinal: u64) -> Vec<&str> {
+        let mut columns: Vec<&str> = self
+            .vectors
+            .iter()
+            .filter(|vector| vector.withholds_raw_payload(ordinal))
+            .flat_map(|vector| vector.redacted_columns().iter().map(String::as_str))
+            .collect();
+        columns.sort_unstable();
+        columns.dedup();
+        columns
+    }
+
+    /// Hides row `ordinal`'s redacted fields in `value`: each redacted dot-separated path the value holds is set to
+    /// `Null`, the tombstone an erased subject's field reads as. Paths the value does not hold are left alone.
+    pub fn redact_value(&self, ordinal: u64, value: &mut VariantValue) {
+        for path in self.redacted_columns_at(ordinal) {
+            if let Some(slot) = field_mut(value, path) {
+                *slot = VariantValue::Null;
+            }
+        }
+    }
+
+    /// Row `ordinal`'s payload as a query may serve it: a reconstructed value with its redacted fields set to `Null`
+    /// (see [`Self::redact_value`]). An external payload reference cannot be redacted in place, so a row with any
+    /// redacted field serves no payload at all instead.
+    pub fn redact_payload(&self, ordinal: u64, payload: PayloadRead) -> PayloadRead {
+        if !self.withholds_raw_payload(ordinal) {
+            return payload;
+        }
+        match payload {
+            PayloadRead::Value(mut value) => {
+                self.redact_value(ordinal, &mut value);
+                PayloadRead::Value(value)
+            }
+            PayloadRead::External(_) | PayloadRead::None => PayloadRead::None,
+        }
+    }
+
+    /// The stored columns of `file` that hold one of row `ordinal`'s redacted fields: the shredded and sparse-key
+    /// columns lifted from a redacted top-level path, and any column whose name is a redacted path. A column scan
+    /// treats these as null at that row. The raw payload column is listed too whenever the row has a redacted field.
+    pub fn redacted_column_ids(&self, file: &OeFile, ordinal: u64) -> Vec<u32> {
+        let paths = self.redacted_columns_at(ordinal);
+        if paths.is_empty() {
+            return Vec::new();
+        }
+        let footer = file.footer();
+        let mut ids: Vec<u32> = footer
+            .shredded
+            .iter()
+            .chain(&footer.sparse_keys)
+            .filter(|entry| paths.contains(&entry.path.as_str()))
+            .map(|entry| entry.column_id)
+            .chain(
+                footer
+                    .columns
+                    .iter()
+                    .filter(|column| paths.contains(&column.name.as_str()))
+                    .map(|column| column.column_id),
+            )
+            .chain(std::iter::once(column_ids::RAW_PAYLOAD))
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+}
+
+fn field_mut<'a>(value: &'a mut VariantValue, path: &str) -> Option<&'a mut VariantValue> {
+    let mut current = value;
+    for segment in path.split('.') {
+        let VariantValue::Object(fields) = current else {
+            return None;
+        };
+        current = fields.get_mut(segment)?;
+    }
+    Some(current)
+}
+
+impl OeFile {
+    /// [`Self::payload`] with `redactions` applied: row `row_ordinal`'s redacted fields read as `Null` (see
+    /// [`FieldRedactions::redact_payload`]).
+    pub fn payload_redacted(&self, row_ordinal: u64, redactions: &FieldRedactions) -> Result<PayloadRead, FormatError> {
+        Ok(redactions.redact_payload(row_ordinal, self.payload(row_ordinal)?))
+    }
+
+    /// [`Self::raw_payload`] with `redactions` applied: `None` for a row with any redacted field, since a redacted
+    /// field cannot be cut out of byte-exact raw bytes.
+    pub fn raw_payload_redacted(
+        &self,
+        row_ordinal: u64,
+        redactions: &FieldRedactions,
+    ) -> Result<Option<std::borrow::Cow<'_, [u8]>>, FormatError> {
+        if redactions.withholds_raw_payload(row_ordinal) {
+            return Ok(None);
+        }
+        self.raw_payload(row_ordinal)
     }
 }
 
