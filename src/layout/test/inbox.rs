@@ -101,6 +101,7 @@ fn config(profile: Profile, index_granularity: usize) -> OeBuildConfig {
         },
         tenant_id: tenant(),
         time_series_bucket_nanos: None,
+        delivery_lineage: false,
     }
 }
 

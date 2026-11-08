@@ -9,8 +9,8 @@
 //!
 //! See: oe-deletes-and-corrections/spec.md
 
-use super::build::{BuildInput, BuildLifecycle, BuildPayload, OeBuildConfig, OeRow, build_oe_file};
-use super::merge::{open_stored_input, read_event_rows};
+use super::build::{BuildLifecycle, BuildPayload, OeBuildConfig, build_oe_file};
+use super::merge::{open_stored_input, read_build_rows};
 use super::publish::{OePublisher, PeerNotices, PublishFailure};
 use super::subject_seal::seal_subject_rows;
 use crate::clock::Clock;
@@ -53,7 +53,9 @@ pub enum RekeyError {
 /// `file_id` must be an `Active` file of `config`'s tenant. Unresolved events, and rows not in the backlog, are carried
 /// over unchanged. Backlog entries naming this file whose rows it does not hold are left alone. Nothing is marked
 /// re-keyed unless the publication won. Entries for events of a file that has since been replaced (by a compaction,
-/// say) must be re-pointed by the caller with [`FileErasureBacklog::record_unresolved`].
+/// say) are re-pointed with [`FileErasureBacklog::retarget`], which
+/// [`Maintenance`](super::maintenance::Maintenance) does after every compaction it publishes, or with
+/// [`retarget_backlog_after_compaction`].
 #[expect(
     clippy::too_many_arguments,
     reason = "the re-keying rewrite wires every interface exactly once"
@@ -93,9 +95,7 @@ pub fn rekey_backlog_file(
             "a re-keyed file is not an active file of this tenant",
         )))?;
     let file = open_stored_input(file_id, &entry.file_seal, config, objects).map_err(RekeyError::Publish)?;
-    let rows: Vec<OeRow> =
-        read_event_rows(&file).map_err(|error| RekeyError::Publish(PublishFailure::Format(error)))?;
-    let mut rows = OeRow::into_build_rows(rows);
+    let mut rows = read_build_rows(&file).map_err(|error| RekeyError::Publish(PublishFailure::Format(error)))?;
     for row in &mut rows {
         let event_id = row.envelope.event_id;
         let Some(subject) = resolved.get(&event_id) else {
@@ -133,6 +133,22 @@ pub fn rekey_backlog_file(
     report.generation = Some(published.generation);
     report.output_file_id = Some(published.entry.file_id);
     Ok(report)
+}
+
+/// Re-points every backlog entry waiting in one of `inputs` at `output`, the file a compaction just published in their
+/// place, so [`rekey_backlog_file`] finds the events where they now live.
+pub fn retarget_backlog_after_compaction(
+    backlog: &FileErasureBacklog,
+    inputs: &[u128],
+    output: u128,
+) -> Result<(), crate::error::StorageError> {
+    let pending = backlog.pending()?;
+    for input in inputs {
+        if pending.iter().any(|entry| entry.file_id == *input) {
+            backlog.retarget(*input, output)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

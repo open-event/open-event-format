@@ -54,6 +54,9 @@ zeekstd = "0.6.2"
 zeroize = "1"
 zstd = "0.13.3"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 aes-gcm = "0.11.1"
 

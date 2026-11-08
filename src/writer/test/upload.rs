@@ -79,6 +79,7 @@ fn multi_stripe_file() -> BuiltOe {
         },
         tenant_id: TenantId::new_test_id(9),
         time_series_bucket_nanos: None,
+        delivery_lineage: false,
     };
     let rows = (0..40)
         .map(|i| OeRow {

@@ -12,6 +12,7 @@ fn entry(file_id: u128, part_state: PartState) -> OeFileEntry {
             last_sequence: file_id as u64 * 10 + 9,
         },
         feature_metadata: None,
+        field_deletion_vectors: Vec::new(),
         file_seal: [file_id as u8; 32],
         file_id,
         file_type: FileType::OeFile,

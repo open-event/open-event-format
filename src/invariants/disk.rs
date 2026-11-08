@@ -12,12 +12,19 @@ use super::constant::{
 };
 use super::{JournalStorage, PublishedSet, ShardAtomicity, ShardId};
 use crate::artifacts::FRAME_ALIGN;
+use crate::artifacts::frame::precheck_header;
 use crate::error::{PublishError, StorageError};
 use crate::lifecycle::ManifestGeneration;
 use hashbrown::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
+#[cfg(not(unix))]
+use std::io::Read;
+use std::io::{ErrorKind, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
+
+/// How many shards [`FileJournalStorage`] keeps a read-only handle to.
+pub const JOURNAL_READ_HANDLES: usize = 16;
 
 /// Makes the entries of `dir` (a file created, renamed or removed in it) durable.
 pub fn sync_dir(dir: &Path) -> std::io::Result<()> {
@@ -36,25 +43,135 @@ fn io_error(op: &'static str) -> impl FnOnce(std::io::Error) -> StorageError {
 ///
 /// Shard `n` is the file `{n as 8 hex digits}.oej` in the journal directory. Frames are appended whole and 4096-byte
 /// aligned at the end of the file; `sync` is `fdatasync`, which is what makes an append durable before the engine
-/// acknowledges it. A shard's extent is its file length, so a torn tail left by a crash (a partial, possibly unaligned
+/// acknowledges it. Without preallocation a shard's extent is its file length, so a torn tail left by a crash (a partial, possibly unaligned
 /// last write) is visible to replay, which cuts it back through `truncate`; `truncate` syncs the shorter length before
 /// returning.
 ///
 /// The atomicity recorded for every shard is the conservative buffered answer unless the deployment probed its device
 /// and supplied a better one with [`FileJournalStorage::with_atomicity`].
+///
+/// With [`FileJournalStorage::with_preallocation`] files grow in preallocated chunks (`posix_fallocate` where the
+/// platform has it), so most appends land inside space the file already has and their `fdatasync` has no file size to
+/// commit. The logical end of a shard is then tracked apart from its file length: a file whose last block reads as
+/// zeros is walked frame header by frame header on open, and the first header that is not a whole frame's, with only
+/// zeros after it, is its end. A sealed shard is cut back to its logical end with [`FileJournalStorage::trim`], and
+/// every open shard is when the storage is dropped. Preallocation is off by default.
+///
+/// Shards not open for appending are read through a small cache of read-only handles
+/// ([`JOURNAL_READ_HANDLES`]), revalidated by file length on every use.
 #[derive(Debug)]
 pub struct FileJournalStorage {
     atomicity: ShardAtomicity,
     dir: PathBuf,
+    /// Preallocation chunk in bytes; zero leaves files to grow as they are written.
+    preallocate_bytes: u64,
+    readers: Mutex<ReadHandles>,
     shards: HashMap<ShardId, OpenShard>,
 }
 
 /// One open shard file, how far it is written, and the atomicity probed for it when it was opened.
 #[derive(Debug)]
 struct OpenShard {
+    /// The file's length on disk, preallocated space included.
+    allocated: u64,
     atomicity: ShardAtomicity,
+    /// The logical end: where the next frame goes.
     extent: u64,
     file: File,
+}
+
+/// The most recently used read-only shard handles, oldest first.
+#[derive(Debug, Default)]
+struct ReadHandles {
+    entries: Vec<ReadHandle>,
+}
+
+#[derive(Debug)]
+struct ReadHandle {
+    file: Arc<File>,
+    /// The file's length when `extent` was worked out.
+    physical: u64,
+    shard: ShardId,
+    /// The logical end, kept only when it is the file's length: such a file can change only by changing length. A
+    /// file with a zeroed tail is scanned again on every use, as a writer elsewhere may be filling it in.
+    extent: Option<u64>,
+}
+
+/// Reads exactly `bytes.len()` bytes at `offset` without moving a shared cursor where the platform allows.
+fn read_exact_at(file: &File, bytes: &mut [u8], offset: u64) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_exact_at(bytes, offset)
+    }
+    #[cfg(not(unix))]
+    {
+        let mut file = file;
+        file.seek(SeekFrom::Start(offset))?;
+        file.read_exact(bytes)
+    }
+}
+
+/// The logical end of a shard file `physical` bytes long. A file whose length is not block aligned, or whose last
+/// block holds anything but zeros, was never preallocated past its frames (or was cut back): it ends where the file
+/// does, and recovery deals with any torn tail. Otherwise the frames are walked from the start by their headers; the
+/// first header that is not a whole frame's is the end, provided everything from there on is zeros (a preallocated
+/// tail). If anything else follows, the file length is kept so replay sees it.
+pub fn journal_logical_end(file: &File, physical: u64) -> std::io::Result<u64> {
+    let align = u64::from(FRAME_ALIGN);
+    if physical == 0 || !physical.is_multiple_of(align) {
+        return Ok(physical);
+    }
+    let mut block = vec![0; FRAME_ALIGN as usize];
+    read_exact_at(file, &mut block, physical - align)?;
+    if block.iter().any(|byte| *byte != 0) {
+        return Ok(physical);
+    }
+    let mut offset = 0;
+    while offset + align <= physical {
+        read_exact_at(file, &mut block, offset)?;
+        let Ok(header) = precheck_header(&block) else {
+            break;
+        };
+        let len = u64::from(header.frame_len);
+        if len == 0 || !len.is_multiple_of(align) || offset + len > physical {
+            break;
+        }
+        offset += len;
+    }
+    let mut at = offset;
+    while at < physical {
+        read_exact_at(file, &mut block, at)?;
+        if block.iter().any(|byte| *byte != 0) {
+            return Ok(physical);
+        }
+        at += align;
+    }
+    Ok(offset)
+}
+
+/// Gives `file` room up to `len` bytes without changing what it holds. Returns whether it did; where the platform or
+/// filesystem cannot preallocate, the file is left to grow as it is written.
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
+#[allow(unsafe_code)]
+fn preallocate(file: &File, len: u64) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    let Ok(len) = libc::off_t::try_from(len) else {
+        return Ok(false);
+    };
+    // SAFETY: the descriptor is borrowed from a live `File` for the duration of the call, and posix_fallocate only
+    // reads its integer arguments.
+    let result = unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, len) };
+    match result {
+        0 => Ok(true),
+        libc::EOPNOTSUPP | libc::EINVAL | libc::ENOSYS => Ok(false),
+        errno => Err(std::io::Error::from_raw_os_error(errno)),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
+fn preallocate(_file: &File, _len: u64) -> std::io::Result<bool> {
+    Ok(false)
 }
 
 impl FileJournalStorage {
@@ -65,8 +182,95 @@ impl FileJournalStorage {
         Ok(Self {
             atomicity: ShardAtomicity::buffered_unprobed(),
             dir,
+            preallocate_bytes: 0,
+            readers: Mutex::default(),
             shards: HashMap::new(),
         })
+    }
+
+    /// Grows shard files in preallocated chunks of `bytes` (rounded up to the frame alignment) instead of one append
+    /// at a time. Zero turns preallocation off, the default.
+    pub fn with_preallocation(mut self, bytes: u64) -> Self {
+        self.preallocate_bytes = if bytes == 0 {
+            0
+        } else {
+            bytes.next_multiple_of(u64::from(FRAME_ALIGN))
+        };
+        self
+    }
+
+    /// Cuts the preallocated space past the logical end of `shard`'s file off, durably: for a sealed shard, which
+    /// nothing appends to again. A shard that is not open for appending is left as it is.
+    pub fn trim(&mut self, shard: ShardId) -> std::io::Result<()> {
+        let Some(open) = self.shards.get_mut(&shard) else {
+            return Ok(());
+        };
+        if open.allocated > open.extent {
+            open.file.set_len(open.extent)?;
+            open.file.sync_all()?;
+            open.allocated = open.extent;
+        }
+        Ok(())
+    }
+
+    /// Drops the read-only handle to `shard`, if one is kept.
+    fn forget_reader(&mut self, shard: ShardId) {
+        let readers = self.readers.get_mut().unwrap_or_else(PoisonError::into_inner);
+        readers.entries.retain(|entry| entry.shard != shard);
+    }
+
+    /// Runs `with` on a read-only handle to `shard` (not open for appending) and its logical end: the kept handle when
+    /// its file is unchanged, otherwise opened (or rescanned) and kept.
+    fn with_reader<T>(
+        &self,
+        shard: ShardId,
+        with: impl FnOnce(&File, u64) -> Result<T, StorageError>,
+    ) -> Result<T, StorageError> {
+        let mut readers = self.readers.lock().unwrap_or_else(PoisonError::into_inner);
+        let (file, extent) = if let Some(index) = readers.entries.iter().position(|entry| entry.shard == shard) {
+            let mut entry = readers.entries.remove(index);
+            let physical = entry.file.metadata().map_err(io_error("journal stat"))?.len();
+            let extent = match entry.extent {
+                Some(extent) if physical == entry.physical => extent,
+                _ => journal_logical_end(&entry.file, physical).map_err(io_error("journal scan"))?,
+            };
+            entry.physical = physical;
+            entry.extent = (extent == physical).then_some(extent);
+            let file = Arc::clone(&entry.file);
+            readers.entries.push(entry);
+            (file, extent)
+        } else {
+            let file = File::open(self.shard_path(shard)).map_err(|error| {
+                if error.kind() == ErrorKind::NotFound {
+                    StorageError::UnknownShard
+                } else {
+                    io_error("journal open")(error)
+                }
+            })?;
+            let physical = file.metadata().map_err(io_error("journal stat"))?.len();
+            let extent = journal_logical_end(&file, physical).map_err(io_error("journal scan"))?;
+            let file = Arc::new(file);
+            if readers.entries.len() >= JOURNAL_READ_HANDLES {
+                readers.entries.remove(0);
+            }
+            readers.entries.push(ReadHandle {
+                file: Arc::clone(&file),
+                physical,
+                shard,
+                extent: (extent == physical).then_some(extent),
+            });
+            (file, extent)
+        };
+        with(&file, extent)
+    }
+
+    #[cfg(test)]
+    fn cached_readers(&self) -> usize {
+        self.readers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entries
+            .len()
     }
 
     /// Records `atomicity` for every shard opened from now on, for a deployment that probed its device's untorn-write
@@ -116,6 +320,7 @@ impl FileJournalStorage {
     /// succeeds.
     pub fn remove(&mut self, shard: ShardId) -> std::io::Result<()> {
         self.shards.remove(&shard);
+        self.forget_reader(shard);
         match std::fs::remove_file(self.shard_path(shard)) {
             Ok(()) => sync_dir(&self.dir),
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
@@ -126,6 +331,7 @@ impl FileJournalStorage {
     /// The open file of `shard`, opening (and creating, durably) it on first use.
     fn open_shard(&mut self, shard: ShardId) -> Result<&mut OpenShard, StorageError> {
         if !self.shards.contains_key(&shard) {
+            self.forget_reader(shard);
             let path = self.shard_path(shard);
             let created = !path.exists();
             let file = OpenOptions::new()
@@ -138,10 +344,12 @@ impl FileJournalStorage {
             if created {
                 sync_dir(&self.dir).map_err(io_error("journal directory sync"))?;
             }
-            let extent = file.metadata().map_err(io_error("journal stat"))?.len();
+            let allocated = file.metadata().map_err(io_error("journal stat"))?.len();
+            let extent = journal_logical_end(&file, allocated).map_err(io_error("journal scan"))?;
             self.shards.insert(
                 shard,
                 OpenShard {
+                    allocated,
                     atomicity: self.atomicity,
                     extent,
                     file,
@@ -152,14 +360,25 @@ impl FileJournalStorage {
     }
 }
 
+impl Drop for FileJournalStorage {
+    /// Cuts every open file's preallocated tail off, so a cleanly closed shard is exactly its frames. Not synced: a
+    /// crash before the cut reaches the disk leaves a zeroed tail, which opening it again reads as the end.
+    fn drop(&mut self) {
+        for open in self.shards.values_mut() {
+            if open.allocated > open.extent && open.file.set_len(open.extent).is_ok() {
+                open.allocated = open.extent;
+            }
+        }
+    }
+}
+
 /// Reads `len` bytes at `offset` from `file`, whose written extent is `extent`.
-fn read_at(mut file: &File, extent: u64, offset: u64, len: u32) -> Result<Vec<u8>, StorageError> {
+fn read_at(file: &File, extent: u64, offset: u64, len: u32) -> Result<Vec<u8>, StorageError> {
     if offset.checked_add(u64::from(len)).is_none_or(|end| end > extent) {
         return Err(StorageError::OutOfBounds);
     }
-    file.seek(SeekFrom::Start(offset)).map_err(io_error("journal seek"))?;
     let mut bytes = vec![0; len as usize];
-    file.read_exact(&mut bytes).map_err(io_error("journal read"))?;
+    read_exact_at(file, &mut bytes, offset).map_err(io_error("journal read"))?;
     Ok(bytes)
 }
 
@@ -168,11 +387,19 @@ impl JournalStorage for FileJournalStorage {
         if !frame.len().is_multiple_of(FRAME_ALIGN as usize) {
             return Err(StorageError::Unaligned);
         }
+        let chunk = self.preallocate_bytes;
         let open = self.open_shard(shard)?;
         let offset = open.extent;
         if !offset.is_multiple_of(u64::from(FRAME_ALIGN)) {
             // A torn tail recovery has not cut back yet: appending here would misalign every later frame.
             return Err(StorageError::Unaligned);
+        }
+        let end = offset + frame.len() as u64;
+        if chunk > 0 && end > open.allocated {
+            let want = end.div_ceil(chunk) * chunk;
+            if preallocate(&open.file, want).map_err(io_error("journal preallocate"))? {
+                open.allocated = want;
+            }
         }
         open.file
             .seek(SeekFrom::Start(offset))
@@ -182,7 +409,8 @@ impl JournalStorage for FileJournalStorage {
             // crash replay cuts the torn tail back.
             return Err(io_error("journal append")(error));
         }
-        open.extent = offset + frame.len() as u64;
+        open.extent = end;
+        open.allocated = open.allocated.max(end);
         Ok(offset)
     }
 
@@ -204,6 +432,7 @@ impl JournalStorage for FileJournalStorage {
         open.file.set_len(len).map_err(io_error("journal truncate"))?;
         open.file.sync_all().map_err(io_error("journal sync"))?;
         open.extent = len;
+        open.allocated = len;
         Ok(())
     }
 
@@ -211,25 +440,16 @@ impl JournalStorage for FileJournalStorage {
         if let Some(open) = self.shards.get(&shard) {
             return read_at(&open.file, open.extent, offset, len);
         }
-        let file = File::open(self.shard_path(shard)).map_err(|error| {
-            if error.kind() == ErrorKind::NotFound {
-                StorageError::UnknownShard
-            } else {
-                io_error("journal open")(error)
-            }
-        })?;
-        let extent = file.metadata().map_err(io_error("journal stat"))?.len();
-        read_at(&file, extent, offset, len)
+        self.with_reader(shard, |file, extent| read_at(file, extent, offset, len))
     }
 
     fn extent(&self, shard: ShardId) -> Result<u64, StorageError> {
         if let Some(open) = self.shards.get(&shard) {
             return Ok(open.extent);
         }
-        match std::fs::metadata(self.shard_path(shard)) {
-            Ok(metadata) => Ok(metadata.len()),
-            Err(error) if error.kind() == ErrorKind::NotFound => Ok(0),
-            Err(error) => Err(io_error("journal stat")(error)),
+        match self.with_reader(shard, |_, extent| Ok(extent)) {
+            Err(StorageError::UnknownShard) => Ok(0),
+            other => other,
         }
     }
 

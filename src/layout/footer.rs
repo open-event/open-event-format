@@ -10,7 +10,7 @@
 use super::graph::{ChainCover, DepthRange, EventIdIndex, UnresolvedEdge, decode_unresolved, encode_unresolved};
 use super::snapshot::SnapshotKeyIndex;
 use super::time_series::TimeSeriesRollups;
-use super::{Profile, required_features};
+use super::{Profile, optional_features, required_features};
 use crate::artifacts::state_chunk::StateRoot;
 use crate::compat::EscapeHatch;
 use crate::encoding::{ColumnData, PipelineId, decode_block, encode_block};
@@ -122,6 +122,9 @@ pub mod sections {
     /// Optional: one [`crate::vector::VectorColumnMeta`] per vector column. Present exactly when the file declares
     /// the `VECTOR_COLUMNS` required feature.
     pub const VECTOR_COLUMNS: u32 = 41;
+    /// Optional: the file's entity summary. Present exactly when the file declares the `ENTITY_SUMMARY` optional
+    /// feature; readers that predate the id skip it.
+    pub const ENTITY_SUMMARY: u32 = 42;
 }
 
 /// Logical column kind codes (stored in the column directory).
@@ -649,6 +652,9 @@ pub struct Footer {
     /// granules that cannot hold the id. Present when `ENTITY_HASH_POINT_FILTERS` is declared; empty otherwise, and a
     /// reader then scans every granule exactly as it did before the filters existed.
     pub entity_hash_filters: Vec<EntityHashFilterEntry>,
+    /// The file's entity summary. Present when the file declares the `ENTITY_SUMMARY` optional feature; `None` in
+    /// files written before it existed.
+    pub entity_summary: Option<crate::indexes::entity_summary::EntitySummary>,
     /// Forward-compatibility notes: how an older reader may still read an optional block it predates, via a portable
     /// decoder the fleet trusts.
     pub escape_hatches: Vec<EscapeHatch>,
@@ -1386,6 +1392,10 @@ fn encode_sections(footer: &Footer) -> SectionArea {
 
     if let Some(rollups) = &footer.time_series_rollups {
         sections.push(sections::TIME_SERIES_ROLLUPS, |out| rollups.encode_into(out));
+    }
+
+    if let Some(summary) = &footer.entity_summary {
+        sections.push(sections::ENTITY_SUMMARY, |out| summary.encode_into(out));
     }
 
     if !footer.vector_columns.is_empty() {
@@ -2417,6 +2427,15 @@ pub fn decode_footer(blob: &[u8]) -> Result<Footer, FormatError> {
         });
     }
 
+    let entity_summary = decode_section(&directory, section_area, sections::ENTITY_SUMMARY)?
+        .map(crate::indexes::entity_summary::EntitySummary::decode)
+        .transpose()?;
+    if entity_summary.is_some() != (optional_feature_flags & optional_features::ENTITY_SUMMARY != 0) {
+        return Err(FormatError::Structural {
+            rule: "entity summary section is present exactly when ENTITY_SUMMARY is declared",
+        });
+    }
+
     let time_series_rollups = decode_section(&directory, section_area, sections::TIME_SERIES_ROLLUPS)?
         .map(TimeSeriesRollups::decode)
         .transpose()?;
@@ -2481,6 +2500,7 @@ pub fn decode_footer(blob: &[u8]) -> Result<Footer, FormatError> {
         dictionaries,
         embedding_row_offsets,
         entity_hash_filters,
+        entity_summary,
         escape_hatches,
         exact_counts,
         external_ids,

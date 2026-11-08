@@ -1292,6 +1292,7 @@ dependencies = [
  "hex-simd",
  "hkdf",
  "k256",
+ "libc",
  "lz4_flex",
  "memchr",
  "miniz_oxide",

@@ -131,7 +131,7 @@ fn split_sealed(stored: &[u8]) -> Option<(SubjectId, &[u8])> {
 }
 
 /// The event id stored for row `row_ordinal`, which the payload's seal is bound to.
-fn row_event_id(file: &OeFile, row_ordinal: u64) -> Result<u128, FormatError> {
+pub(crate) fn row_event_id(file: &OeFile, row_ordinal: u64) -> Result<u128, FormatError> {
     let granules = &file.footer().granules;
     let index = granules.partition_point(|granule| granule.first_row_ordinal <= row_ordinal);
     let granule = index
@@ -178,7 +178,7 @@ fn open_sealed(
 }
 
 /// Decodes an opened payload: its key dictionary's length (`u32`), the dictionary, then the encoded value.
-fn decode_plaintext(plaintext: &[u8]) -> Result<VariantValue, FormatError> {
+pub(crate) fn decode_plaintext(plaintext: &[u8]) -> Result<VariantValue, FormatError> {
     let mut reader = Reader::new(plaintext);
     let dictionary_len = reader.u32("sealed payload dictionary length")? as usize;
     let dictionary = decode_variant_dictionary(reader.take(dictionary_len, "sealed payload dictionary")?)?;

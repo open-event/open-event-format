@@ -398,6 +398,7 @@ impl OePublisher {
         let staged_entry = OeFileEntry {
             coverage: range,
             feature_metadata: None,
+            field_deletion_vectors: Vec::new(),
             file_seal: built.file_seal,
             file_id: built.file_id,
             file_type: FileType::OeFile,

@@ -813,3 +813,32 @@ fn search_skips_deleted_rows_and_compaction_drops_them() {
     let hits = search_segments(std::slice::from_ref(&compacted), &search).unwrap();
     assert!(hits.iter().all(|hit| hit.event_id != event));
 }
+
+#[test]
+fn a_catalogued_search_reads_each_segments_deletes_from_the_manifest() {
+    use crate::lifecycle::ManifestGeneration;
+    use crate::object_store::sim::SimObjectStore;
+    let model = model(16, VectorMetric::Cosine);
+    let representations = vec![VectorElement::U1, VectorElement::F32];
+    let rows = input(40, 16);
+    let bytes = write_segment(&spec(model.clone(), representations), &rows, &key(1)).unwrap();
+    let readers = vec![SegmentReader::open(bytes, &key(1)).unwrap()];
+    let target = 7u64;
+    let query = rows.vectors[target as usize].clone();
+    let search = VectorSearch {
+        filter: SearchFilter::default(),
+        k: 3,
+        model: &model,
+        oversample: DEFAULT_OVERSAMPLE,
+        query: &query,
+    };
+    let store = SimObjectStore::new();
+    let mut manifest = ManifestGeneration::default();
+    manifest.register_vector_segment(11);
+    let before = search_catalogued_segments(&store, &manifest, &readers, &[11], &search).unwrap();
+    assert_eq!(before[0].row, target);
+    publish_segment_deletes(&store, &mut manifest, 11, &SegmentDeletes::new().with_deleted([target])).unwrap();
+    let after = search_catalogued_segments(&store, &manifest, &readers, &[11], &search).unwrap();
+    assert!(after.iter().all(|hit| hit.row != target));
+    assert!(search_catalogued_segments(&store, &manifest, &readers, &[], &search).is_err());
+}

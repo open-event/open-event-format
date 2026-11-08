@@ -20,6 +20,7 @@ fn sealed_file_not_yet_visible() {
             last_sequence: 4,
         },
         feature_metadata: None,
+        field_deletion_vectors: Vec::new(),
         file_seal: [0; 32],
         file_id: 1,
         file_type: oe::lifecycle::FileType::OeFile,

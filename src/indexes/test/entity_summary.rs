@@ -13,6 +13,7 @@ fn entry(file_id: u128, tenant: u128, summary: Option<EntitySummary>, part_state
         },
         entity_summary: summary,
         feature_metadata: None,
+        field_deletion_vectors: Vec::new(),
         file_seal: [0u8; 32],
         file_id,
         file_type: FileType::OeFile,

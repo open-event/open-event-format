@@ -256,6 +256,7 @@ fn built_file() -> BuiltOe {
         },
         tenant_id: TenantId::new_test_id(3),
         time_series_bucket_nanos: None,
+        delivery_lineage: false,
     };
     build_oe_file(rows, &config).unwrap()
 }

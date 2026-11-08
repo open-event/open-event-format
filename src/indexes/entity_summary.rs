@@ -104,6 +104,76 @@ impl EntitySummary {
     }
 }
 
+impl EntitySummary {
+    /// Appends the footer encoding: a form tag, then the sorted keys (exact) or the entity count and filter bytes
+    /// (Bloom).
+    pub(crate) fn encode_into(&self, out: &mut crate::file::bytes::Writer) {
+        match self {
+            Self::Exact { keys } => {
+                out.put_u8(0);
+                out.put_u32(keys.len() as u32);
+                for key in keys {
+                    out.put_u64(key.high);
+                    out.put_u64(key.low);
+                }
+            }
+            Self::Bloom { entity_count, filter } => {
+                out.put_u8(1);
+                out.put_u64(*entity_count);
+                out.put_u32(filter.len() as u32);
+                out.put_slice(filter);
+            }
+        }
+    }
+
+    /// Rebuilds a summary from [`Self::encode_into`] output. Refuses an unknown form, unsorted or repeated exact keys,
+    /// and trailing bytes.
+    pub fn decode(bytes: &[u8]) -> Result<Self, crate::error::FormatError> {
+        let malformed = crate::error::FormatError::Structural {
+            rule: "malformed entity summary",
+        };
+        let mut reader = crate::file::bytes::Reader::new(bytes);
+        let summary = match reader.u8("entity summary form")? {
+            0 => {
+                let count = reader.u32("entity summary key count")? as usize;
+                if count > reader.remaining() / 16 {
+                    return Err(malformed);
+                }
+                let mut keys = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let high = reader.u64("entity summary key")?;
+                    let low = reader.u64("entity summary key")?;
+                    keys.push(EntityKey::new(high, low));
+                }
+                if keys.windows(2).any(|pair| pair.first() >= pair.get(1)) {
+                    return Err(malformed);
+                }
+                Self::Exact { keys }
+            }
+            1 => {
+                let entity_count = reader.u64("entity summary entity count")?;
+                let len = reader.u32("entity summary filter length")? as usize;
+                let filter = reader.take(len, "entity summary filter")?.to_vec();
+                Self::Bloom { entity_count, filter }
+            }
+            _ => return Err(malformed),
+        };
+        if reader.remaining() != 0 {
+            return Err(malformed);
+        }
+        Ok(summary)
+    }
+}
+
+impl crate::layout::reader::OeFile {
+    /// The entity summary the writer stored in this file's footer, so a reader holding only the file recovers what
+    /// its manifest entry carries. `None` for a file written before the footer carried it (no `ENTITY_SUMMARY`
+    /// optional feature).
+    pub fn entity_summary(&self) -> Option<&EntitySummary> {
+        self.footer().entity_summary.as_ref()
+    }
+}
+
 impl OeFileEntry {
     /// Whether this file may hold events of the entity `key`, from the entry alone. `false` is certain and lets a
     /// planner skip the file; `true` may be wrong. Always `true` for an entry without an entity summary (written before
