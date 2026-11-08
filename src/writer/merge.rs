@@ -20,7 +20,9 @@
 
 use super::build::{BuildLifecycle, BuildRow, OeBuildConfig, OeRow, SharedStrings, build_oe_file};
 use super::compaction::rebuild_graph_input;
+use super::graph_renumber::{RenumberSource, renumber_graph};
 use super::publish::{OePublisher, PeerNotices, PublishFailure, Published};
+use super::retire::GraphRewriteOutput;
 use crate::artifacts::batch::{EventInput, PayloadInput};
 use crate::clock::Clock;
 use crate::columns::column_ids;
@@ -32,6 +34,7 @@ use crate::events::{EventEnvelope, EventFlags, EventId, StreamId, TimestampValue
 use crate::field_deletion_store::FieldRedactions;
 use crate::invariants::PublishedSet;
 use crate::layout::Profile;
+use crate::layout::graph::EdgeKind;
 use crate::layout::reader::{OeFile, PayloadRead};
 use crate::lifecycle::{CompactionJob, OeFileEntry, PartState};
 use crate::object_store::{ObjectStore, oe_object_key};
@@ -419,13 +422,16 @@ pub(crate) fn open_stored_input(
 /// follow on; they merge in event order with the graph rebuilt from them and every later `Active` file of the subject,
 /// and the output is a graph file whatever `config`'s profile.
 ///
-/// A graph input with a row-level deletion vector is refused. Dropping a row would renumber the subject's events, and
-/// that cannot be kept consistent within one compaction: a graph file addresses events by subject-wide event SN, the
-/// subject's later `Active` files (which this job does not rewrite) name parents in the merged range by those SNs, the
-/// output must cover the same contiguous SN range as its inputs ([`rebuild_graph_input`] refuses a gap), and the
-/// manifest entries of every later file record their SN ranges. Renumbering would mean rewriting every later file of
-/// the subject in the same generation; instead the deleted rows stay in the graph file and readers hide them through
-/// the deletion vector. A graph input's field-level redactions are applied, since they leave every row in place. Nothing is published when an input is missing, fails its seal,
+/// A graph input with a row-level deletion vector cannot simply drop its rows: a graph file addresses events by
+/// subject-wide event SN with no gaps, and the subject's later files name parents in the merged range by those SNs.
+/// So such a job renumbers instead (see [`super::graph_renumber`]): it rewrites the merged range *and* every later
+/// `Active` graph file of the subject - plus any earlier file whose inbound edges name renumbered children - with every
+/// deleted row of every rewritten file dropped, one old-to-new SN map applied to event SNs, edges, inbound edges,
+/// state roots, unresolved parents and `subject_sequence` relationships, and edges to a deleted event re-parented onto
+/// its nearest surviving ancestors. All outputs and the retirement of every rewritten file go out in one generation
+/// through [`OePublisher::publish_graph_rewrite`]; the returned publication is the merged output's. A rewrite that
+/// would leave some output with no surviving event is refused. A graph input's field-level redactions are applied in
+/// every case, since they leave every row in place. Nothing is published when an input is missing, fails its seal,
 /// or does not read back (see [`read_build_rows`]). The replaced inputs stay in the store until
 /// [`sweep_retired_files`](super::retire::sweep_retired_files) deletes them.
 pub fn execute_compaction(
@@ -501,13 +507,13 @@ pub fn execute_compaction(
             .map(|summary| summary.max_event_sn)
             .max()
             .unwrap_or(0);
+        if entries.iter().any(|entry| entry.deletion_vector.is_some()) {
+            return execute_graph_renumbering(
+                publisher, &head, &entries, &subject, end_sn, &config, published, objects, notices, clock,
+            );
+        }
         let mut sources = Vec::with_capacity(entries.len());
         for entry in &entries {
-            if entry.deletion_vector.is_some() {
-                return Err(PublishFailure::Verification(
-                    "a graph compaction input carries a deletion vector",
-                ));
-            }
             let file = open_stored_input(entry.file_id, &entry.file_seal, &config, objects)?;
             let redactions = entry.load_field_deletion_vectors().map_err(PublishFailure::Format)?;
             rows.extend(read_build_rows_redacted(&file, &redactions).map_err(PublishFailure::Format)?);
@@ -535,6 +541,157 @@ pub fn execute_compaction(
     }
     let built = build_oe_file(rows, &config).map_err(PublishFailure::Format)?;
     publisher.publish_compaction(built, &config, &job.file_ids, published, objects, notices, clock)
+}
+
+/// The graph compaction of `entries` (sorted by SN, one subject's files ending at `end_sn`) when an input carries a
+/// row deletion vector: renumbers the subject from the merged range (or from the earliest earlier file whose inbound
+/// edges name a child at or past it) to its last `Active` file, and publishes every rewritten file in one generation.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the compaction publish wires every interface exactly once"
+)]
+fn execute_graph_renumbering(
+    publisher: &mut OePublisher,
+    head: &crate::lifecycle::ManifestGeneration,
+    entries: &[&OeFileEntry],
+    subject: &[u8],
+    end_sn: u64,
+    config: &OeBuildConfig,
+    published: &mut dyn PublishedSet,
+    objects: &dyn ObjectStore,
+    notices: &mut dyn PeerNotices,
+    clock: &dyn Clock,
+) -> Result<Published, PublishFailure> {
+    let summary_of = |entry: &OeFileEntry| entry.graph_summary.clone();
+    let start_sn = entries
+        .first()
+        .and_then(|entry| summary_of(entry))
+        .map_or(0, |summary| summary.min_event_sn);
+    let mut subject_files: Vec<&OeFileEntry> = head
+        .files
+        .iter()
+        .filter(|entry| {
+            entry.tenant_id == config.tenant_id
+                && entry.part_state == PartState::Active
+                && entry
+                    .graph_summary
+                    .as_ref()
+                    .is_some_and(|summary| summary.subject == subject)
+        })
+        .collect();
+    subject_files.sort_by_key(|entry| entry.graph_summary.as_ref().map_or(0, |summary| summary.min_event_sn));
+    let min_sn = |entry: &OeFileEntry| entry.graph_summary.as_ref().map_or(0, |summary| summary.min_event_sn);
+    let max_sn = |entry: &OeFileEntry| entry.graph_summary.as_ref().map_or(0, |summary| summary.max_event_sn);
+    let later: Vec<&OeFileEntry> = subject_files
+        .iter()
+        .copied()
+        .filter(|entry| min_sn(entry) > end_sn)
+        .collect();
+    let earlier: Vec<&OeFileEntry> = subject_files
+        .iter()
+        .copied()
+        .filter(|entry| max_sn(entry) < start_sn)
+        .collect();
+
+    // An earlier file that lists a child at or past the first renumbered SN as an inbound edge must be rewritten too,
+    // and so must every file after it; repeat until no earlier file outside the region names a child inside it.
+    let mut region_start = start_sn;
+    let mut opened_earlier: Vec<Option<OeFile>> = earlier.iter().map(|_| None).collect();
+    loop {
+        let mut moved = false;
+        for (index, entry) in earlier.iter().enumerate() {
+            if min_sn(entry) >= region_start {
+                continue;
+            }
+            let Some(slot) = opened_earlier.get_mut(index) else {
+                continue;
+            };
+            if slot.is_none() {
+                *slot = Some(open_stored_input(entry.file_id, &entry.file_seal, config, objects)?);
+            }
+            let Some(file) = slot.as_ref() else {
+                continue;
+            };
+            if inbound_reaches(file, region_start).map_err(PublishFailure::Format)? {
+                region_start = min_sn(entry);
+                moved = true;
+            }
+        }
+        if !moved {
+            break;
+        }
+    }
+
+    let source = |entry: &OeFileEntry| -> Result<RenumberSource, PublishFailure> {
+        let file = open_stored_input(entry.file_id, &entry.file_seal, config, objects)?;
+        let deleted = entry
+            .load_deletion_vector_from(objects)
+            .map_err(PublishFailure::Format)?;
+        let redactions = entry.load_field_deletion_vectors().map_err(PublishFailure::Format)?;
+        let rows = read_build_rows_redacted(&file, &redactions).map_err(PublishFailure::Format)?;
+        Ok(RenumberSource { deleted, file, rows })
+    };
+    let mut groups: Vec<Vec<RenumberSource>> = Vec::new();
+    let mut group_inputs: Vec<Vec<u128>> = Vec::new();
+    for entry in earlier.iter().filter(|entry| min_sn(entry) >= region_start) {
+        groups.push(vec![source(entry)?]);
+        group_inputs.push(vec![entry.file_id]);
+    }
+    let merged_index = groups.len();
+    groups.push(entries.iter().map(|entry| source(entry)).collect::<Result<_, _>>()?);
+    group_inputs.push(entries.iter().map(|entry| entry.file_id).collect());
+    for entry in &later {
+        groups.push(vec![source(entry)?]);
+        group_inputs.push(vec![entry.file_id]);
+    }
+    let renumbered = renumber_graph(groups).map_err(PublishFailure::Format)?;
+    let mut outputs = Vec::with_capacity(renumbered.files.len());
+    for (file, inputs) in renumbered.files.into_iter().zip(group_inputs) {
+        let config = OeBuildConfig {
+            graph: Some(file.graph),
+            profile: Profile::Graph,
+            ..config.clone()
+        };
+        outputs.push(GraphRewriteOutput {
+            built: build_oe_file(file.rows, &config).map_err(PublishFailure::Format)?,
+            inputs,
+        });
+    }
+    let config = OeBuildConfig {
+        profile: Profile::Graph,
+        ..config.clone()
+    };
+    publisher
+        .publish_graph_rewrite(outputs, &config, published, objects, notices, clock)?
+        .into_iter()
+        .nth(merged_index)
+        .ok_or(PublishFailure::Verification(
+            "a graph rewrite publishes its merged output",
+        ))
+}
+
+/// Whether `file` records an inbound edge (a child in a later file) whose child is at or past `sn`.
+fn inbound_reaches(file: &OeFile, sn: u64) -> Result<bool, FormatError> {
+    let footer = file.footer();
+    let Some(directory) = footer.graph.as_ref() else {
+        return Ok(false);
+    };
+    let end = directory.first_sn.saturating_add(footer.exact_counts.row_count);
+    for granule in &footer.granules {
+        let edges = file.granule_edges(granule.granule_id)?;
+        let first = directory.first_sn + granule.first_row_ordinal;
+        for parent in first..first + u64::from(granule.row_count) {
+            for kind in [EdgeKind::Auth, EdgeKind::Prev] {
+                if edges
+                    .children_iter(parent, kind)
+                    .any(|child| child >= end && child >= sn)
+                {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]

@@ -607,3 +607,239 @@ fn compaction_applies_field_redactions_and_external_deletion_vectors() {
         assert_eq!(fields.get("body"), Some(&expected_body), "sequence {}", row.sequence);
     }
 }
+
+// --- A graph compaction with a deleted row renumbers the subject ------------------------------------------------------
+
+use crate::layout::graph::{EdgeKind, GraphInput, RowEdges};
+use crate::writer::build::BuildInput;
+
+const GRAPH_SUBJECT: &[u8] = b"!room:example.org";
+
+fn graph_id(old_sn: u64) -> Vec<u8> {
+    format!("${old_sn}:example.org").into_bytes()
+}
+
+/// One subject's graph events `first..end` (journal sequences `first + 1..=end`): each follows the one before (`prev`)
+/// and is authorised by event 0 (`auth`), declared as relationships and as edges, with `graph_id(sn)` as external id.
+fn graph_file(first: u64, end: u64) -> BuiltOe {
+    let mut rows = OeRow::into_build_rows(rows_of(first + 1..=end));
+    let mut graph = GraphInput {
+        first_sn: first,
+        subject: GRAPH_SUBJECT.to_vec(),
+        ..GraphInput::default()
+    };
+    for (sn, row) in (first..).zip(&mut rows) {
+        row.external_id = Some(graph_id(sn));
+        let mut refs = Vec::new();
+        let mut edges = RowEdges::default();
+        if sn > 0 {
+            refs.push(RelationshipRef::to_subject_sequence(RelationshipKind::Auth, 0));
+            refs.push(RelationshipRef::to_subject_sequence(RelationshipKind::Prev, sn - 1));
+            edges.auth.push(0);
+            edges.prev.push(sn - 1);
+        }
+        row.relationships = (!refs.is_empty()).then(|| EventRelationships::new(refs).unwrap());
+        graph.rows.push(edges);
+    }
+    let config = OeBuildConfig {
+        graph: Some(graph),
+        profile: Profile::Graph,
+        ..build_config()
+    };
+    build_oe_file(rows, &config).unwrap()
+}
+
+fn delete_rows(published: &mut SimulatedPublishedSet, file_id: u128, ordinals: &[u64]) {
+    let (head_id, mut head) = published.head().unwrap();
+    head.generation = head_id + 1;
+    head.footer_mirror = None;
+    let mut vector = crate::deletes::DeletionVector::new();
+    for &ordinal in ordinals {
+        vector.mark_deleted(ordinal);
+    }
+    assert!(head.publish_deletions(file_id, &vector, None).unwrap().is_some());
+    published.put_generation(head).unwrap();
+    published.advance_head(head_id, head_id + 1).unwrap();
+}
+
+fn compact(published: &mut SimulatedPublishedSet, objects: &SimObjectStore, file_ids: Vec<u128>) -> Published {
+    execute_compaction(
+        &mut OePublisher::default(),
+        &CompactionJob {
+            expected_output_bytes: 0,
+            file_ids,
+        },
+        &build_config(),
+        published,
+        objects,
+        &mut NoopPeerNotices::default(),
+        &FixedClock::at(START_NANOS),
+    )
+    .unwrap()
+}
+
+/// The subject's `Active` graph files in the head, in SN order, opened against their recorded seals.
+fn active_graph_files(published: &SimulatedPublishedSet, objects: &SimObjectStore) -> Vec<(OeFileEntry, OeFile)> {
+    let (_, head) = published.head().unwrap();
+    let mut entries: Vec<OeFileEntry> = head
+        .files
+        .iter()
+        .filter(|entry| entry.part_state == PartState::Active && entry.graph_summary.is_some())
+        .cloned()
+        .collect();
+    entries.sort_by_key(|entry| entry.graph_summary.as_ref().unwrap().min_event_sn);
+    entries
+        .into_iter()
+        .map(|entry| {
+            let stored = objects.get(&oe_object_key(tenant(), entry.file_id)).unwrap().unwrap();
+            let file = OeFile::open(stored.bytes, Some(&entry.file_seal)).unwrap();
+            (entry, file)
+        })
+        .collect()
+}
+
+/// Finds `sn` across `files` and returns `(parents, children)` of `kind`, children gathered from every file.
+fn edges_of(files: &[(OeFileEntry, OeFile)], sn: u64, kind: EdgeKind) -> (Vec<u64>, Vec<u64>) {
+    let (_, file) = files
+        .iter()
+        .find(|(entry, _)| {
+            let summary = entry.graph_summary.as_ref().unwrap();
+            (summary.min_event_sn..=summary.max_event_sn).contains(&sn)
+        })
+        .unwrap();
+    let edges = file.granule_edges(file.graph_granule_of(sn).unwrap()).unwrap();
+    (edges.parents(sn, kind).to_vec(), edges.children(sn, kind))
+}
+
+/// Checks the renumbered prev/auth chain over new SNs `0..count` held by `files`, whose surviving events had the old
+/// SNs `old_of[new]`.
+fn assert_chain(files: &[(OeFileEntry, OeFile)], old_of: &[u64]) {
+    let count = old_of.len() as u64;
+    for (new, &old) in (0..count).zip(old_of) {
+        let holder = files
+            .iter()
+            .find(|(entry, _)| {
+                let summary = entry.graph_summary.as_ref().unwrap();
+                (summary.min_event_sn..=summary.max_event_sn).contains(&new)
+            })
+            .unwrap();
+        // External ids still find their (renumbered) event, in the file that holds it.
+        assert_eq!(
+            holder.1.graph_sn_of(&graph_id(old)).unwrap(),
+            Some(new),
+            "id of old {old}"
+        );
+        let (prev, prev_children) = edges_of(files, new, EdgeKind::Prev);
+        let expected_prev: Vec<u64> = new.checked_sub(1).into_iter().collect();
+        assert_eq!(prev, expected_prev, "prev of {new}");
+        let expected_children: Vec<u64> = (new + 1 < count).then_some(new + 1).into_iter().collect();
+        assert_eq!(prev_children, expected_children, "prev children of {new}");
+        let (auth, auth_children) = edges_of(files, new, EdgeKind::Auth);
+        assert_eq!(auth, if new == 0 { vec![] } else { vec![0] }, "auth of {new}");
+        if new == 0 {
+            assert_eq!(auth_children, (1..count).collect::<Vec<_>>());
+        }
+        // The row's declared relationships follow the renumbering.
+        let row_ordinal = holder.1.graph_row_of(new).unwrap();
+        let row = read_build_rows(&holder.1).unwrap().remove(row_ordinal as usize);
+        let refs: Vec<RelationshipRef> = row.relationships.map(|r| r.refs().to_vec()).unwrap_or_default();
+        let mut expected = Vec::new();
+        if new > 0 {
+            expected.push(RelationshipRef::to_subject_sequence(RelationshipKind::Auth, 0));
+            expected.push(RelationshipRef::to_subject_sequence(RelationshipKind::Prev, new - 1));
+        }
+        assert_eq!(refs, expected, "relationships of {new}");
+    }
+}
+
+#[test]
+fn graph_compaction_with_a_deleted_mid_chain_event_renumbers_the_merged_range_and_later_files() {
+    let objects = SimObjectStore::new();
+    let mut published = SimulatedPublishedSet::new();
+    let (a, b, c) = (graph_file(0, 4), graph_file(4, 9), graph_file(9, 12));
+    publish_built(&a, 1, 4, &mut published, &objects);
+    publish_built(&b, 5, 9, &mut published, &objects);
+    publish_built(&c, 10, 12, &mut published, &objects);
+    // Delete event 5 (row 1 of the second file), in the middle of the chain.
+    delete_rows(&mut published, b.file_id, &[1]);
+
+    let output = compact(&mut published, &objects, vec![a.file_id, b.file_id]);
+    let summary = output.entry.graph_summary.clone().unwrap();
+    assert_eq!((summary.min_event_sn, summary.max_event_sn), (0, 7));
+    assert!(output.entry.deletion_vector.is_none());
+
+    // Every rewritten input is retired in the same generation, and the later file was rewritten.
+    let (_, head) = published.head().unwrap();
+    for id in [a.file_id, b.file_id, c.file_id] {
+        let entry = head.files.iter().find(|entry| entry.file_id == id).unwrap();
+        assert_eq!(entry.part_state, PartState::Outdated);
+        assert!(
+            head.retirements
+                .iter()
+                .any(|r| r.file_id == id && r.generation == output.generation)
+        );
+    }
+    let files = active_graph_files(&published, &objects);
+    assert_eq!(files.len(), 2);
+    let later = files[1].0.graph_summary.clone().unwrap();
+    assert_eq!((later.min_event_sn, later.max_event_sn), (8, 10));
+    assert_eq!(files[1].0.coverage.first_sequence, 10);
+    // The deleted event is gone; old 6 now follows old 4 directly (re-parented to its nearest surviving ancestor).
+    assert_eq!(files[0].1.graph_sn_of(&graph_id(5)).unwrap(), None);
+    assert_chain(&files, &[0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 11]);
+}
+
+#[test]
+fn graph_renumbering_rewrites_an_earlier_file_whose_inbound_edges_name_renumbered_children() {
+    let objects = SimObjectStore::new();
+    let mut published = SimulatedPublishedSet::new();
+    let (a, b, c) = (graph_file(0, 4), graph_file(4, 9), graph_file(9, 12));
+    publish_built(&a, 1, 4, &mut published, &objects);
+    publish_built(&b, 5, 9, &mut published, &objects);
+    publish_built(&c, 10, 12, &mut published, &objects);
+    // A clean merge first: the merged file records the third file's children as inbound edges.
+    let ab = compact(&mut published, &objects, vec![a.file_id, b.file_id]);
+    // Then delete the third file's first event (old 9) and compact that file alone.
+    delete_rows(&mut published, c.file_id, &[0]);
+    let output = compact(&mut published, &objects, vec![c.file_id]);
+    let summary = output.entry.graph_summary.clone().unwrap();
+    assert_eq!((summary.min_event_sn, summary.max_event_sn), (9, 10));
+
+    let (_, head) = published.head().unwrap();
+    let ab_entry = head
+        .files
+        .iter()
+        .find(|entry| entry.file_id == ab.entry.file_id)
+        .unwrap();
+    assert_eq!(
+        ab_entry.part_state,
+        PartState::Outdated,
+        "the earlier file was rewritten"
+    );
+    let files = active_graph_files(&published, &objects);
+    assert_eq!(files.len(), 2);
+    assert_chain(&files, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11]);
+}
+
+#[test]
+fn graph_renumbering_refuses_an_output_with_no_surviving_event() {
+    let objects = SimObjectStore::new();
+    let mut published = SimulatedPublishedSet::new();
+    let (a, b) = (graph_file(0, 4), graph_file(4, 6));
+    publish_built(&a, 1, 4, &mut published, &objects);
+    publish_built(&b, 5, 6, &mut published, &objects);
+    delete_rows(&mut published, b.file_id, &[0, 1]);
+    let result = execute_compaction(
+        &mut OePublisher::default(),
+        &CompactionJob {
+            expected_output_bytes: 0,
+            file_ids: vec![b.file_id],
+        },
+        &build_config(),
+        &mut published,
+        &objects,
+        &mut NoopPeerNotices::default(),
+        &FixedClock::at(START_NANOS),
+    );
+    assert!(matches!(result, Err(PublishFailure::Format(_))), "{result:?}");
+}

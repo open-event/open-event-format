@@ -16,6 +16,7 @@
 
 use super::*;
 use crate::deletes::DeletionVector;
+use crate::field_deletion_store::FieldRedactions;
 use crate::indexes::bitmap::{RoaringRangeBitmap, RowRange};
 use crate::indexes::bool_pruning::{FilterExpr, residual};
 use crate::indexes::external_id::ExternalIdLocation;
@@ -232,6 +233,10 @@ pub struct ScanRequest<'a> {
     /// Stop once this many rows survive.
     pub limit: Option<usize>,
     pub order: ScanOrder,
+    /// The file's field-level redactions: every projected column holding a redacted field reads as null at that row
+    /// (see [`OeFile::mask_redacted`]) before the row filter or the sink sees the batch, so a redacted value neither
+    /// matches a filter nor comes back.
+    pub redactions: Option<&'a FieldRedactions>,
     /// Only these file row ordinals are candidates; granules holding none are not read.
     pub selection: Option<&'a RoaringRangeBitmap>,
 }
@@ -360,10 +365,11 @@ impl OeFile {
                     rule: "a scanned granule yields one batch",
                 });
             }
-            for ((entry, candidates), batch) in chunk.into_iter().zip(batches) {
+            for ((entry, candidates), mut batch) in chunk.into_iter().zip(batches) {
                 if stored_limit_hit(stats.rows_returned) {
                     break;
                 }
+                self.mask_redacted(&mut batch, column_ids, request.redactions)?;
                 let first = entry.first_row_ordinal;
                 let mut keep: Vec<u32> = candidates
                     .iter()
@@ -488,6 +494,8 @@ impl OeFile {
 pub struct QueryInputs<'a> {
     pub bound: Option<&'a TopNBound>,
     pub deletions: Option<&'a DeletionVector>,
+    /// The file's field-level redactions, applied as [`ScanRequest::redactions`] applies them.
+    pub redactions: Option<&'a FieldRedactions>,
     /// Index hits (see [`OeFile::selection_for_external_ids`], [`OeFile::selection_for_entity_hash`] and
     /// [`OeFile::selection_for_thread`]); only these rows are candidates.
     pub selection: Option<&'a RoaringRangeBitmap>,
@@ -579,6 +587,7 @@ impl OeFile {
             deletions: inputs.deletions,
             limit: *limit,
             order: *order,
+            redactions: inputs.redactions,
             selection: inputs.selection,
         };
         self.scan_selective(
