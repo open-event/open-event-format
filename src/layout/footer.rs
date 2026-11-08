@@ -1574,29 +1574,41 @@ impl BitPacker {
 }
 
 /// Reads `width`-bit values packed by [`BitPacker`] from a slice already sized by the caller; never panics.
-struct BitUnpacker<'a> {
-    bytes: &'a [u8],
-    bit: usize,
-}
-
-impl BitUnpacker<'_> {
-    fn get(&mut self, width: u8) -> Result<u64, FormatError> {
-        let mut value = 0u64;
-        let mut filled = 0u32;
-        let width = u32::from(width);
-        while filled < width {
-            let byte = self.bytes.get(self.bit / 8).copied().ok_or(FormatError::Structural {
-                rule: "external id packed bits truncated",
-            })?;
-            let offset = (self.bit % 8) as u32;
-            let take = (8 - offset).min(width - filled);
-            let chunk = (u64::from(byte) >> offset) & ((1u64 << take) - 1);
-            value |= chunk << filled;
-            filled += take;
-            self.bit += take as usize;
+/// Unpacks `n` values of `width` bits (least-significant first) from `bytes`, handing each to `sink`. The input is
+/// copied once into a buffer padded by 16 zero bytes so every value is one unaligned 16-byte window load, a shift and
+/// a mask, with no per-value bounds branch beyond the slice lookup. `bytes` must hold exactly `ceil(n * width / 8)`
+/// bytes (the caller takes that many from the section), so nothing past the input is ever read as data.
+fn unpack_bits(bytes: &[u8], width: u8, n: usize, mut sink: impl FnMut(u64)) -> Result<(), FormatError> {
+    if width == 0 {
+        for _ in 0..n {
+            sink(0);
         }
-        Ok(value)
+        return Ok(());
     }
+    let width = usize::from(width);
+    if bytes.len() * 8 < n * width {
+        return Err(FormatError::Structural {
+            rule: "external id packed bits truncated",
+        });
+    }
+    let mut padded = Vec::with_capacity(bytes.len() + 16);
+    padded.extend_from_slice(bytes);
+    padded.resize(bytes.len() + 16, 0);
+    let mask = if width == 64 { u64::MAX } else { (1u64 << width) - 1 };
+    let mut bit = 0usize;
+    for _ in 0..n {
+        let start = bit / 8;
+        let window: [u8; 16] =
+            padded
+                .get(start..start + 16)
+                .and_then(|w| w.try_into().ok())
+                .ok_or(FormatError::Structural {
+                    rule: "external id packed bits truncated",
+                })?;
+        sink(((u128::from_le_bytes(window) >> (bit % 8)) as u64) & mask);
+        bit += width;
+    }
+    Ok(())
 }
 
 /// Packed external-id index (section `EXTERNAL_IDS_PACKED`):
@@ -1660,8 +1672,11 @@ pub fn decode_external_ids_packed(bytes: &[u8]) -> Result<Vec<ExternalIdEntry>, 
             rule: "external id count exceeds input",
         });
     }
-    let mut hashes = Vec::with_capacity(count);
-    hashes.push(hash);
+    let mut entries = Vec::with_capacity(count);
+    entries.push(ExternalIdEntry {
+        id_hash: hash,
+        row_ordinal: 0,
+    });
     let mut left = count - 1;
     while left > 0 {
         let n = left.min(EXTERNAL_ID_BLOCK);
@@ -1671,27 +1686,23 @@ pub fn decode_external_ids_packed(bytes: &[u8]) -> Result<Vec<ExternalIdEntry>, 
                 rule: "external id delta width exceeds 64",
             });
         }
-        let mut bits = BitUnpacker {
-            bytes: r.take(packed_len(n, width)?, "external id deltas")?,
-            bit: 0,
-        };
-        for _ in 0..n {
-            hash = hash.wrapping_add(bits.get(width)?);
-            hashes.push(hash);
-        }
+        let bytes = r.take(packed_len(n, width)?, "external id deltas")?;
+        unpack_bits(bytes, width, n, |delta| {
+            hash = hash.wrapping_add(delta);
+            entries.push(ExternalIdEntry {
+                id_hash: hash,
+                row_ordinal: 0,
+            });
+        })?;
         left -= n;
     }
-    let mut bits = BitUnpacker {
-        bytes: r.take(packed_len(count, ordinal_width)?, "external id rows")?,
-        bit: 0,
-    };
-    let mut entries = Vec::with_capacity(count);
-    for id_hash in hashes {
-        entries.push(ExternalIdEntry {
-            id_hash,
-            row_ordinal: bits.get(ordinal_width)?,
-        });
-    }
+    let bytes = r.take(packed_len(count, ordinal_width)?, "external id rows")?;
+    let mut slots = entries.iter_mut();
+    unpack_bits(bytes, ordinal_width, count, |row| {
+        if let Some(entry) = slots.next() {
+            entry.row_ordinal = row;
+        }
+    })?;
     if r.remaining() != 0 {
         return Err(FormatError::Structural {
             rule: "external id index has trailing bytes",
