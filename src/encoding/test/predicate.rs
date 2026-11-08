@@ -2131,3 +2131,39 @@ fn decoded_float_filters_agree_with_the_reference() {
         );
     }
 }
+
+/// A large, unsorted `IN` list with duplicates answers exactly as the per-value reference does, through the sorted
+/// binary-search path of the decoded filter and of every compressed kernel.
+#[test]
+fn large_string_in_lists_agree_with_the_per_value_reference() {
+    let mut needles: Vec<String> = (0..300).rev().map(|i| format!("id-{:05}", i * 3)).collect();
+    needles.extend(needles.clone());
+    needles.push("missing".to_owned());
+    needles.push("banana".to_owned());
+    let predicate = StringPredicate::InSet(needles);
+    for values in [high_cardinality(256), low_cardinality(256)] {
+        let column: StringColumn = values.clone().into();
+        let reference: Vec<bool> = column.iter().map(|value| predicate.matches_value(value)).collect();
+        assert_eq!(predicate.filter_decoded(&column), reference);
+        assert!(reference.iter().any(|matched| *matched) && reference.iter().any(|matched| !*matched));
+        for random_access in [true, false] {
+            check(&values, &predicate, random_access);
+        }
+    }
+    assert!(check(&high_cardinality(256), &predicate, true), "FSST answers the set from compressed bytes");
+}
+
+/// An integer `IN` list naming every value of a contiguous span, in any order and with repeats, is translated into one
+/// range check rather than a set of points.
+#[test]
+fn a_contiguous_integer_in_list_becomes_one_range_check() {
+    let set: Vec<i128> = (10..=60).rev().chain(20..30).collect();
+    let test = NativeRangeTest::translate(&NumericPredicate::InSet(set.clone()));
+    assert_eq!(test.ranges, vec![(10, 60)]);
+    assert!(!test.negate);
+    let gapped = NativeRangeTest::translate(&NumericPredicate::InSet(vec![1, 2, 3, 7, 8]));
+    assert_eq!(gapped.ranges, vec![(1, 3), (7, 8)]);
+    let values: Vec<u64> = (0..100).collect();
+    let mask = NumericPredicate::InSet(set).filter_decoded(&ColumnData::U64(values.clone()));
+    assert_eq!(mask, values.iter().map(|v| (10..=60).contains(v)).collect::<Vec<_>>());
+}

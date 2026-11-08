@@ -316,8 +316,24 @@ impl StringPredicate {
     /// Filters already-decoded values, one bool per row. This is the plain reference path the compressed-data kernels
     /// must agree with; it is also what a caller falls back to when no kernel applies.
     pub fn filter_decoded(&self, values: &StringColumn) -> Vec<bool> {
+        if let StringPredicate::InSet(needles) = self {
+            // Sorted and deduplicated once, so each row is one binary search rather than a walk of the whole list.
+            let set = sorted_needles(needles);
+            return values
+                .iter()
+                .map(|value| value.is_some_and(|value| set.binary_search(&value).is_ok()))
+                .collect();
+        }
         values.iter().map(|value| self.matches_value(value)).collect()
     }
+}
+
+/// `needles` sorted by byte order with duplicates removed, ready for binary search.
+fn sorted_needles(needles: &[String]) -> Vec<&str> {
+    let mut set: Vec<&str> = needles.iter().map(String::as_str).collect();
+    set.sort_unstable();
+    set.dedup();
+    set
 }
 
 /// Tries to answer `predicate` straight from an encoded string block, without decoding every row to text.
@@ -637,7 +653,9 @@ impl FsstTest {
     fn matches(&self, compressed: &[u8]) -> bool {
         match self {
             FsstTest::Equals(term) => compressed == term.as_slice(),
-            FsstTest::InSet(terms) => terms.iter().any(|term| term.as_slice() == compressed),
+            FsstTest::InSet(terms) => terms
+                .binary_search_by(|term| term.as_slice().cmp(compressed))
+                .is_ok(),
             FsstTest::NotEquals(term) => compressed != term.as_slice(),
         }
     }
@@ -652,12 +670,16 @@ fn filter_fsst(body: &[u8], predicate: &StringPredicate) -> Result<Vec<bool>, Fo
     let test = match predicate {
         StringPredicate::Equals(needle) => FsstTest::Equals(compressor.compress(needle.as_bytes())),
         StringPredicate::NotEquals(needle) => FsstTest::NotEquals(compressor.compress(needle.as_bytes())),
-        StringPredicate::InSet(needles) => FsstTest::InSet(
-            needles
+        StringPredicate::InSet(needles) => {
+            // Compressed once, then sorted and deduplicated so each row is a binary search over the terms.
+            let mut terms: Vec<Vec<u8>> = needles
                 .iter()
                 .map(|needle| compressor.compress(needle.as_bytes()))
-                .collect(),
-        ),
+                .collect();
+            terms.sort_unstable();
+            terms.dedup();
+            FsstTest::InSet(terms)
+        }
         StringPredicate::Contains(_) => {
             return Err(FormatError::Structural {
                 rule: "FSST substring predicates are answered by the arena kernel, not the equality kernel",

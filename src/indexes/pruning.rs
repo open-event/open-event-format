@@ -534,6 +534,72 @@ pub fn plan_query(query: &Query, declared: &GranuleStatistics) -> QueryPlan {
     }
 }
 
+/// A query's `IN (…)` list over an ordered column, sorted and deduplicated once so every later probe — a granule's
+/// min/max bounds, or a single value — is a binary search rather than a walk of the whole list.
+///
+/// A [`FilterClause`] summarises a membership list by its `[lo, hi]` envelope, which keeps a granule whose bounds sit
+/// in a gap between listed values; [`Self::judge_bounds`] drops it. A list that names every value of a contiguous span
+/// is exactly a range, so [`Self::clause`] turns it into a [`PredicateKind::Range`] clause.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MembershipList {
+    values: Vec<i128>,
+}
+
+impl MembershipList {
+    pub fn new(mut values: Vec<i128>) -> Self {
+        values.sort_unstable();
+        values.dedup();
+        Self { values }
+    }
+
+    /// The listed values, ascending and distinct.
+    pub fn values(&self) -> &[i128] {
+        &self.values
+    }
+
+    pub fn contains(&self, value: i128) -> bool {
+        self.values.binary_search(&value).is_ok()
+    }
+
+    /// Whether any listed value falls in the inclusive span `[lo, hi]`.
+    pub fn any_in(&self, lo: i128, hi: i128) -> bool {
+        if lo > hi {
+            return false;
+        }
+        let first_at_or_above = self.values.partition_point(|value| *value < lo);
+        self.values.get(first_at_or_above).is_some_and(|value| *value <= hi)
+    }
+
+    /// What a granule's `[min, max]` bounds conclude about the list: absent unless some listed value lies inside them.
+    pub fn judge_bounds(&self, min: i128, max: i128) -> StatVerdict {
+        if self.any_in(min, max) {
+            StatVerdict::CouldMatch
+        } else {
+            StatVerdict::ProvenAbsent
+        }
+    }
+
+    /// The clause this list contributes to a [`Filter`]: a `Range` over the span when the list covers it without a
+    /// gap, otherwise a `Membership` summarised by its envelope. `None` for an empty list, which matches nothing.
+    pub fn clause(&self, column_id: u32) -> Option<FilterClause> {
+        let (&value_lo, &value_hi) = (self.values.first()?, self.values.last()?);
+        let contiguous = value_hi
+            .checked_sub(value_lo)
+            .and_then(|span| span.checked_add(1))
+            .is_some_and(|span| span == self.values.len() as i128);
+        Some(FilterClause {
+            column_id,
+            predicate: if contiguous {
+                PredicateKind::Range
+            } else {
+                PredicateKind::Membership
+            },
+            value_hi,
+            value_lo,
+        })
+    }
+}
+
 /// Whether a page survives the filter: the same keep/drop verdict as `evaluate(&build_pruning_expression(filter,
 /// stats), stats)`, computed by borrowing instead of building and discarding an expression per page.
 ///

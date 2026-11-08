@@ -137,6 +137,68 @@ impl DeletionVector {
     }
 }
 
+impl DeletionVector {
+    /// How many of the `row_count` rows starting at `first_ordinal` are deleted: one binary search plus a walk of the
+    /// runs that overlap the span, never a look at each row.
+    pub fn deleted_in(&self, first_ordinal: u64, row_count: u32) -> u64 {
+        let past_last_ordinal = first_ordinal.saturating_add(u64::from(row_count));
+        let first_run = self.deleted_runs.partition_point(|run| run.end <= first_ordinal);
+        self.deleted_runs
+            .iter()
+            .skip(first_run)
+            .take_while(|run| run.start < past_last_ordinal)
+            .map(|run| run.end.min(past_last_ordinal) - run.start.max(first_ordinal))
+            .sum()
+    }
+
+    /// Which of a granule's `row_count` rows, starting at `first_ordinal`, a scan still serves once this vector's
+    /// deletions — and, when given, the `predicate` mask over the same rows — are applied. A granule this vector
+    /// deletes outright selects nothing whatever the predicate says, and one it leaves untouched with no predicate
+    /// selects everything, both decided from the runs without building a mask.
+    pub fn selection(&self, first_ordinal: u64, row_count: u32, predicate: Option<Vec<bool>>) -> RowSelection {
+        let deleted = self.deleted_in(first_ordinal, row_count);
+        if deleted >= u64::from(row_count) {
+            return RowSelection::None;
+        }
+        match predicate {
+            None if deleted == 0 => RowSelection::All,
+            None => {
+                let mut keep = vec![true; row_count as usize];
+                self.exclude_deleted(first_ordinal, &mut keep);
+                RowSelection::Some(keep)
+            }
+            Some(mut mask) => {
+                if deleted > 0 {
+                    self.exclude_deleted(first_ordinal, &mut mask);
+                }
+                RowSelection::from_mask(mask)
+            }
+        }
+    }
+}
+
+/// The rows of one granule a scan has to serve, after deletions and any predicate mask: none (the granule need not be
+/// decoded or projected at all), all (the filter step can be skipped), or the ones a keep mask flags.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RowSelection {
+    All,
+    None,
+    Some(Vec<bool>),
+}
+
+impl RowSelection {
+    /// Classifies a keep mask, so a mask that keeps every row or none is never applied row by row.
+    pub fn from_mask(mask: Vec<bool>) -> Self {
+        if !mask.contains(&true) {
+            RowSelection::None
+        } else if !mask.contains(&false) {
+            RowSelection::All
+        } else {
+            RowSelection::Some(mask)
+        }
+    }
+}
+
 impl Default for DeletionVector {
     fn default() -> Self {
         Self::new()

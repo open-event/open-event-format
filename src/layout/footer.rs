@@ -2474,7 +2474,7 @@ pub fn decode_footer(blob: &[u8]) -> Result<Footer, FormatError> {
         });
     }
 
-    Ok(Footer {
+    let footer = Footer {
         audit,
         clustering,
         columns,
@@ -2519,7 +2519,11 @@ pub fn decode_footer(blob: &[u8]) -> Result<Footer, FormatError> {
         text_token_offsets,
         time_series_rollups,
         vector_columns,
-    })
+    };
+    // Granule statistics drive pruning and scanning, so counts that overrun or undercount the file's rows are
+    // refused here, on every open path, rather than trusted.
+    crate::indexes::summary::validate_granule_row_counts(&footer)?;
+    Ok(footer)
 }
 
 /// Writes one `u64` field array with the format's own integer encodings — the same encoder a data column uses —

@@ -780,3 +780,41 @@ fn inline_statistics_match_their_vector_forms() {
         }
     }
 }
+
+/// A membership list is sorted and deduplicated once; probing it by binary search agrees with a linear scan, drops a
+/// granule whose bounds fall in a gap the list's envelope would keep, and a gap-free list becomes a range clause.
+#[test]
+fn membership_lists_prune_by_binary_search_and_contiguous_lists_become_ranges() {
+    let raw = vec![90, 10, 50, 10, 70, 30, 90];
+    let list = MembershipList::new(raw.clone());
+    assert_eq!(list.values(), &[10, 30, 50, 70, 90]);
+    for lo in 0..100 {
+        assert_eq!(list.contains(lo), raw.contains(&lo));
+        for hi in lo - 3..lo + 25 {
+            let linear = raw.iter().any(|value| (lo..=hi).contains(value));
+            assert_eq!(list.any_in(lo, hi), linear, "[{lo}, {hi}]");
+            let expected = if linear {
+                StatVerdict::CouldMatch
+            } else {
+                StatVerdict::ProvenAbsent
+            };
+            assert_eq!(list.judge_bounds(lo, hi), expected);
+        }
+    }
+    // Bounds [31, 49] sit inside the envelope [10, 90] but between listed values.
+    let envelope = list.clause(4).unwrap();
+    assert_eq!(envelope.predicate, PredicateKind::Membership);
+    assert_eq!((envelope.value_lo, envelope.value_hi), (10, 90));
+    let gap = Statistic::MinMaxBound {
+        column_id: 4,
+        max: 49,
+        min: 31,
+    };
+    assert_eq!(gap.judge(&envelope), StatVerdict::CouldMatch);
+    assert_eq!(list.judge_bounds(31, 49), StatVerdict::ProvenAbsent);
+
+    let contiguous = MembershipList::new((5..=20).rev().chain(7..9).collect()).clause(2).unwrap();
+    assert_eq!(contiguous, range_clause(2, 5, 20));
+    assert_eq!(MembershipList::new(vec![i128::MIN, i128::MAX]).clause(1).unwrap().predicate, PredicateKind::Membership);
+    assert_eq!(MembershipList::new(vec![]).clause(1), None);
+}

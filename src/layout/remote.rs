@@ -352,6 +352,10 @@ impl RemoteFile {
     /// stripe) this reader does not already hold, in file order, joining the pieces of one stripe that sit within
     /// [`GRAPH_FETCH_GAP_BYTES`] of each other while the joined piece stays within [`GRAPH_FETCH_WINDOW_BYTES`]. A
     /// piece the shared cache holds and still proves is held at once instead of planned.
+    ///
+    /// The cache is consulted for each piece *before* it is joined to its neighbours: the cache keys a piece by the
+    /// exact range an earlier reader fetched, so once a cached piece is folded into a larger joined one its key no
+    /// longer matches and its bytes would be fetched again.
     fn plan_prefetch(&self, ranges: &[(u64, u64)]) -> Result<Vec<VerifiedStripeRead>, FormatError> {
         let mut wanted: Vec<(u64, u64)> = ranges
             .iter()
@@ -361,12 +365,19 @@ impl RemoteFile {
         wanted.sort_unstable();
         let mut pieces: Vec<VerifiedStripeRead> = Vec::new();
         for (start, end) in wanted {
+            // An earlier range's cache hit may already cover this one.
+            if self.held.find(start, end).is_some() {
+                continue;
+            }
             let stripe = self.stripe_holding(start, end).ok_or(FormatError::RefOutOfRange {
                 what: "remote read outside any one stripe",
             })?;
             let plan =
                 self.footer
                     .plan_verified_stripe_read(stripe.stripe_id, start - stripe.file_offset, end - start)?;
+            if self.hold_cached(&plan)? {
+                continue;
+            }
             let plan_end = plan.file_offset + plan.length;
             if let Some(last) = pieces.last_mut()
                 && last.stripe_id == plan.stripe_id

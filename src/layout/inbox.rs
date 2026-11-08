@@ -10,12 +10,13 @@
 //! See: oe-file-layout/spec.md
 
 use super::entity_scan::{DeletesAndCorrections, EntityEvent};
-use super::event::read_u64s;
 use super::footer::{GranuleEntry, InboxRecipientEntry};
 use super::optional_features;
-use super::reader::{OeFile, granules_overlapping_rows};
+use super::reader::scan::ScanColumn;
+use super::reader::{ColumnRead, OeFile, granules_overlapping_rows};
 use crate::columns::column_ids;
-use crate::deletes::DeletionVector;
+use crate::deletes::{DeletionVector, RowSelection};
+use crate::encoding::ColumnData;
 use crate::error::{FormatError, InboxError};
 use crate::events::{EventEnvelope, SequencePoint, TenantId};
 use std::vec::IntoIter;
@@ -134,33 +135,76 @@ fn read_rows(
     deleted: Option<&DeletionVector>,
     out: &mut Vec<EntityEvent>,
 ) -> Result<(), FormatError> {
-    for granule in granules {
-        let rows = granule.row_count as usize;
-        let epochs = read_u64s(file, column_ids::EPOCH, granule.granule_id, rows)?;
-        let sequences = read_u64s(file, column_ids::SEQUENCE, granule.granule_id, rows)?;
-        let lows = read_u64s(file, column_ids::ENTITY_ID_HASH_LOW, granule.granule_id, rows)?;
-        let highs = read_u64s(file, column_ids::ENTITY_ID_HASH_HIGH, granule.granule_id, rows)?;
+    // The key columns come through the live scan: a granule the deletion vector empties is never decoded, and one it
+    // leaves untouched needs no per-row deletion test.
+    let no_deletes = DeletionVector::new();
+    let granule_ids: Vec<u32> = granules.iter().map(|granule| granule.granule_id).collect();
+    let columns = [
+        column_ids::EPOCH,
+        column_ids::SEQUENCE,
+        column_ids::ENTITY_ID_HASH_LOW,
+        column_ids::ENTITY_ID_HASH_HIGH,
+    ];
+    file.scan_projected_serial_live(&columns, &granule_ids, deleted.unwrap_or(&no_deletes), |batch, selection| {
+        let rows = batch.row_count as usize;
+        let first_row_ordinal = file
+            .footer()
+            .granules
+            .iter()
+            .find(|granule| granule.granule_id == batch.granule_id)
+            .map(|granule| granule.first_row_ordinal)
+            .ok_or(FormatError::RefOutOfRange {
+                what: "scanned granule missing from the granule directory",
+            })?;
+        let [epochs, sequences, lows, highs] = <[Vec<u64>; 4]>::try_from(
+            batch
+                .columns
+                .into_iter()
+                .map(|column| scanned_u64s(column, rows))
+                .collect::<Result<Vec<_>, _>>()?,
+        )
+        .map_err(|_| FormatError::Structural {
+            rule: "a scan batch holds one block per projected column",
+        })?;
         let mut envelopes = None;
         let keys = epochs.iter().zip(&sequences).zip(lows.iter().zip(&highs));
         for (row_in_granule, ((&epoch, &sequence), (&low, &high))) in keys.enumerate() {
             let point = SequencePoint { epoch, sequence };
-            let row_ordinal = granule.first_row_ordinal + row_in_granule as u64;
-            if low != recipient.entity_id_hash_low
+            let row_ordinal = first_row_ordinal + row_in_granule as u64;
+            let live = match &selection {
+                RowSelection::All => true,
+                RowSelection::None => false,
+                RowSelection::Some(keep) => keep.get(row_in_granule).copied().unwrap_or(false),
+            };
+            if !live
+                || low != recipient.entity_id_hash_low
                 || high != recipient.entity_id_hash_high
                 || acked.is_some_and(|acked| point <= acked)
-                || deleted.is_some_and(|vector| vector.is_deleted(row_ordinal))
             {
                 continue;
             }
-            let envelope = take_envelope(file, granule.granule_id, &mut envelopes, row_in_granule)?;
+            let envelope = take_envelope(file, batch.granule_id, &mut envelopes, row_in_granule)?;
             out.push(EntityEvent {
                 envelope,
                 payload: file.payload(row_ordinal)?,
                 point,
             });
         }
+        Ok(())
+    })
+}
+
+/// A scanned key column's values, one `u64` per row.
+fn scanned_u64s(column: ScanColumn, rows: usize) -> Result<Vec<u64>, FormatError> {
+    match column {
+        ScanColumn::Materialized(ColumnRead {
+            data: ColumnData::U64(values),
+            ..
+        }) if values.len() == rows => Ok(values),
+        _ => Err(FormatError::Structural {
+            rule: "an envelope column holds one u64 per row",
+        }),
     }
-    Ok(())
 }
 
 /// Moves row `row_in_granule`'s envelope out of its granule, decoding the whole granule the first time a row of it is

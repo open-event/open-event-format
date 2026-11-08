@@ -84,8 +84,56 @@ impl ManifestSummary {
                 rule: "summary coverage inverted with non-zero counts",
             });
         }
+        // Every granule holds at least one row, so the counts must agree: rows without granules, or more granules
+        // than rows, is a summary that cannot describe any file.
+        if (summary.granule_count == 0) != (summary.row_count == 0)
+            || summary.row_count < u64::from(summary.granule_count)
+        {
+            return Err(FormatError::Structural {
+                rule: "summary row count disagrees with its granule count",
+            });
+        }
         Ok(summary)
     }
+
+    /// Checks this summary against the footer of the file it claims to describe: its granule count must match the
+    /// granule directory, and its row count must match both the footer's exact count and the sum of the granules' row
+    /// counts. A summary that overruns or undercounts the file's rows is a structural error, not a pruning hint.
+    pub fn validate_against_footer(&self, footer: &Footer) -> Result<(), FormatError> {
+        validate_granule_row_counts(footer)?;
+        if usize::try_from(self.granule_count).ok() != Some(footer.granules.len())
+            || self.row_count != footer.exact_counts.row_count
+        {
+            return Err(FormatError::Structural {
+                rule: "summary counts disagree with the footer",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Checks that a footer's granule directory accounts for exactly its exact row count, with no empty granule and no
+/// granule whose rows overrun the file.
+pub fn validate_granule_row_counts(footer: &Footer) -> Result<(), FormatError> {
+    let mut total: u64 = 0;
+    for granule in &footer.granules {
+        if granule.row_count == 0 {
+            return Err(FormatError::Structural {
+                rule: "granule statistics cover no rows",
+            });
+        }
+        total = total
+            .checked_add(u64::from(granule.row_count))
+            .ok_or(FormatError::Structural {
+                rule: "granule row counts overflow",
+            })?;
+    }
+    if total != footer.exact_counts.row_count {
+        return Err(FormatError::Structural {
+            rule: "granule row counts disagree with the file row count",
+        });
+    }
+    Ok(())
 }
 
 /// Derives a [`ManifestSummary`] from a real file footer, showing that the summary is a copy of footer metadata and
