@@ -336,9 +336,9 @@ fn the_packed_string_offsets_bit_is_known_but_declared_only_by_files_that_use_it
     assert_eq!(required_features::PACKED_STRING_OFFSETS, 1 << 33);
     assert_eq!(required_features::PACKED_STRING_OFFSETS & required_features::ALL, 0);
     assert_eq!(required_features::PACKED_STRING_OFFSETS & !required_features::KNOWN, 0);
-    // Bit 35 belongs to a feature this reader does not implement, so a file declaring it is refused.
-    assert_eq!((1u64 << 35) & required_features::KNOWN, 0);
-    assert!(crate::compat::check_features(1 << 35, 0).is_err());
+    // Bit 37 belongs to a feature this reader does not implement, so a file declaring it is refused.
+    assert_eq!((1u64 << 37) & required_features::KNOWN, 0);
+    assert!(crate::compat::check_features(1 << 37, 0).is_err());
     assert!(crate::compat::check_features(required_features::PACKED_STRING_OFFSETS, 0).is_ok());
 }
 

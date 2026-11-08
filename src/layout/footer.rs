@@ -128,6 +128,10 @@ pub mod sections {
     /// Optional: the file's external-id index in its packed form (see [`encode_external_ids_packed`]). Writers emit
     /// it in place of the legacy fixed-width `EXTERNAL_IDS` section; readers accept either.
     pub const EXTERNAL_IDS_PACKED: u32 = 43;
+    /// Optional: the file's external-id index keyed on 32-bit hashes (see [`encode_external_ids_32`]). Writers emit
+    /// it when every entry's hash is truncated to its high 32 bits; a file carrying it declares the
+    /// `EXTERNAL_ID_INDEX_32` required feature, since a reader that ignored it would silently find no id.
+    pub const EXTERNAL_IDS_32: u32 = 44;
 }
 
 /// Logical column kind codes (stored in the column directory).
@@ -343,7 +347,9 @@ pub struct StateRootEntry {
 
 /// One row's entry in the file's external-id index: a stable hash of the id and the row that carries it. The footer
 /// keeps the entries sorted by `(id_hash, row_ordinal)`, so finding an id is a binary search; two ids can share a
-/// hash, so a reader confirms every hit against the stored id before answering.
+/// hash, so a reader confirms every hit against the stored id before answering. Lookups compare only the high 32
+/// bits ([`ExternalIdEntry::key`]): current writers store the hash truncated to them (low 32 bits zero), and an
+/// older file's full hashes, sorted by the full value, are sorted by the high bits too.
 ///
 /// See: oe-query-metadata-and-indexes/spec.md
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -351,6 +357,18 @@ pub struct ExternalIdEntry {
     /// [`stable_hash`](crate::indexes::stable_hash) of the id's bytes.
     pub id_hash: u64,
     pub row_ordinal: u64,
+}
+
+impl ExternalIdEntry {
+    /// The 32-bit lookup key: the high half of `id_hash`.
+    pub fn key(&self) -> u32 {
+        (self.id_hash >> 32) as u32
+    }
+
+    /// The index hash current writers store for an id hash: its high 32 bits, low 32 bits zero.
+    pub fn truncated_hash(id_hash: u64) -> u64 {
+        id_hash & !0xFFFF_FFFF
+    }
 }
 
 /// One recipient's rows in an inbox file: where they start, how many there are, and the newest queue position among
@@ -1267,9 +1285,17 @@ fn encode_sections(footer: &Footer) -> SectionArea {
 
     // The external-id index: optional, emitted only when some row carries an external id.
     if !footer.external_ids.is_empty() {
-        sections.push(sections::EXTERNAL_IDS_PACKED, |out| {
-            encode_external_ids_packed(&footer.external_ids, out);
-        });
+        // Truncated hashes (every writer since `EXTERNAL_ID_INDEX_32`) take the 32-bit form; full hashes, which only
+        // a footer built by hand or by an older writer holds, keep the lossless 64-bit form.
+        if footer.external_ids.iter().all(|e| e.id_hash & 0xFFFF_FFFF == 0) {
+            sections.push(sections::EXTERNAL_IDS_32, |out| {
+                encode_external_ids_32(&footer.external_ids, out);
+            });
+        } else {
+            sections.push(sections::EXTERNAL_IDS_PACKED, |out| {
+                encode_external_ids_packed(&footer.external_ids, out);
+            });
+        }
     }
 
     // The inbox recipient directory: optional, emitted only for an inbox file.
@@ -1694,6 +1720,105 @@ pub fn decode_external_ids_packed(bytes: &[u8]) -> Result<Vec<ExternalIdEntry>, 
                 row_ordinal: 0,
             });
         })?;
+        left -= n;
+    }
+    let bytes = r.take(packed_len(count, ordinal_width)?, "external id rows")?;
+    let mut slots = entries.iter_mut();
+    unpack_bits(bytes, ordinal_width, count, |row| {
+        if let Some(entry) = slots.next() {
+            entry.row_ordinal = row;
+        }
+    })?;
+    if r.remaining() != 0 {
+        return Err(FormatError::Structural {
+            rule: "external id index has trailing bytes",
+        });
+    }
+    Ok(entries)
+}
+
+/// 32-bit external-id index (section `EXTERNAL_IDS_32`): the layout of [`encode_external_ids_packed`] with every
+/// hash replaced by its high 32 bits ([`ExternalIdEntry::key`]): `count u32`, then when `count > 0`:
+/// `ordinal_width u8 | first_key u32`, then the `count - 1` key deltas in blocks of 128 as `width u8 |
+/// ceil(n * width / 8) bytes` (width at most 32), then all row ordinals packed at `ordinal_width` bits. Keys are
+/// non-decreasing, so deltas never wrap. The caller keeps entries sorted by key; low hash bits are dropped.
+pub fn encode_external_ids_32(entries: &[ExternalIdEntry], out: &mut Writer) {
+    out.put_u32(entries.len() as u32);
+    let Some(first) = entries.first() else {
+        return;
+    };
+    let max_ordinal = entries.iter().map(|entry| entry.row_ordinal).max().unwrap_or(0);
+    let ordinal_width = bit_width(max_ordinal);
+    out.put_u8(ordinal_width);
+    out.put_u32(first.key());
+    let deltas: Vec<u64> = entries
+        .windows(2)
+        .map(|pair| match pair {
+            [a, b] => u64::from(b.key().wrapping_sub(a.key())),
+            _ => 0,
+        })
+        .collect();
+    for block in deltas.chunks(EXTERNAL_ID_BLOCK) {
+        let width = block.iter().copied().map(bit_width).max().unwrap_or(0);
+        out.put_u8(width);
+        let mut packer = BitPacker::new();
+        for &delta in block {
+            packer.put(delta, width);
+        }
+        out.put_slice(&packer.finish());
+    }
+    let mut packer = BitPacker::new();
+    for entry in entries {
+        packer.put(entry.row_ordinal, ordinal_width);
+    }
+    out.put_slice(&packer.finish());
+}
+
+/// Decodes [`encode_external_ids_32`] into entries whose `id_hash` holds the key in its high 32 bits. Refuses
+/// truncated input, a delta width above 32, an ordinal width above 64, keys past 32 bits, and trailing bytes.
+pub fn decode_external_ids_32(bytes: &[u8]) -> Result<Vec<ExternalIdEntry>, FormatError> {
+    let mut r = Reader::new(bytes);
+    let count = r.u32("external id count")? as usize;
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let ordinal_width = r.u8("external id ordinal width")?;
+    let mut key = u64::from(r.u32("external id first key")?);
+    // Each delta block costs at least its width byte, so the block count bounds the entry count before allocating.
+    let blocks = (count - 1).div_ceil(EXTERNAL_ID_BLOCK);
+    if blocks > r.remaining() || ordinal_width > 64 {
+        return Err(FormatError::Structural {
+            rule: "external id count exceeds input",
+        });
+    }
+    let mut entries = Vec::with_capacity(count);
+    entries.push(ExternalIdEntry {
+        id_hash: key << 32,
+        row_ordinal: 0,
+    });
+    let mut left = count - 1;
+    while left > 0 {
+        let n = left.min(EXTERNAL_ID_BLOCK);
+        let width = r.u8("external id delta width")?;
+        if width > 32 {
+            return Err(FormatError::Structural {
+                rule: "external id key delta width exceeds 32",
+            });
+        }
+        let bytes = r.take(packed_len(n, width)?, "external id deltas")?;
+        // Every delta is below 2^32 and the key is checked after each block, so the u64 sum cannot overflow.
+        unpack_bits(bytes, width, n, |delta| {
+            key += delta;
+            entries.push(ExternalIdEntry {
+                id_hash: key << 32,
+                row_ordinal: 0,
+            });
+        })?;
+        if key > u64::from(u32::MAX) {
+            return Err(FormatError::Structural {
+                rule: "external id key exceeds 32 bits",
+            });
+        }
         left -= n;
     }
     let bytes = r.take(packed_len(count, ordinal_width)?, "external id rows")?;
@@ -2294,7 +2419,9 @@ pub fn decode_footer(blob: &[u8]) -> Result<Footer, FormatError> {
 
     // The external-id index: optional. The packed form wins; the legacy fixed 16-byte-entry form still opens.
     let mut external_ids = Vec::new();
-    if let Some(index_bytes) = decode_section(&directory, section_area, sections::EXTERNAL_IDS_PACKED)? {
+    if let Some(index_bytes) = decode_section(&directory, section_area, sections::EXTERNAL_IDS_32)? {
+        external_ids = decode_external_ids_32(index_bytes)?;
+    } else if let Some(index_bytes) = decode_section(&directory, section_area, sections::EXTERNAL_IDS_PACKED)? {
         external_ids = decode_external_ids_packed(index_bytes)?;
     } else if let Some(index_bytes) = decode_section(&directory, section_area, sections::EXTERNAL_IDS)? {
         let mut r = Reader::new(index_bytes);

@@ -60,16 +60,18 @@ impl OeFile {
     /// Hands `found` every row that holds `external_id`, in row order, confirming each index candidate against the
     /// stored id. One decode buffer serves every candidate, so a lookup allocates no per-candidate id.
     fn for_each_row_with_external_id(&self, external_id: &[u8], mut found: impl FnMut(u64)) -> Result<(), FormatError> {
-        let id_hash = stable_hash(external_id);
+        // The index keys on the hash's high 32 bits (an older file's full hashes are sorted by them all the same), so
+        // ids that share those bits are all candidates and confirmation tells them apart.
+        let key = (stable_hash(external_id) >> 32) as u32;
         let entries = &self.footer().external_ids;
-        let first = entries.partition_point(|entry| entry.id_hash < id_hash);
+        let first = entries.partition_point(|entry| entry.key() < key);
         let elision = self.external_id_elision_declared();
         let mut decoded = Vec::new();
         for entry in entries
             .get(first..)
             .unwrap_or_default()
             .iter()
-            .take_while(|entry| entry.id_hash == id_hash)
+            .take_while(|entry| entry.key() == key)
         {
             // Two ids can share a hash, so every candidate is confirmed against the stored id.
             let matches = self.with_source_form_text(column_ids::EXTERNAL_ID, entry.row_ordinal, |stored| {

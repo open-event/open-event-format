@@ -43,7 +43,7 @@ impl SourceFormIndexes {
     /// relationship reference.
     pub(crate) fn from_footer(footer: &Footer) -> Self {
         Self {
-            external_ids: footer.external_ids.clone(),
+            external_ids: truncate_external_ids(footer.external_ids.clone()),
             reference_filters: footer.reference_filters.clone(),
             elides_event_ids: footer.required_feature_flags & required_features::EXTERNAL_ID_EVENT_ID_ELISION != 0,
         }
@@ -207,14 +207,24 @@ fn column_block(rows: &[BuildRow], column_id: u32) -> Result<SourceFormBlock, Fo
     Ok((column_id, presence, ColumnData::Strings(values)))
 }
 
-/// Every row's external id as a sorted `(id hash, row ordinal)` index.
+/// Truncates every entry to the 32-bit key the index stores and re-sorts, so a footer carried over from an older file
+/// (full 64-bit hashes) is written in the current form.
+fn truncate_external_ids(mut entries: Vec<ExternalIdEntry>) -> Vec<ExternalIdEntry> {
+    for entry in &mut entries {
+        entry.id_hash = ExternalIdEntry::truncated_hash(entry.id_hash);
+    }
+    entries.sort_unstable_by_key(|entry| (entry.id_hash, entry.row_ordinal));
+    entries
+}
+
+/// Every row's external id as a sorted `(id hash, row ordinal)` index; each hash keeps only its high 32 bits.
 fn external_id_index(rows: &[BuildRow]) -> Vec<ExternalIdEntry> {
     let mut entries: Vec<ExternalIdEntry> = rows
         .iter()
         .enumerate()
         .filter_map(|(ordinal, row)| {
             row.external_id.as_ref().map(|id| ExternalIdEntry {
-                id_hash: stable_hash(id),
+                id_hash: ExternalIdEntry::truncated_hash(stable_hash(id)),
                 row_ordinal: ordinal as u64,
             })
         })
