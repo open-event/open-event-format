@@ -272,3 +272,18 @@ fn take_rejects_truncated_fsst_body() {
     assert!(take_block_rows(block.pipeline, cut, &[499]).is_err());
     assert!(fsst_uncompressed_len(block.pipeline, cut).is_err());
 }
+
+#[test]
+fn take_matches_full_decode_for_for_bitpack() {
+    let u: Vec<u64> = (0..5000u64).map(|row| 1_000 + (row * 7919) % 613).collect();
+    let i: Vec<i64> = (0..5000i64).map(|row| (row * 7919) % 613 - 300).collect();
+    for data in [ColumnData::U64(u), ColumnData::I64(i)] {
+        let block = forced(&data, Transform::ForBitpack);
+        let rows = sample_rows(5000);
+        assert_eq!(
+            take_block_rows(block.pipeline, &block.bytes, &rows).unwrap(),
+            oracle_gather(&data, &rows)
+        );
+        assert!(take_block_rows(block.pipeline, &block.bytes, &[5000]).is_err());
+    }
+}
