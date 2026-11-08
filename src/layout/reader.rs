@@ -62,6 +62,9 @@ use zeekstd::SeekTable;
 pub mod scan;
 pub use scan::*;
 
+#[path = "query_scan.rs"]
+pub mod query_scan;
+
 /// Concatenates two `ColumnData` values of the same variant. Returns an error when the variants differ (a structural
 /// violation — multi-page marks within one granule always encode the same column type).
 fn concat_column_data(a: ColumnData, b: ColumnData) -> Result<ColumnData, FormatError> {
