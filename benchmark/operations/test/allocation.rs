@@ -182,6 +182,7 @@ fn config() -> OeBuildConfig {
         analytical_columns: Vec::new(),
         audit: None,
         created_at_physical: 1_000_000,
+        delivery_lineage: false,
         footer_dek: None,
         footer_encryption: FooterEncryption::Plaintext,
         freetext: FreetextDeclaration {
