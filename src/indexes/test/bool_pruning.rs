@@ -128,3 +128,77 @@ fn conjunction_matches_flat_filter() {
         assert_eq!(drops_granule(&FilterExpr::from(flat.clone()), &granule.stats), expected);
     }
 }
+
+fn in_list(column_id: u32, values: &[i128]) -> FilterExpr {
+    FilterExpr::In(InList::new(
+        column_id,
+        crate::indexes::pruning::MembershipList::new(values.to_vec()),
+    ))
+}
+
+/// IN lists inside AND/OR trees prune by gap checks and row-test by binary search, matching a naive scan, and a
+/// granule inside an IN list's envelope but between its values is dropped.
+#[test]
+fn in_lists_in_boolean_trees_match_naive_scan() {
+    let exprs = vec![
+        in_list(1, &[3, 77, 150]),
+        in_list(1, &[]),
+        FilterExpr::Or(vec![in_list(1, &[5, 199]), in_list(2, &[13, 41])]),
+        FilterExpr::And(vec![in_list(2, &[0, 7, 21, 35, 49]), range(1, 20, 120)]),
+        FilterExpr::Or(vec![
+            FilterExpr::And(vec![in_list(1, &[12, 13, 14, 15]), range(2, 0, 30)]),
+            in_list(1, &[1000, -4]),
+        ]),
+    ];
+    let granules = granules();
+    for expr in &exprs {
+        let naive: Vec<(i128, i128)> = granules
+            .iter()
+            .flat_map(|granule| granule.rows.iter().copied())
+            .filter(|&row| {
+                expr.matches_row(&mut |clause| {
+                    let value = if clause.column_id == 1 { row.0 } else { row.1 };
+                    value >= clause.value_lo && value <= clause.value_hi
+                })
+            })
+            .collect();
+        let mut pruned = Vec::new();
+        for granule in &granules {
+            if let Some(rest) = residual(expr, &granule.stats) {
+                pruned.extend(granule.rows.iter().copied().filter(|&row| row_matches(&rest, row)));
+            }
+        }
+        assert_eq!(pruned, naive, "{expr:?}");
+    }
+    // A linear membership test over the raw rows agrees with the binary-search row test.
+    let all: Vec<(i128, i128)> = granules.iter().flat_map(|g| g.rows.iter().copied()).collect();
+    let linear: Vec<(i128, i128)> = all
+        .iter()
+        .copied()
+        .filter(|row| [3, 77, 150].contains(&row.0))
+        .collect();
+    let searched: Vec<(i128, i128)> = all.iter().copied().filter(|&row| row_matches(&exprs[0], row)).collect();
+    assert_eq!(searched, linear);
+    // [3, 150]'s envelope keeps every granule from 0 to 15; the gap check keeps only those holding a listed value.
+    let stats: Vec<GranuleStatistics> = granules.iter().map(|granule| granule.stats.clone()).collect();
+    assert_eq!(prune_granules(&exprs[0], &stats), vec![0, 7, 15]);
+    assert!(prune_granules(&exprs[1], &stats).is_empty());
+}
+
+/// A flat filter carrying an IN list converts to an `In` leaf and back, and both paths prune alike.
+#[test]
+fn filter_in_list_round_trips_through_expr() {
+    let flat = Filter::new(vec![FilterClause {
+        column_id: 2,
+        predicate: crate::indexes::pruning::PredicateKind::Range,
+        value_hi: 30,
+        value_lo: 0,
+    }])
+    .with_in_list(1, vec![150, 3, 77]);
+    let expr = FilterExpr::from(flat.clone());
+    assert_eq!(expr.as_conjunction(), Some(flat.clone()));
+    for granule in granules() {
+        let expected = evaluate(&build_pruning_expression(&flat, &granule.stats), &granule.stats).drop;
+        assert_eq!(drops_granule(&expr, &granule.stats), expected);
+    }
+}

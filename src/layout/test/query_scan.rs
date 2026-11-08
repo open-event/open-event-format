@@ -340,8 +340,8 @@ fn time_order_without_occurred_at_is_refused() {
     assert!(result.is_err());
 }
 
-use crate::indexes::bool_pruning::{ExprQuery, plan_expr_query};
-use crate::indexes::pruning::{Filter, PredicateKind, Query};
+use crate::indexes::bool_pruning::ExprQuery;
+use crate::indexes::pruning::{Filter, PredicateKind, Query, plan_query};
 
 fn clause(column_id: u32, predicate: PredicateKind, lo: i128, hi: i128) -> FilterExpr {
     FilterExpr::Clause(FilterClause {
@@ -382,7 +382,7 @@ fn naive_full(file: &OeFile) -> Vec<(i64, u64, u64)> {
         .collect()
 }
 
-fn execute(file: &OeFile, plan: &ExprQueryPlan, inputs: &QueryInputs<'_>) -> (Vec<u64>, SelectiveScanStats) {
+fn execute(file: &OeFile, plan: &QueryPlan, inputs: &QueryInputs<'_>) -> (Vec<u64>, SelectiveScanStats) {
     let mut rows = Vec::new();
     let stats = file
         .execute_query(
@@ -426,12 +426,15 @@ fn or_query_prunes_granules_and_matches_naive() {
         (Some(6), ScanOrder::TimeDescending),
         (Some(9), ScanOrder::Stored),
     ] {
-        let plan = plan_expr_query(&ExprQuery {
-            answerable_from_aggregate: false,
-            filter: filter.clone(),
-            limit,
-            order,
-        });
+        let plan = plan_query(
+            &ExprQuery {
+                answerable_from_aggregate: false,
+                filter: filter.clone(),
+                limit,
+                order,
+            },
+            &GranuleStatistics::default(),
+        );
         let (rows, stats) = execute(&file, &plan, &QueryInputs::default());
         let mut naive: Vec<(i64, u64, u64)> = naive_full(&file).into_iter().filter(|r| matches(r.0)).collect();
         if order == ScanOrder::TimeDescending {
@@ -450,17 +453,20 @@ fn entity_and_external_id_hits_route_to_point_reads() {
     let file = file(400, 32);
     let target = 123u64 * 7919;
     let selection = file.selection_for_entity_hash(target);
-    let plan = plan_expr_query(&ExprQuery {
-        answerable_from_aggregate: false,
-        filter: clause(
-            column_ids::ENTITY_ID_HASH_LOW,
-            PredicateKind::Equality,
-            i128::from(target),
-            i128::from(target),
-        ),
-        limit: None,
-        order: ScanOrder::Stored,
-    });
+    let plan = plan_query(
+        &ExprQuery {
+            answerable_from_aggregate: false,
+            filter: clause(
+                column_ids::ENTITY_ID_HASH_LOW,
+                PredicateKind::Equality,
+                i128::from(target),
+                i128::from(target),
+            ),
+            limit: None,
+            order: ScanOrder::Stored,
+        },
+        &GranuleStatistics::default(),
+    );
     let inputs = QueryInputs {
         selection: Some(&selection),
         ..QueryInputs::default()
@@ -483,10 +489,13 @@ fn entity_and_external_id_hits_route_to_point_reads() {
         }])
         .collect();
     let selection = file.selection_for_external_ids(&locations);
-    let everything = plan_expr_query(&ExprQuery::from(Query {
-        answerable_from_aggregate: false,
-        filter: Filter { clauses: Vec::new() },
-    }));
+    let everything = plan_query(
+        &ExprQuery::from(Query {
+            answerable_from_aggregate: false,
+            filter: Filter::default(),
+        }),
+        &GranuleStatistics::default(),
+    );
     let inputs = QueryInputs {
         selection: Some(&selection),
         ..QueryInputs::default()
@@ -499,13 +508,90 @@ fn entity_and_external_id_hits_route_to_point_reads() {
 #[test]
 fn aggregate_shortcut_is_not_scanned() {
     let file = file(40, 16);
-    let plan = plan_expr_query(&ExprQuery {
-        answerable_from_aggregate: true,
-        filter: FilterExpr::And(Vec::new()),
-        limit: Some(1),
-        order: ScanOrder::Stored,
-    });
-    assert_eq!(plan, ExprQueryPlan::AggregateShortcut);
+    let plan = plan_query(
+        &ExprQuery {
+            answerable_from_aggregate: true,
+            filter: FilterExpr::And(Vec::new()),
+            limit: Some(1),
+            order: ScanOrder::Stored,
+        },
+        &GranuleStatistics::default(),
+    );
+    assert_eq!(plan, QueryPlan::AggregateShortcut);
     let result = file.execute_query(&plan, &[], &[], &QueryInputs::default(), |_, _, _| true, |_| Ok(()));
     assert!(result.is_err());
+}
+
+/// An IN list over occurred-at, alone and ORed with an entity equality, runs through the one planner and
+/// `execute_query`, skips granules that hold no listed value, and returns what a naive scan returns.
+#[test]
+fn in_list_query_prunes_gaps_and_matches_naive() {
+    use crate::indexes::pruning::{InList, MembershipList};
+    let file = file(400, 32);
+    let times: Vec<i64> = naive_rows(&file).iter().map(|&(at, _)| at).collect();
+    let listed: Vec<i64> = vec![times[3], times[200], times[201], times[399]];
+    let list = FilterExpr::In(InList::new(
+        column_ids::OCCURRED_AT,
+        MembershipList::new(listed.iter().map(|&t| i128::from(t)).collect()),
+    ));
+    let target = 57u64 * 7919;
+    let either = FilterExpr::Or(vec![
+        list.clone(),
+        clause(
+            column_ids::ENTITY_ID_HASH_LOW,
+            PredicateKind::Equality,
+            i128::from(target),
+            i128::from(target),
+        ),
+    ]);
+    for (filter, extra) in [(list, None), (either, Some(target))] {
+        let plan = plan_query(
+            ExprQuery {
+                answerable_from_aggregate: false,
+                filter,
+                limit: None,
+                order: ScanOrder::Stored,
+            },
+            &GranuleStatistics::default(),
+        );
+        let (rows, stats) = execute(&file, &plan, &QueryInputs::default());
+        let expected: Vec<u64> = naive_full(&file)
+            .into_iter()
+            .filter(|r| listed.contains(&r.0) || Some(r.1) == extra)
+            .map(|r| r.2)
+            .collect();
+        assert_eq!(rows, expected);
+        assert!(stats.granules_read.len() < all_granules(&file).len(), "{stats:?}");
+        let holding: std::collections::BTreeSet<u32> = file
+            .footer
+            .granules
+            .iter()
+            .filter(|g| {
+                (g.first_row_ordinal..g.first_row_ordinal + u64::from(g.row_count)).any(|row| expected.contains(&row))
+            })
+            .map(|g| g.granule_id)
+            .collect();
+        assert!(holding.iter().all(|g| stats.granules_read.contains(g)), "{stats:?}");
+    }
+    // The list's envelope keeps granules the gap check drops.
+    let lo = i128::from(*listed.iter().min().unwrap());
+    let hi = i128::from(*listed.iter().max().unwrap());
+    let read = |filter| {
+        let plan = plan_query(
+            ExprQuery {
+                answerable_from_aggregate: false,
+                filter,
+                limit: None,
+                order: ScanOrder::Stored,
+            },
+            &GranuleStatistics::default(),
+        );
+        execute(&file, &plan, &QueryInputs::default()).1.granules_read.len()
+    };
+    let envelope = read(clause(column_ids::OCCURRED_AT, PredicateKind::Membership, lo, hi));
+    let gaps = read(FilterExpr::In(InList::new(
+        column_ids::OCCURRED_AT,
+        MembershipList::new(listed.iter().map(|&t| i128::from(t)).collect()),
+    )));
+    assert!(gaps < envelope, "{gaps} vs {envelope}");
 }

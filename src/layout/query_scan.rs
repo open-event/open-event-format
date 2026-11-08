@@ -17,9 +17,9 @@
 use super::*;
 use crate::deletes::DeletionVector;
 use crate::indexes::bitmap::{RoaringRangeBitmap, RowRange};
-use crate::indexes::bool_pruning::{ExprQueryPlan, FilterExpr, residual};
+use crate::indexes::bool_pruning::{FilterExpr, residual};
 use crate::indexes::external_id::ExternalIdLocation;
-use crate::indexes::pruning::{FilterClause, GranuleStatistics, Statistic};
+use crate::indexes::pruning::{FilterClause, GranuleStatistics, QueryPlan, Statistic};
 use std::sync::atomic::AtomicI64;
 
 /// Granules a limited scan without a bound decodes side by side per dispatch.
@@ -543,14 +543,17 @@ impl OeFile {
     /// answered by another tier, so it is refused here.
     pub fn execute_query(
         &self,
-        plan: &ExprQueryPlan,
+        plan: &QueryPlan,
         column_ids: &[u32],
         granule_ids: &[u32],
         inputs: &QueryInputs<'_>,
         mut clause_matches: impl FnMut(&ScanBatch, u32, &FilterClause) -> bool,
         sink: impl FnMut(SelectedBatch) -> Result<(), FormatError>,
     ) -> Result<SelectiveScanStats, FormatError> {
-        let ExprQueryPlan::Scan { filter, limit, order } = plan else {
+        let QueryPlan::Scan {
+            filter, limit, order, ..
+        } = plan
+        else {
             return Err(FormatError::Structural {
                 rule: "an aggregate-shortcut plan is answered by the aggregate tier",
             });

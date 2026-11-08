@@ -11,7 +11,7 @@
 //! `Or` branches proven absent there are removed, because no row in the granule satisfies them, so the residual
 //! accepts exactly the rows the original accepts. [`FilterExpr::matches_row`] evaluates any expression over one row.
 
-use super::pruning::{Filter, FilterClause, GranuleStatistics, Query, StatVerdict};
+use super::pruning::{Filter, FilterClause, GranuleStatistics, InList, Query, clause_proven_absent};
 use crate::layout::reader::query_scan::ScanOrder;
 
 /// A boolean filter tree over clauses that may name different columns.
@@ -20,6 +20,8 @@ pub enum FilterExpr {
     /// All children must hold; an empty `And` is always true.
     And(Vec<FilterExpr>),
     Clause(FilterClause),
+    /// `column IN (…)`, pruned and row-tested by binary search over the sorted list.
+    In(InList),
     /// At least one child must hold; an empty `Or` is always false.
     Or(Vec<FilterExpr>),
 }
@@ -36,25 +38,29 @@ pub enum Truth {
 
 impl From<Filter> for FilterExpr {
     fn from(filter: Filter) -> Self {
-        FilterExpr::And(filter.clauses.into_iter().map(FilterExpr::Clause).collect())
+        let Filter { clauses, memberships } = filter;
+        let mut children: Vec<FilterExpr> = clauses
+            .into_iter()
+            .filter(|clause| !memberships.iter().any(|in_list| in_list.clause == *clause))
+            .map(FilterExpr::Clause)
+            .collect();
+        children.extend(memberships.into_iter().map(FilterExpr::In));
+        FilterExpr::And(children)
     }
 }
 
 impl FilterExpr {
     /// The flat conjunction this expression is, when it is one, so it can take the existing AND-only path.
     pub fn as_conjunction(&self) -> Option<Filter> {
-        let mut clauses = Vec::new();
-        if collect_conjunction(self, &mut clauses) {
-            Some(Filter { clauses })
-        } else {
-            None
-        }
+        let mut filter = Filter::default();
+        collect_conjunction(self, &mut filter).then_some(filter)
     }
 
     /// Whether one row satisfies the expression, given an exact per-clause row test.
     pub fn matches_row(&self, clause_matches: &mut impl FnMut(&FilterClause) -> bool) -> bool {
         match self {
             FilterExpr::Clause(clause) => clause_matches(clause),
+            FilterExpr::In(in_list) => in_list.matches_row(clause_matches),
             FilterExpr::And(children) => children.iter().all(|child| child.matches_row(clause_matches)),
             FilterExpr::Or(children) => children.iter().any(|child| child.matches_row(clause_matches)),
         }
@@ -63,7 +69,10 @@ impl FilterExpr {
     /// The three-valued verdict of this expression over the granule described by `granule`.
     pub fn truth(&self, granule: &GranuleStatistics) -> Truth {
         match self {
-            FilterExpr::Clause(clause) => clause_truth(clause, granule),
+            FilterExpr::Clause(clause) => absent_or_unknown(clause_proven_absent(clause, None, granule)),
+            FilterExpr::In(in_list) => {
+                absent_or_unknown(clause_proven_absent(&in_list.clause, Some(&in_list.list), granule))
+            }
             FilterExpr::And(children) => {
                 let mut all_true = true;
                 for child in children {
@@ -104,7 +113,7 @@ pub fn residual(expr: &FilterExpr, granule: &GranuleStatistics) -> Option<Filter
         Truth::False => None,
         Truth::True => Some(FilterExpr::And(Vec::new())),
         Truth::Unknown => Some(match expr {
-            FilterExpr::Clause(_) => expr.clone(),
+            FilterExpr::Clause(_) | FilterExpr::In(_) => expr.clone(),
             FilterExpr::And(children) => FilterExpr::And(
                 children
                     .iter()
@@ -124,8 +133,8 @@ pub fn prune_granules(expr: &FilterExpr, granules: &[GranuleStatistics]) -> Vec<
         .collect()
 }
 
-/// A query whose filter is a boolean tree, with an optional row limit and order: the [`Query`] the scan path plans
-/// once a filter may hold OR.
+/// A query whose filter is a boolean tree, with an optional row limit and order: the general form of [`Query`] that
+/// [`plan_query`](super::pruning::plan_query) plans.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExprQuery {
     pub answerable_from_aggregate: bool,
@@ -145,45 +154,33 @@ impl From<Query> for ExprQuery {
     }
 }
 
-/// The plan for an [`ExprQuery`]: the aggregate shortcut, or a scan that prunes granules with [`drops_granule`],
-/// filters kept rows with [`residual`], and pushes the limit and order down to
-/// [`OeFile::scan_selective`](crate::layout::reader::OeFile::scan_selective).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ExprQueryPlan {
-    AggregateShortcut,
-    Scan {
-        filter: FilterExpr,
-        limit: Option<usize>,
-        order: ScanOrder,
-    },
-}
-
-/// Plans an [`ExprQuery`], keeping the aggregate shortcut tier above granule pruning exactly as
-/// [`plan_query`](super::pruning::plan_query) does. A pure conjunction prunes exactly as the AND-only expression would.
-pub fn plan_expr_query(query: &ExprQuery) -> ExprQueryPlan {
-    if query.answerable_from_aggregate {
-        return ExprQueryPlan::AggregateShortcut;
-    }
-    ExprQueryPlan::Scan {
-        filter: query.filter.clone(),
-        limit: query.limit,
-        order: query.order,
+impl From<&Query> for ExprQuery {
+    fn from(query: &Query) -> Self {
+        query.clone().into()
     }
 }
 
-/// A leaf's verdict: `False` when any relevant statistic the granule declares proves the clause absent.
-fn clause_truth(clause: &FilterClause, granule: &GranuleStatistics) -> Truth {
-    let absent = granule
-        .statistics
-        .iter()
-        .any(|statistic| statistic.relevant_to(clause) && statistic.judge(clause) == StatVerdict::ProvenAbsent);
+impl From<&ExprQuery> for ExprQuery {
+    fn from(query: &ExprQuery) -> Self {
+        query.clone()
+    }
+}
+
+/// A leaf's verdict: `False` when the granule's statistics prove it absent, else `Unknown` (no granule statistic
+/// confirms a match).
+fn absent_or_unknown(absent: bool) -> Truth {
     if absent { Truth::False } else { Truth::Unknown }
 }
 
-fn collect_conjunction(expr: &FilterExpr, out: &mut Vec<FilterClause>) -> bool {
+fn collect_conjunction(expr: &FilterExpr, out: &mut Filter) -> bool {
     match expr {
         FilterExpr::Clause(clause) => {
-            out.push(*clause);
+            out.clauses.push(*clause);
+            true
+        }
+        FilterExpr::In(in_list) => {
+            out.clauses.push(in_list.clause);
+            out.memberships.push(in_list.clone());
             true
         }
         FilterExpr::And(children) => children.iter().all(|child| collect_conjunction(child, out)),

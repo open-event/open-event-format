@@ -12,6 +12,7 @@ fn reject_pages_inside_a_surviving_granule() {
     // granule survives pruning. At page granularity the five pages cover disjoint sub-ranges; pages 0, 1, and 2 are
     // entirely below the filter threshold and must be rejected.
     let filter = Filter {
+        memberships: Vec::new(),
         clauses: vec![FilterClause {
             column_id: 1,
             predicate: PredicateKind::Range,
