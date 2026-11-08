@@ -23,6 +23,7 @@ OE is the storage engine for events. Events first land in **OEJ**, an append-onl
 - **Integrity end to end**: CRC-64/NVMe and BLAKE3 checksums, optional proof trees, and authenticated (sealed) footers. A reader verifies on open, or opens lazily and verifies what it touches.
 - **Erasure and isolation**: Crypto-shredding, subject-sealed payloads, and encrypted footers for data that has to be forgettable.
 
+<br/>
 ## Use cases
 
 - **Chat and messaging history**: busy rooms, threads, edits, reactions and redactions in one file
@@ -30,15 +31,14 @@ OE is the storage engine for events. Events first land in **OEJ**, an append-onl
 - **Telemetry and product analytics**: numeric and text payloads scanned column by column
 - **Agent and session transcripts**: one durable stream per session, queryable after the fact
 
+<br/>
 ## Why a new format?
 
 Parquet and Vortex are excellent general analytical formats, but an event store asks for more than scans: append with a durable acknowledgement, find one event by its id, follow a thread, remove a single message for a GDPR request, and prove the file was not tampered with. General formats cannot append, cannot remove rows in place, and do not verify content on open.
 
 OE keeps the columnar layout and modern encodings (FSST, bit-packing, dictionaries, RLE, XOR floats, zstd and LZ4) and adds the envelope, indexes, deletion vectors and integrity an event stream needs. The cost is size: OE stores every envelope column, skip index and checksum, so its files are larger than Parquet's.
 
-## How OE compares
-
-1,000,000 chat events, single thread, file held in memory. All times in milliseconds (median of 5 runs).
+For comparison across a million chat events, single thread, file held in memory:
 
 | Operation | OE | Parquet | Vortex |
 | --- | --- | --- | --- |
@@ -51,6 +51,7 @@ OE keeps the columnar layout and modern encodings (FSST, bit-packing, dictionari
 | Size per event | 95.5 bytes | **37.7 bytes** | 48.1 bytes |
 | Write | 4,246 ms | **1,188 ms** | 2,180 ms |
 
+<br/>
 ## Features
 
 - **OEJ journal**: Append-only frames, each acknowledged only after sync. 172,879 events/s at 128-event batches with a 1.322 ms p99 ack.
@@ -63,6 +64,7 @@ OE keeps the columnar layout and modern encodings (FSST, bit-packing, dictionari
 - **Arrow-friendly**: Column data maps onto Arrow arrays for the query engine that embeds OE.
 - **Hardened**: `unsafe` is denied outside one documented FSST call site, `unwrap`/`panic`/indexing are denied by Clippy, and every file structure has a fuzz target.
 
+<br/>
 ## Getting Started
 
 ```bash
@@ -76,6 +78,7 @@ cd open-event-format && cargo test --all-features
 cd benchmark && cargo run --release -- --sizes 10000,100000,1000000 --reps 5 --write-reps 3 --out results
 ```
 
+<br/>
 ## FAQ
 
 <details>
