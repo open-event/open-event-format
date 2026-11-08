@@ -336,10 +336,21 @@ fn the_packed_string_offsets_bit_is_known_but_declared_only_by_files_that_use_it
     assert_eq!(required_features::PACKED_STRING_OFFSETS, 1 << 33);
     assert_eq!(required_features::PACKED_STRING_OFFSETS & required_features::ALL, 0);
     assert_eq!(required_features::PACKED_STRING_OFFSETS & !required_features::KNOWN, 0);
-    // Bit 37 belongs to a feature this reader does not implement, so a file declaring it is refused.
-    assert_eq!((1u64 << 37) & required_features::KNOWN, 0);
-    assert!(crate::compat::check_features(1 << 37, 0).is_err());
+    // Bit 38 belongs to a feature this reader does not implement, so a file declaring it is refused.
+    assert_eq!((1u64 << 38) & required_features::KNOWN, 0);
+    assert!(crate::compat::check_features(1 << 38, 0).is_err());
     assert!(crate::compat::check_features(required_features::PACKED_STRING_OFFSETS, 0).is_ok());
+}
+
+#[test]
+fn the_string_zstd_blocks_bit_is_known_but_declared_only_by_files_that_use_it() {
+    assert_eq!(required_features::STRING_ZSTD_BLOCKS, 1 << 37);
+    assert_eq!(required_features::STRING_ZSTD_BLOCKS & required_features::ALL, 0);
+    assert_eq!(required_features::STRING_ZSTD_BLOCKS & !required_features::KNOWN, 0);
+    assert!(crate::compat::check_features(required_features::STRING_ZSTD_BLOCKS, 0).is_ok());
+    // A reader whose known set predates bit 37 finds it unknown, and refuses a file declaring it.
+    let old_known = required_features::KNOWN & !required_features::STRING_ZSTD_BLOCKS;
+    assert_ne!(required_features::STRING_ZSTD_BLOCKS & !old_known, 0);
 }
 
 #[test]

@@ -11,6 +11,11 @@ fuzz_target!(|data: &[u8]| {
         let id = u32::from_le_bytes(id_bytes.try_into().unwrap_or([0; 4]));
         let _ = decode_block(PipelineId(id), body);
         let _ = decode_string_block_views(PipelineId(id), body);
+        // The body as a relaid whole-block Zstandard string stage (compression 6) over a raw or dictionary block, so
+        // the relayout's inverse sees arbitrary inflated bytes, not only bodies that fail the pipeline-id parse.
+        for transform in [8u32, 10] {
+            let _ = decode_block(PipelineId(transform | (6 << 8) | (5 << 16)), body);
+        }
         // The whole input as an occurred-relative `ingested_at` body: resolved against an `occurred_at` of the
         // inner block's own length (the success path) and against one value fewer (the refusal path).
         let count = occurred_residual_inner(data)

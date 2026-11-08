@@ -16,9 +16,9 @@ use crate::columns::{
 };
 use crate::deletes::SubjectId;
 use crate::encoding::{
-    BlockStats, CascadeStrategy, ColumnData, FsstTable, ReplayCapture, SideStream, StringColumn, Transform, ValueKind,
-    count_set_bits, encode_block_replayed, encode_block_with_shared_dictionary, encode_block_with_xor_floats,
-    encode_occurred_residual, seekable_zstd,
+    BlockStats, CascadeStrategy, ColumnData, Compression, FsstTable, ReplayCapture, SideStream, StringColumn,
+    Transform, ValueKind, count_set_bits, encode_block_replayed_with, encode_block_with_shared_dictionary,
+    encode_block_with_xor_floats, encode_occurred_residual, seekable_zstd,
 };
 use crate::error::FormatError;
 use crate::events::provenance::{SignedEventProvenance, hex_lower_into};
@@ -3871,7 +3871,12 @@ fn build_oe_file_sealed_in_order(
             if xor_floats && matches!(data, ColumnData::F64(_)) {
                 encode_block_with_xor_floats(data, block.random_access, strategy)
             } else {
-                encode_block_replayed(data, block.random_access, strategy, replay, shared).0
+                // Only the shredded payload and free-text columns weigh whole-block Zstandard for strings: the
+                // envelope and relationship columns are what equality lookups probe granule by granule, and they
+                // keep the layouts a filter answers without inflating anything.
+                let string_zstd = block.random_access
+                    && (column_ids::SHREDDED_BASE..column_ids::CONTEXT_BASE).contains(&block.column_id);
+                encode_block_replayed_with(data, block.random_access, strategy, replay, shared, string_zstd).0
             }
         };
         let mut text_tokens: Vec<TextTokenEntry> = Vec::new();
@@ -4595,6 +4600,12 @@ fn build_oe_file_sealed_in_order(
         std::iter::once(piece.pipeline)
             .chain(piece.pages.iter().map(|page| page.1))
             .any(|pipeline| pipeline.transform() == Ok(Transform::OccurredResidual))
+    });
+    // Whether any block or page stores a string block under the relaid whole-block Zstandard stage.
+    let string_zstd_blocks = pieces.iter().any(|piece| {
+        std::iter::once(piece.pipeline)
+            .chain(piece.pages.iter().map(|page| page.1))
+            .any(|pipeline| pipeline.compression() == Ok(Compression::StringZstd))
     });
     // Whether any block or page stores FSST with bitpacked value lengths.
     let packed_string_offsets = pieces.iter().any(|piece| {
@@ -5370,6 +5381,9 @@ fn build_oe_file_sealed_in_order(
     }
     if occurred_relative_ingested_at {
         required_feature_flags |= required_features::OCCURRED_RELATIVE_INGESTED_AT;
+    }
+    if string_zstd_blocks {
+        required_feature_flags |= required_features::STRING_ZSTD_BLOCKS;
     }
     if !state_roots.is_empty() {
         required_feature_flags |= required_features::GRAPH_STATE_ROOTS;

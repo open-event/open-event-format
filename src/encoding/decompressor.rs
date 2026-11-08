@@ -147,6 +147,7 @@ impl Decompressor for SoftwareDecompressor {
             }
             Compression::Deflate => super::deflate::decompress_into(bytes, plain)?,
             Compression::SeekableZstd => super::seekable_zstd::decompress_all_into(bytes, plain)?,
+            Compression::StringZstd => super::string_zstd::decompress_into(bytes, plain, self)?,
             Compression::Lz4 => {
                 let mut reader = Reader::new(bytes);
                 let uncompressed_len = reader.u32("lz4 uncompressed length")? as usize;

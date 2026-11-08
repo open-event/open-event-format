@@ -69,6 +69,17 @@ Pipeline transform 15 (FSST with bitpacked value lengths) SHALL have an availabi
 - **WHEN** a reader without transform 15 is handed a block whose pipeline id names it
 - **THEN** it returns a structural "unknown transform" error and decodes nothing
 
+### Requirement: String-zstd blocks are gated by a required feature
+Pipeline trailing compression 6 (`string_zstd`, a string block relaid and compressed whole with Zstandard) SHALL be refused, like every unknown compression, by a reader that does not implement it: decoding the pipeline id SHALL return a structural "unknown compression" error and decode nothing. A file holding such a block SHALL declare required feature bit 37 (`string_zstd_blocks`); a reader whose known required set lacks bit 37 SHALL refuse the file at open.
+
+#### Scenario: Unknown compression refused cleanly
+- **WHEN** a reader without compression 6 is handed a block whose pipeline id names it
+- **THEN** it returns a structural "unknown compression" error and decodes nothing
+
+#### Scenario: A file declaring bit 37 is refused by an older reader
+- **WHEN** a file stores a compression-6 block and is opened by a reader whose known required set predates bit 37
+- **THEN** the file declares bit 37 and that reader refuses it at open
+
 ### Requirement: Occurred-relative ingested-at blocks are gated by a required feature
 Pipeline transform 16 (`ingested_at` stored relative to `occurred_at`) SHALL have an availability window opening at format version 1.0 and SHALL be refused, like every unknown transform, by a reader that does not implement it. Its body SHALL NOT decode on its own: a decode handed the bare block without the granule's `occurred_at` SHALL return a structural error rather than values. A file holding such a block SHALL declare required feature bit 34 (`occurred_relative_ingested_at`); a reader whose known required set lacks bit 34 SHALL refuse the file at open.
 

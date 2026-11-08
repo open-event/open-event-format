@@ -835,6 +835,8 @@ fn batched_reads_over_long_text_agree_and_fsst_plaintext_size_matches_decode() {
     // Granules of 24 rows: enough values per block for the encoder to pick FSST over raw.
     let mut config = freetext_config();
     config.targets.index_granularity = 24;
+    // Without a trailing stage the free text keeps FSST rather than the whole-block Zstandard string stage.
+    config.lifecycle = BuildLifecycle::FreshPublicationWithoutTrailing;
     let built = build_oe_file(rows, &config).unwrap();
     let file = OeFile::open(built.bytes, Some(&built.file_seal)).unwrap();
     let refs: Vec<PayloadRef> = [40, 1, 2, 3, 5, 3, 47, 12, 13, 14, 15, 0, 30, 31]

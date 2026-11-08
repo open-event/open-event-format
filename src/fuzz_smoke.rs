@@ -389,6 +389,50 @@ fn mutated_packed_fsst_block_never_panics() {
     }
 }
 
+/// Flips bytes across valid relaid whole-block Zstandard string blocks (raw arena and dictionary) and truncates them:
+/// every read path refuses or answers, never panics, and every truncation is refused by a whole-block decode.
+#[test]
+fn mutated_string_zstd_block_never_panics() {
+    for distinct in [8_000u64, 300] {
+        let mut values = super::encoding::StringColumn::new();
+        for i in 0..8_192u64 {
+            values.push(
+                (i % 11 != 0)
+                    .then(|| format!("!room{}:example.org", i * 37 % distinct))
+                    .as_deref(),
+            );
+        }
+        let block = super::encoding::encode_block_replayed_with(
+            &ColumnData::Strings(values),
+            true,
+            super::encoding::CascadeStrategy::DecodeOptimized,
+            None,
+            None,
+            true,
+        )
+        .0;
+        assert_eq!(
+            block.pipeline.compression().unwrap(),
+            super::encoding::Compression::StringZstd
+        );
+        assert!(decode_block(block.pipeline, &block.bytes).is_ok());
+        let mut rng = XorShift(43);
+        for position in (0..block.bytes.len()).step_by(7) {
+            let mut mutated = block.bytes.clone();
+            mutated[position] ^= (rng.next() as u8) | 1;
+            let _ = decode_block(block.pipeline, &mutated);
+            let _ = super::encoding::decode_block_range(block.pipeline, &mutated, 3, 90);
+            let _ = super::encoding::take_block_rows(block.pipeline, &mutated, &[0, 5, 399]);
+            let _ = super::encoding::decode_string_block_views(block.pipeline, &mutated);
+            let equals = super::encoding::predicate::StringPredicate::Equals("!room37:example.org".to_owned());
+            let _ = super::encoding::predicate::filter_string_block(block.pipeline, &mutated, &equals);
+        }
+        for cut in (0..block.bytes.len()).step_by(13) {
+            assert!(decode_block(block.pipeline, &block.bytes[..cut]).is_err());
+        }
+    }
+}
+
 /// Flips bytes across a valid occurred-relative `ingested_at` body and truncates it: resolving it against its
 /// `occurred_at` refuses or answers, never panics, and every truncation is refused.
 #[test]

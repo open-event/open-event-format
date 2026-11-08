@@ -32,8 +32,8 @@ use constant::{
     FSST_LOSSY_PHT_HASH_SHIFT, FSST_MAX_AVERAGE_VALUE_LEN, FSST_MAX_SYMBOL_COUNT, FSST_MIN_SAMPLE_COUNT,
     FSST_PER_FRAME_BAR_MIN_BLOCK_BYTES, FSST_TRAILING_MAX_RATIO_DEN, FSST_TRAILING_MAX_RATIO_NUM,
     FSST_VALUE_KEYS_MAX_PLAINTEXT_DIVISOR, MAX_RLE_EXPANSION_VALUES, PREFIX_KEY_BYTES, PREFIX_SUM_CHUNK,
-    REPLAY_TRIP_DEN, REPLAY_TRIP_NUM, SIZE_OPTIMIZED_SAVINGS_DIVISOR, TRANSFORM_SAMPLE_RUNS, TRANSFORM_SAMPLE_SIZE,
-    ZSTD_LENGTH_PREFIX_BYTES,
+    REPLAY_TRIP_DEN, REPLAY_TRIP_NUM, SIZE_OPTIMIZED_SAVINGS_DIVISOR, STRING_ZSTD_LEVEL, STRING_ZSTD_MIN_SAVINGS_DEN,
+    STRING_ZSTD_MIN_SAVINGS_NUM, TRANSFORM_SAMPLE_RUNS, TRANSFORM_SAMPLE_SIZE, ZSTD_LENGTH_PREFIX_BYTES,
 };
 use multiversion::multiversion;
 use std::borrow::Cow;
@@ -64,6 +64,7 @@ mod scratch;
 pub mod seekable_zstd;
 pub mod sidecar;
 mod string_column;
+mod string_zstd;
 
 /// Which trade-off the encoder makes when choosing a trailing compression stage for a column block.
 ///
@@ -260,6 +261,12 @@ pub enum Compression {
     /// decompressible on its own, with a seek table recording where every frame starts. The trailing stage a
     /// random-access column takes, because a reader reaches one row's bytes by decompressing one frame.
     SeekableZstd = 5,
+    /// A string block relaid for an entropy coder — offset tables replaced by value terminators, dictionary codes by
+    /// byte planes — and compressed whole with Zstandard (see [`string_zstd`]). Undoing the stage restores the
+    /// block's classic body exactly, so a reader decodes, filters and point-reads it as that body after one inflate.
+    /// Chosen for a string block only where it stores well under the block's otherwise chosen form. A file holding one
+    /// declares the `STRING_ZSTD_BLOCKS` required feature.
+    StringZstd = 6,
     Zstd1 = 2,
     Zstd3 = 3,
 }
@@ -356,6 +363,7 @@ impl PipelineId {
             3 => Compression::Zstd3,
             4 => Compression::Deflate,
             5 => Compression::SeekableZstd,
+            6 => Compression::StringZstd,
             _ => {
                 return Err(FormatError::Structural {
                     rule: "unknown compression in pipeline id",
@@ -2630,6 +2638,20 @@ fn encode_dictionary_string(
     shared: Option<&[String]>,
     out: &mut Writer,
 ) -> Result<SideStream, FormatError> {
+    encode_dictionary_string_with(values, present, strategy, shared, true, out)
+}
+
+/// [`encode_dictionary_string`], with the FSST inner level on the distinct-value stream allowed only when
+/// `fsst_values` is set. The whole-block Zstandard candidate ([`string_zstd_candidate`]) turns it off: a trailing
+/// entropy coder finds the repeats in plain entries that FSST codes would hide from it.
+fn encode_dictionary_string_with(
+    values: &StringColumn,
+    present: &[&str],
+    strategy: CascadeStrategy,
+    shared: Option<&[String]>,
+    fsst_values: bool,
+    out: &mut Writer,
+) -> Result<SideStream, FormatError> {
     NullStream::from_values(values).write(out);
     // Dictionary encoding is chosen precisely when distinct values are a small fraction of the rows, so hash-dedup
     // the (row-sized) present values down to the distinct set before paying to sort — sorting only the distinct
@@ -2675,7 +2697,14 @@ fn encode_dictionary_string(
         });
         let shared_bytes = shared_out.into_bytes();
         let mut local_out = Writer::new();
-        let local_side = encode_local_dictionary(&dictionary, present.len(), local_code, strategy, &mut local_out)?;
+        let local_side = encode_local_dictionary_with(
+            &dictionary,
+            present.len(),
+            local_code,
+            strategy,
+            fsst_values,
+            &mut local_out,
+        )?;
         let local_bytes = local_out.into_bytes();
         if shared_bytes.len() < local_bytes.len() {
             out.put_slice(&shared_bytes);
@@ -2684,7 +2713,7 @@ fn encode_dictionary_string(
         out.put_slice(&local_bytes);
         return Ok(local_side);
     }
-    encode_local_dictionary(&dictionary, present.len(), local_code, strategy, out)
+    encode_local_dictionary_with(&dictionary, present.len(), local_code, strategy, fsst_values, out)
 }
 
 /// The block-local dictionary form: distinct values (plain or through the FSST inner cascade level), then the `count`
@@ -2692,6 +2721,7 @@ fn encode_dictionary_string(
 /// assignment against `dictionary`). Every entry of `dictionary` must be some row's value, which fixes the largest
 /// code at `dictionary.len() - 1`. One candidate in [`encode_dictionary_string`]'s scope trial, and the only form for
 /// a block the column's shared alphabet does not cover.
+#[cfg(test)]
 fn encode_local_dictionary(
     dictionary: &[&str],
     count: usize,
@@ -2699,8 +2729,20 @@ fn encode_local_dictionary(
     strategy: CascadeStrategy,
     out: &mut Writer,
 ) -> Result<SideStream, FormatError> {
+    encode_local_dictionary_with(dictionary, count, code, strategy, true, out)
+}
+
+/// [`encode_local_dictionary`], trying the FSST inner level on the distinct values only when `fsst_values` is set.
+fn encode_local_dictionary_with(
+    dictionary: &[&str],
+    count: usize,
+    code: impl Fn(usize) -> u64,
+    strategy: CascadeStrategy,
+    fsst_values: bool,
+    out: &mut Writer,
+) -> Result<SideStream, FormatError> {
     out.put_u32(dictionary.len() as u32);
-    let side = if write_fsst_dictionary_values(dictionary, strategy, out)? {
+    let side = if fsst_values && write_fsst_dictionary_values(dictionary, strategy, out)? {
         SideStream::FsstDictionaryValues
     } else {
         write_offsets(dictionary.iter().map(|value| value.len()), out)?;
@@ -4407,7 +4449,9 @@ fn apply_captured_trailing(body: Vec<u8>, captured: Compression, strategy: Casca
         }
         // A random-access column's framed stage is chosen before this one, and no encoder emits deflate any more, so
         // neither can be the captured codec here; both fall back to storing the body as it stands.
-        Compression::Deflate | Compression::SeekableZstd | Compression::None => (Compression::None, body),
+        Compression::Deflate | Compression::SeekableZstd | Compression::StringZstd | Compression::None => {
+            (Compression::None, body)
+        }
     }
 }
 
@@ -4596,7 +4640,7 @@ pub fn encode_block(data: &ColumnData, random_access: bool) -> EncodedBlock {
 /// permits it (`random_access` forbids whole-block compression on shredded scan-path columns). Requirement:
 /// "Lifecycle-selected cascade strategies".
 pub fn encode_block_with_strategy(data: &ColumnData, random_access: bool, strategy: CascadeStrategy) -> EncodedBlock {
-    encode_block_inner(data, random_access, strategy, None, None, None, None)
+    encode_block_inner(data, random_access, strategy, None, None, None, None, false)
 }
 
 /// [`encode_block_with_strategy`] with the column's file-scope shared alphabet: a dictionary block whose distinct
@@ -4607,7 +4651,7 @@ pub fn encode_block_with_shared_dictionary(
     strategy: CascadeStrategy,
     shared: Option<&[String]>,
 ) -> EncodedBlock {
-    encode_block_inner(data, random_access, strategy, None, None, None, shared)
+    encode_block_inner(data, random_access, strategy, None, None, None, shared, false)
 }
 
 /// Encodes a time-series file's block: exactly [`encode_block_with_strategy`], except that a float block is also
@@ -4615,11 +4659,20 @@ pub fn encode_block_with_shared_dictionary(
 /// adaptive selection's own choice. Every other block kind encodes as usual. A file that stores a Chimp block must
 /// declare the `XOR_FLOAT_BLOCKS` required feature.
 pub fn encode_block_with_xor_floats(data: &ColumnData, random_access: bool, strategy: CascadeStrategy) -> EncodedBlock {
-    let selected = encode_block_inner(data, random_access, strategy, None, None, None, None);
+    let selected = encode_block_inner(data, random_access, strategy, None, None, None, None, false);
     if !matches!(data, ColumnData::F64(_)) {
         return selected;
     }
-    let xor = encode_chosen_form(data, random_access, strategy, Some(Transform::Chimp), None, None, None);
+    let xor = encode_chosen_form(
+        data,
+        random_access,
+        strategy,
+        Some(Transform::Chimp),
+        None,
+        None,
+        None,
+        false,
+    );
     if xor.bytes.len() < selected.bytes.len() {
         xor
     } else {
@@ -4729,6 +4782,21 @@ pub fn encode_block_replayed(
     capture: Option<&ReplayCapture>,
     shared: Option<&[String]>,
 ) -> (EncodedBlock, bool) {
+    encode_block_replayed_with(data, random_access, strategy, capture, shared, false)
+}
+
+/// [`encode_block_replayed`], with the whole-block Zstandard string candidate ([`string_zstd_candidate`]) weighed
+/// only when `string_zstd` is set — no other entry point weighs it. The writer sets it for the random-access blocks of
+/// shredded payload and free-text columns only, so the envelope and relationship columns that equality lookups probe
+/// keep the layouts a filter answers in place, never paying an inflate per granule.
+pub fn encode_block_replayed_with(
+    data: &ColumnData,
+    random_access: bool,
+    strategy: CascadeStrategy,
+    capture: Option<&ReplayCapture>,
+    shared: Option<&[String]>,
+    string_zstd: bool,
+) -> (EncodedBlock, bool) {
     if let Some(capture) = capture
         && transform_matches_kind(capture.transform, data)
     {
@@ -4740,6 +4808,7 @@ pub fn encode_block_replayed(
             Some(capture.compression),
             capture.fsst.as_ref(),
             shared,
+            string_zstd,
         );
         let raw = raw_value_bytes(data).max(1);
         // Keep the replay while replayed_ratio <= head_ratio * TRIP_NUM/TRIP_DEN, cross-multiplied to stay integral.
@@ -4751,7 +4820,7 @@ pub fn encode_block_replayed(
         }
     }
     (
-        encode_block_inner(data, random_access, strategy, None, None, None, shared),
+        encode_block_inner(data, random_access, strategy, None, None, None, shared, string_zstd),
         false,
     )
 }
@@ -4777,6 +4846,7 @@ fn plain_form(
         Some(Compression::None),
         None,
         shared,
+        false,
     )
 }
 
@@ -4828,6 +4898,7 @@ pub fn encode_block_forced_for_conformance(
         None,
         None,
         None,
+        false,
     ))
 }
 
@@ -4835,6 +4906,10 @@ pub fn encode_block_forced_for_conformance(
 /// forcing entry: `forced` bypasses candidate selection where it names a kind-valid transform, `replay_trailing`
 /// replays a capture's trailing codec instead of the two-codec trial, `replay_fsst` replays a capture's symbol table
 /// instead of training one, and every other stage — side streams, the recorded pipeline — runs identically.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is an independent selection input threaded from the public entry points"
+)]
 fn encode_block_inner(
     data: &ColumnData,
     random_access: bool,
@@ -4843,6 +4918,7 @@ fn encode_block_inner(
     replay_trailing: Option<Compression>,
     replay_fsst: Option<&FsstTable>,
     shared: Option<&[String]>,
+    string_zstd: bool,
 ) -> EncodedBlock {
     let block = encode_chosen_form(
         data,
@@ -4852,6 +4928,7 @@ fn encode_block_inner(
         replay_trailing,
         replay_fsst,
         shared,
+        string_zstd,
     );
     // A caller that named the transform asked for that transform, and gets it; so does a replay, which the caller
     // holds against the plain form itself. Everything else goes through the acceptance gate: a block that a
@@ -4871,7 +4948,104 @@ fn encode_block_inner(
 
 /// The encode itself — mandatory representation rules, candidate selection, side streams, and the trailing stage —
 /// without the acceptance gate [`encode_block_inner`] wraps it in.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is an independent selection input threaded from the public entry points"
+)]
 fn encode_chosen_form(
+    data: &ColumnData,
+    random_access: bool,
+    strategy: CascadeStrategy,
+    forced: Option<Transform>,
+    replay_trailing: Option<Compression>,
+    replay_fsst: Option<&FsstTable>,
+    shared: Option<&[String]>,
+    string_zstd: bool,
+) -> EncodedBlock {
+    let block = encode_selected_form(
+        data,
+        random_access,
+        strategy,
+        forced,
+        replay_trailing,
+        replay_fsst,
+        shared,
+    );
+    // Selection — and a replay, which re-arms it — also weighs a string block compressed whole with Zstandard, the
+    // way a Parquet column chunk stores it. A forced conformance encode keeps the form it named, and the plain form
+    // the acceptance gate measures against (forced, with no trailing stage) stays plain.
+    if string_zstd
+        && let ColumnData::Strings(values) = data
+        && (forced.is_none() || replay_trailing.is_some_and(|captured| captured != Compression::None))
+        && let Some(candidate) = string_zstd_candidate(values, strategy, shared, block.bytes.len(), block.stats)
+    {
+        return candidate;
+    }
+    block
+}
+
+/// The whole-block Zstandard form of a string block, when it stores fewer than [`STRING_ZSTD_MIN_SAVINGS_NUM`] /
+/// [`STRING_ZSTD_MIN_SAVINGS_DEN`] of `current_len`: the raw arena, and — for a block that repeats its values
+/// ([`dictionary_trial_worthwhile`]) — the dictionary form with plain entries and bitpacked codes, each compressed
+/// whole with Zstandard at [`STRING_ZSTD_LEVEL`], the smaller kept. Both are pipelines every reader already decodes
+/// ([`Transform::RawString`] or [`Transform::DictionaryString`] behind a [`Compression::Zstd3`] trailing stage): a
+/// point read or a filter inflates the block once and then reads it exactly as the uncompressed form, dictionary
+/// equality still resolving one entry and comparing codes. It is the one whole-block stage a random-access column may
+/// take: the block is one granule's values, so a single inflate answers any row of it, and the reader's decoded-block
+/// cache keeps the inflated column for the next read. `None` under [`CascadeStrategy::NoTrailing`], for a block with
+/// no present value, or when neither candidate clears the bar.
+fn string_zstd_candidate(
+    values: &StringColumn,
+    strategy: CascadeStrategy,
+    shared: Option<&[String]>,
+    current_len: usize,
+    stats: BlockStats,
+) -> Option<EncodedBlock> {
+    if strategy == CascadeStrategy::NoTrailing || !cascade_level_fits(2) {
+        return None;
+    }
+    let present = present_values(values);
+    if present.is_empty() {
+        return None;
+    }
+    let bar = current_len.saturating_mul(STRING_ZSTD_MIN_SAVINGS_NUM) / STRING_ZSTD_MIN_SAVINGS_DEN;
+    let mut best: Option<(Transform, SideStream, Compression, Vec<u8>, u64)> = None;
+    let mut consider = |transform: Transform, side: SideStream, body: &[u8]| {
+        // The relaid stage where the body has one; plain Zstandard over the classic body otherwise.
+        let (compression, stored) = match string_zstd::compress(transform, side, body, STRING_ZSTD_LEVEL) {
+            Some(stored) => (Compression::StringZstd, stored),
+            None => (Compression::Zstd3, compress_zstd_framed(body, STRING_ZSTD_LEVEL)),
+        };
+        if !stored.is_empty()
+            && stored.len() < bar
+            && best.as_ref().is_none_or(|(_, _, _, kept, _)| stored.len() < kept.len())
+        {
+            best = Some((transform, side, compression, stored, body.len() as u64));
+        }
+    };
+    let mut raw = Writer::new();
+    if encode_raw_string(values, &present, &mut raw).is_ok() {
+        consider(Transform::RawString, SideStream::None, raw.bytes());
+    }
+    if dictionary_trial_worthwhile(&present) {
+        let mut dictionary = Writer::new();
+        if let Ok(side) = encode_dictionary_string_with(values, &present, strategy, shared, false, &mut dictionary) {
+            consider(Transform::DictionaryString, side, dictionary.bytes());
+        }
+    }
+    let (transform, side, compression, bytes, uncompressed_len) = best?;
+    Some(EncodedBlock {
+        pipeline: PipelineId::new(transform, compression, ValueKind::String).with_side_stream(side),
+        bytes,
+        fsst: None,
+        stats,
+        uncompressed_len,
+    })
+}
+
+/// The encode proper behind [`encode_chosen_form`]: mandatory representation rules, candidate selection, side
+/// streams, and the trailing stage.
+fn encode_selected_form(
     data: &ColumnData,
     random_access: bool,
     strategy: CascadeStrategy,

@@ -213,3 +213,17 @@ pub const FSST_TRAILING_MAX_RATIO_DEN: usize = 2;
 /// inflating a block this small costs little beside its fixed per-block costs, and the few raw-stored codes would
 /// only push it past its plain form.
 pub const FSST_PER_FRAME_BAR_MIN_BLOCK_BYTES: usize = 4 * 1024;
+
+/// Zstandard level of the whole-block string candidate (see `string_zstd_candidate`): level 3, the level Parquet
+/// writers default to, so a repeated-string or free-text block lands where a Parquet column chunk of the same values
+/// would.
+pub const STRING_ZSTD_LEVEL: i32 = 3;
+
+/// The whole-block Zstandard string candidate replaces the block's otherwise chosen form only when it stores at most
+/// `STRING_ZSTD_MIN_SAVINGS_NUM / STRING_ZSTD_MIN_SAVINGS_DEN` (9/10) of that form's bytes. The candidate costs a
+/// filter or a point read one block inflate that the compressed-form kernels avoid, so a near-tie keeps the form those
+/// kernels read in place.
+pub const STRING_ZSTD_MIN_SAVINGS_NUM: usize = 9;
+
+/// Denominator of the whole-block Zstandard string bar. See [`STRING_ZSTD_MIN_SAVINGS_NUM`].
+pub const STRING_ZSTD_MIN_SAVINGS_DEN: usize = 10;
