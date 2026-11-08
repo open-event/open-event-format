@@ -39,9 +39,8 @@ OE keeps the columnar layout and modern encodings (FSST, bit-packing, dictionari
 
 ## Getting Started
 
-OE is a Rust crate (`oe`, edition 2024, Rust 1.96, pinned in [`rust-toolchain.toml`](./rust-toolchain.toml)). It is not published to crates.io yet.
-
 ```bash
+# It is not yet published to crates.io
 git clone https://github.com/open-event/open-event-format.git
 
 # Run tests
