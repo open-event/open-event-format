@@ -70,8 +70,8 @@ pub struct MaintenanceConfig {
 /// state roots, and the key the chunks are sealed with.
 pub struct StateChunkMaintenance {
     pub key: StateChunkKey,
-    pub ledger: Box<dyn StateChunkLedger>,
-    pub roots: Box<dyn FileStateRoots>,
+    pub ledger: Box<dyn StateChunkLedger + Send>,
+    pub roots: Box<dyn FileStateRoots + Send>,
 }
 
 /// One compaction a run published.
@@ -127,7 +127,7 @@ pub struct Maintenance {
     pub backlog: Option<FileErasureBacklog>,
     pub config: MaintenanceConfig,
     next_due: Option<u64>,
-    pub notices: Box<dyn PeerNotices>,
+    pub notices: Box<dyn PeerNotices + Send>,
     pub publisher: OePublisher,
     /// Swept after the file sweeps, when the tenant stores graph state chunks.
     pub state_chunks: Option<StateChunkMaintenance>,
