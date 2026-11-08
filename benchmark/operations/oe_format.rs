@@ -123,7 +123,7 @@ pub struct OeFormat<'a> {
 /// The reader one iteration runs against: made for that iteration alone, or the one reader every iteration shares
 /// when `OE_BENCH_WARM_READER` is set.
 enum IterationReader<'a> {
-    Fresh(OeFile),
+    Fresh(Box<OeFile>),
     Warm(&'a OeFile),
 }
 
@@ -232,7 +232,7 @@ impl<'a> OeFormat<'a> {
         }
         template
             .fresh_reader()
-            .map(IterationReader::Fresh)
+            .map(|file| IterationReader::Fresh(Box::new(file)))
             .map_err(|error| anyhow!("opening the OE file: {error}"))
     }
 
