@@ -75,3 +75,10 @@ Pipeline transform 16 (`ingested_at` stored relative to `occurred_at`) SHALL hav
 #### Scenario: Occurred-relative transform refused without its window
 - **WHEN** a reader without transform 16 is handed a block whose pipeline id names it
 - **THEN** it refuses the pipeline before decoding a byte, and a bare decode of the block without `occurred_at` returns a structural error
+
+### Requirement: Entity hash columns may be elided behind a required feature
+A writer MAY omit the `entity_id_hash_low` and `entity_id_hash_high` blocks from a primary-order file of any profile but `inbox` when every row's entity hashes equal the frozen derivation from its `entity_id`: the low half is `stable_hash` of the id's UTF-8 bytes and the high half is zero, and an absent id derives `(0, 0)`. Such a file SHALL drop both columns from its column directory and SHALL declare required feature bit 35 (`entity_hash_columns_elided`); a file with any row whose hashes are not the derivation SHALL store the columns and SHALL NOT declare the bit. The per-granule entity hash filters and the entity summary SHALL still be built from the same hashes. A reader of such a file SHALL recompute a row's entity hashes from `entity_id` wherever it needs them, so envelopes, entity scans and merge reads return exactly the hashes that were written; a reader whose known required set lacks bit 35 SHALL refuse the file at open. Files that store the columns SHALL keep reading unchanged.
+
+#### Scenario: Elided entity hashes read back as written
+- **WHEN** a file is built from rows whose entity hashes are the derivation from their `entity_id`
+- **THEN** it stores no entity hash blocks, declares bit 35, and returns every envelope with the hashes it was written with, while a reader that does not know bit 35 refuses it at open

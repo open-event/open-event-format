@@ -1,5 +1,6 @@
 //! Conformance tests for the `oe-reader-compatibility` capability.
 
+mod entity_hash_columns_may_be_elided_behind_a_required_feature;
 mod forward_compatible_versioned_footer;
 mod occurred_relative_ingested_at_blocks_are_gated_by_a_required_feature;
 mod optional_block_forward_compatibility_escape_hatch;

@@ -15,7 +15,8 @@ pub mod transcode;
 pub mod variant;
 
 pub use envelope::{
-    DurationValue, EventEnvelope, EventFlags, EventId, SequencePoint, SequenceRange, StreamId, TenantId, TimestampValue,
+    DurationValue, EventEnvelope, EventFlags, EventId, SequencePoint, SequenceRange, StreamId, TenantId,
+    TimestampValue, derived_entity_id_hash,
 };
 pub use provenance::{SignatureScheme, SignedEventProvenance, SignerSignature};
 pub use relationships::{EventRelationships, RelationshipKind, RelationshipRef, TargetIdSpace};

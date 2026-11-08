@@ -20,9 +20,9 @@ use oe::encoding::predicate::{
     ContainsMatcher, SharedDictionaryPredicate, StringPredicate, count_string_block_shared, scan_in_parallel,
     translate_for_shared_dictionary,
 };
-use oe::encoding::{ColumnData, decode_block_range_shared, decode_block_shared};
+use oe::encoding::{ColumnData, decode_block_shared};
 use oe::events::variant::VariantValue;
-use oe::events::{EventFlags, EventId, StreamId, TenantId, TimestampValue};
+use oe::events::{EventFlags, derived_entity_id_hash, EventId, StreamId, TenantId, TimestampValue};
 use oe::indexes::bitmap::RoaringRangeBitmap;
 use oe::invariants::io::ThreadPoolEncodeExecutor;
 use oe::layout::footer::{ColumnKind, Footer, GranuleEntry};
@@ -537,17 +537,22 @@ impl<'a> OeFormat<'a> {
     }
 
     /// Finds the one row carrying an entity id: the per-granule identity-hash filters rule out the granules that
-    /// cannot hold the hash, then the surviving granules' hash blocks are scanned and every hit is confirmed against
-    /// the id itself. Stops at the first granule that holds it.
+    /// cannot hold the id's hash, then each surviving granule's `entity_id` block is tested for the id in its
+    /// compressed form (the id is looked up once in the block's dictionary or FSST symbol table and the rows
+    /// compared by code), so no per-row hash column is stored or read. Stops at the first granule that holds it.
     ///
     /// `OE_BENCH_NO_ENTITY_HASH_FILTERS` retains the former scan-every-granule path in the same optimized binary, so
     /// IMP-009 can be measured as interleaved control and candidate runs.
     fn point_lookup(&self) -> Result<Measured> {
         let file = self.reader()?;
         let wanted = self.dataset.workload.entity_id.as_str();
-        let wanted_hash = identity_hash(wanted);
+        let (wanted_hash, _) = derived_entity_id_hash(Some(wanted));
         let unfiltered = std::env::var_os("OE_BENCH_NO_ENTITY_HASH_FILTERS").is_some();
         let started = Instant::now();
+        let predicate = StringPredicate::Equals(wanted.to_owned());
+        let translated = file
+            .shared_alphabet(column_ids::ENTITY_ID)
+            .map(|entries| translate_for_shared_dictionary(&predicate, entries));
         let mut bytes = 0;
         let mut found = 0u64;
         let candidate_granules = if unfiltered {
@@ -564,7 +569,8 @@ impl<'a> OeFormat<'a> {
             file.granules_for_entity_hash(wanted_hash)
         };
         for granule in candidate_granules {
-            let (block_bytes, hits) = Self::point_lookup_granule(&file, wanted, wanted_hash, granule.granule_id)?;
+            let (block_bytes, hits) =
+                Self::point_lookup_granule(&file, &predicate, translated.as_ref(), granule.granule_id)?;
             bytes += block_bytes;
             found += hits;
             if found > 0 {
@@ -581,48 +587,27 @@ impl<'a> OeFormat<'a> {
         })
     }
 
-    /// Scans one granule's hash block for `wanted_hash` and confirms each hit against the id column, reporting the
-    /// file bytes read and the rows confirmed.
+    /// Counts one granule's rows whose entity id equals the wanted one, straight from the encoded `entity_id` block
+    /// where a compressed-form kernel applies and by decoding it otherwise, reporting the file bytes read and the
+    /// rows found.
     #[inline(never)]
-    fn point_lookup_granule(file: &OeFile, wanted: &str, wanted_hash: u64, granule_id: u32) -> Result<(u64, u64)> {
-        let (hashes, mut bytes) = Self::block(file, column_ids::ENTITY_ID_HASH_LOW, granule_id)?;
-        let ColumnData::U64(hashes) = hashes else {
-            bail!("the entity id hash column decoded as something other than u64");
+    fn point_lookup_granule(
+        file: &OeFile,
+        predicate: &StringPredicate,
+        translated: Option<&SharedDictionaryPredicate>,
+        granule_id: u32,
+    ) -> Result<(u64, u64)> {
+        if let Ok(raw) = file.read_column_raw(column_ids::ENTITY_ID, granule_id)
+            && let Some(count) = count_string_block_shared(raw.pipeline, &raw.body, predicate, translated)
+                .map_err(|error| anyhow!("matching the entity id column of granule {granule_id}: {error}"))?
+        {
+            return Ok(((raw.body.len() + raw.presence.len()) as u64, count as u64));
+        }
+        let (ids, bytes) = Self::block(file, column_ids::ENTITY_ID, granule_id)?;
+        let ColumnData::Strings(ids) = ids else {
+            bail!("the entity id column decoded as something other than strings");
         };
-        let candidates: Vec<usize> = hashes
-            .iter()
-            .enumerate()
-            .filter(|(_, hash)| **hash == wanted_hash)
-            .map(|(row, _)| row)
-            .collect();
-        if candidates.is_empty() {
-            return Ok((bytes, 0));
-        }
-        // A hash match is a candidate, not an answer: confirm against the id column before counting the row. Only
-        // the candidate's own row is decoded out of the block — a single-row range, not all of the granule's rows,
-        // which is the whole point of the hash column narrowing the work first.
-        let raw = file
-            .read_column_raw(column_ids::ENTITY_ID, granule_id)
-            .map_err(|error| anyhow!("reading the entity id column of granule {granule_id}: {error}"))?;
-        bytes += (raw.body.len() + raw.presence.len()) as u64;
-        let mut found = 0u64;
-        for row in candidates {
-            let decoded = decode_block_range_shared(
-                raw.pipeline,
-                &raw.body,
-                file.shared_alphabet(column_ids::ENTITY_ID),
-                row,
-                row + 1,
-            )
-            .map_err(|error| anyhow!("decoding row {row} of the entity id column: {error}"))?;
-            let ColumnData::Strings(id) = decoded else {
-                bail!("the entity id column decoded as something other than strings");
-            };
-            if id.get(0).flatten() == Some(wanted) {
-                found += 1;
-            }
-        }
-        Ok((bytes, found))
+        Ok((bytes, predicate.filter_decoded(&ids).iter().filter(|hit| **hit).count() as u64))
     }
 
     /// Counts rows inside a time window. The granule directory rules out whole granules on their recorded time range
@@ -1509,7 +1494,7 @@ fn oe_row(row: &BenchmarkRow, tenant_id: TenantId, strings: &mut RowStrings) -> 
             dedupe_hash_low: identity_hash(&row.note),
             entity_id: Some(row.entity_id.clone()),
             entity_id_hash_high: 0,
-            entity_id_hash_low: identity_hash(&row.entity_id),
+            entity_id_hash_low: derived_entity_id_hash(Some(&row.entity_id)).0,
             entity_type: strings.shared.share(&row.entity_type),
             event_id: EventId::new_test_id(row.event_id),
             event_type: strings.shared.share(&row.event_type),

@@ -600,7 +600,14 @@ pub mod required_features {
     /// declares them — the same reasoning as [`XOR_FLOAT_BLOCKS`]. Declared only when some block is stored that way.
     pub const OCCURRED_RELATIVE_INGESTED_AT: u64 = 1 << 34;
 
-    // Bit 35 belongs to a sibling change; the merge that brings it in defines it here.
+    /// The file stores no `entity_id_hash_low` / `entity_id_hash_high` blocks: every row's entity hashes equal
+    /// [`derived_entity_id_hash`](crate::events::derived_entity_id_hash) of its `entity_id`, so a reader recomputes
+    /// them from that column where it needs a per-row hash, and matches an entity inside a granule against the
+    /// `entity_id` block itself. The per-granule entity hash filters and the entity summary are still built from
+    /// the same hashes. Required and refusing on purpose: a reader that predates it would fail to find the hash
+    /// blocks only when it came to read them, after answering from other columns, and a rewriter that predates it
+    /// could not carry the hashes forward. Declared only on a file that omits the columns.
+    pub const ENTITY_HASH_COLUMNS_ELIDED: u64 = 1 << 35;
 
     /// The file's external-id index is stored in the 32-bit-key footer section `EXTERNAL_IDS_32` (44). Required and
     /// refusing on purpose: a reader that predates it would ignore the section and silently answer every external-id
@@ -629,8 +636,7 @@ pub mod required_features {
         & !PACKED_STRING_OFFSETS
         & !OCCURRED_RELATIVE_INGESTED_AT
         & !EXTERNAL_ID_INDEX_32
-        // Bit 35: reserved for the sibling change noted above; never declared by this writer.
-        & !(1 << 35);
+        & !ENTITY_HASH_COLUMNS_ELIDED;
 }
 
 /// Optional feature flags: unknown optional features are ignored; known ones are validated and used.

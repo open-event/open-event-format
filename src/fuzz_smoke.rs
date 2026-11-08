@@ -417,3 +417,39 @@ fn mutated_occurred_residual_block_never_panics() {
         assert!(super::encoding::resolve_occurred_residual(&block.bytes[..cut], &occurred).is_err());
     }
 }
+
+/// Flips bytes across a valid file that omits its entity hash columns: opening it and reading its envelopes, which
+/// derive each row's entity hashes from `entity_id`, refuses or answers, never panics.
+#[cfg(feature = "write")]
+#[test]
+fn mutated_entity_hash_elided_file_never_panics() {
+    let rows: Vec<_> = (0..40u64)
+        .map(|i| {
+            let mut row = plain_row(i);
+            row.envelope.entity_id = Some(format!("room-{}", i % 3));
+            let (low, high) = super::events::derived_entity_id_hash(row.envelope.entity_id.as_deref());
+            row.envelope.entity_id_hash_low = low;
+            row.envelope.entity_id_hash_high = high;
+            row
+        })
+        .collect();
+    let built = build_oe_file(rows, &source_form_config(8)).unwrap();
+    let file = OeFile::open(built.bytes.clone(), None).unwrap();
+    assert_ne!(
+        file.footer().required_feature_flags & super::layout::required_features::ENTITY_HASH_COLUMNS_ELIDED,
+        0
+    );
+    assert!(file.granule_envelopes(0).is_ok());
+    let mut rng = XorShift(47);
+    let mut position = 0usize;
+    while position < built.bytes.len() {
+        let mut mutated = built.bytes.clone();
+        mutated[position] ^= (rng.next() as u8) | 1;
+        if let Ok(file) = OeFile::open(mutated, None) {
+            for granule in file.footer().granules.iter().take(2) {
+                let _ = file.granule_envelopes(granule.granule_id);
+            }
+        }
+        position += 13;
+    }
+}

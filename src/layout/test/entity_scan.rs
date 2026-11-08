@@ -554,3 +554,87 @@ fn a_deleted_amended_original_drops_the_event() {
 
     assert_eq!(sequences(&events), vec![2, 6, 10, 12, 14, 16, 18, 20]);
 }
+
+/// A file whose rows carry the derived entity hashes stores no hash blocks and declares the elision, and an entity
+/// scan, a whole-granule envelope read and the entity hash filters answer exactly what a file storing the blocks
+/// answers.
+#[test]
+fn a_file_without_stored_entity_hash_columns_scans_the_same_rows() {
+    let derived = |sequence: u64| {
+        let mut event = event(sequence, payload(sequence));
+        let (low, high) = crate::events::derived_entity_id_hash(event.envelope.entity_id.as_deref());
+        event.envelope.entity_id_hash_low = low;
+        event.envelope.entity_id_hash_high = high;
+        // Every fifth row has no entity at all, which derives `(0, 0)`.
+        if sequence.is_multiple_of(5) {
+            event.envelope.entity_id = None;
+            event.envelope.entity_id_hash_low = 0;
+            event.envelope.entity_id_hash_high = 0;
+        }
+        event
+    };
+    let rows = |first: u64, last: u64| -> Vec<OeRow> {
+        (first..=last)
+            .map(|sequence| OeRow {
+                epoch: 1,
+                event: derived(sequence),
+                sequence,
+            })
+            .collect()
+    };
+    let built = build_oe_file(rows(1, 30), &config(1)).unwrap();
+    let elided = OeFile::open(built.bytes, Some(&built.file_seal)).unwrap();
+    assert_ne!(
+        elided.footer().required_feature_flags & crate::layout::required_features::ENTITY_HASH_COLUMNS_ELIDED,
+        0
+    );
+    assert!(
+        elided
+            .footer()
+            .columns
+            .iter()
+            .all(|column| column.column_id != column_ids::ENTITY_ID_HASH_LOW
+                && column.column_id != column_ids::ENTITY_ID_HASH_HIGH)
+    );
+    assert!(elided.mark(column_ids::ENTITY_ID_HASH_LOW, 0, 0).unwrap().is_none());
+    assert!(!elided.footer().entity_hash_filters.is_empty());
+
+    // Envelopes come back with the hashes they were written with.
+    for (ordinal, sequence) in (1..=30u64).enumerate() {
+        assert_eq!(elided.envelope(ordinal as u64).unwrap(), derived(sequence).envelope);
+    }
+
+    // The same rows with one hash that is not the derivation keep the stored columns.
+    let mut stored_rows = rows(1, 30);
+    if let Some(row) = stored_rows.first_mut() {
+        row.event.envelope.entity_id_hash_high = 1;
+    }
+    let built = build_oe_file(stored_rows, &config(1)).unwrap();
+    let stored = OeFile::open(built.bytes, Some(&built.file_seal)).unwrap();
+    assert_eq!(
+        stored.footer().required_feature_flags & crate::layout::required_features::ENTITY_HASH_COLUMNS_ELIDED,
+        0
+    );
+    assert!(stored.mark(column_ids::ENTITY_ID_HASH_LOW, 0, 0).unwrap().is_some());
+
+    let (low, high) = crate::events::derived_entity_id_hash(Some("room-100"));
+    let room_scan = EntityScan {
+        entity_id_hash_high: high,
+        entity_id_hash_low: low,
+        ..scan(SortDirection::Ascending, None)
+    };
+    let expected: Vec<u64> = (2..=30).step_by(2).filter(|sequence| sequence % 5 != 0).collect();
+    for file in [&elided, &stored] {
+        let events = room_scan
+            .run(&[file], &LiveOverlayStore::new(), &RecordedDeletes::default())
+            .unwrap();
+        assert_eq!(sequences(&events), expected);
+        for event in &events {
+            assert_eq!(event.envelope, derived(event.point.sequence).envelope);
+        }
+    }
+    // The entity hash filters still rule out granules from the derived hashes.
+    let candidates = elided.granules_for_entity_hash(low);
+    assert!(!candidates.is_empty());
+    assert!(candidates.len() <= elided.footer().granules.len());
+}

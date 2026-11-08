@@ -874,3 +874,30 @@ fn elided_external_ids_round_trip_through_read_build_rows() {
         "the rewrite elides the same ids again"
     );
 }
+
+/// A file that omits its entity hash columns reads back through the merge path with the derived hashes, and the
+/// rewrite omits them again.
+#[test]
+fn elided_entity_hashes_round_trip_through_read_build_rows() {
+    use crate::layout::required_features;
+    use crate::writer::build::BuildRow;
+    let mut rows: Vec<BuildRow> = OeRow::into_build_rows((1..=8).map(rich_row).collect());
+    for row in &mut rows {
+        let (low, high) = crate::events::derived_entity_id_hash(row.envelope.entity_id.as_deref());
+        row.envelope.entity_id_hash_low = low;
+        row.envelope.entity_id_hash_high = high;
+    }
+    let built = build_oe_file(rows.clone(), &lineage_config()).unwrap();
+    assert_ne!(
+        built.footer.required_feature_flags & required_features::ENTITY_HASH_COLUMNS_ELIDED,
+        0
+    );
+    let read = read_build_rows(&open_built(&built)).unwrap();
+    assert_eq!(read, rows, "merge reads derive every entity hash");
+    let rebuilt = build_oe_file(read, &lineage_config()).unwrap();
+    assert_ne!(
+        rebuilt.footer.required_feature_flags & required_features::ENTITY_HASH_COLUMNS_ELIDED,
+        0
+    );
+    assert_eq!(read_build_rows(&open_built(&rebuilt)).unwrap(), rows);
+}

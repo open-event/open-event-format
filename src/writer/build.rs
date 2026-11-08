@@ -1497,6 +1497,9 @@ struct GranulePieces {
     /// bytes, and the row-indexed `(offset, len)` offsets table over them (same shape as `offsets_bytes`/`residual_bytes`
     /// below, scoped to one free-text column instead of the whole granule). Empty unless the build opted into the index.
     freetext_row_offsets: Vec<(u32, Vec<u8>, Vec<u8>)>,
+    /// The rows' `entity_id_hash_low` values when the file omits the entity hash blocks, so the granule's entity hash
+    /// filter is still built from them; empty when the block carries them.
+    elided_entity_hashes: Vec<u64>,
     /// Whether this granule alone carries a late event — see `build_granule`'s computation of the same name.
     has_internal_late_event: bool,
     offsets_bytes: Vec<u8>,
@@ -1513,6 +1516,7 @@ impl GranulePieces {
             by_event_type: Vec::new(),
             by_source: Vec::new(),
             dictionary_bytes: Vec::new(),
+            elided_entity_hashes: Vec::new(),
             entry,
             freetext_row_offsets: Vec::new(),
             has_internal_late_event: false,
@@ -1834,14 +1838,16 @@ fn build_entity_hash_filters(granules: &[GranulePieces]) -> BTreeMap<u32, Vec<u8
     let mut distinct: HashSet<u64> = HashSet::default();
     let mut filters = BTreeMap::new();
     for granule in granules {
-        let Some(hashes) = granule.blocks.iter().find_map(|block| {
+        let stored = granule.blocks.iter().find_map(|block| {
             (block.column_id == column_ids::ENTITY_ID_HASH_LOW)
                 .then_some(match &block.data {
                     ColumnData::U64(values) => Some(values.as_slice()),
                     _ => None,
                 })
                 .flatten()
-        }) else {
+        });
+        let elided = (!granule.elided_entity_hashes.is_empty()).then_some(granule.elided_entity_hashes.as_slice());
+        let Some(hashes) = stored.or(elided) else {
             continue;
         };
         distinct.clear();
@@ -3207,9 +3213,30 @@ fn build_oe_file_sealed_in_order(
         (shred_plan, sparse_keys, shred_kinds)
     };
 
+    // Whether the file omits the entity hash columns: every row's hashes are the derivation from its `entity_id`, so
+    // a reader recomputes them. Only primary-order files of a profile that never sorts or keys by the hashes omit
+    // them — the entity projection's and the inbox's min/max pruning and recipient keys read the stored blocks. A
+    // sparse update changes no envelope, so it keeps whatever the source decided.
+    let elide_entity_hash = match source {
+        Some(source) => source.header.feature_flags & required_features::ENTITY_HASH_COLUMNS_ELIDED != 0,
+        None => {
+            order == RowOrder::Sequence
+                && config.profile != Profile::Inbox
+                && rows.par_iter().all(|row| {
+                    crate::events::derived_entity_id_hash(row.envelope.entity_id.as_deref())
+                        == (row.envelope.entity_id_hash_low, row.envelope.entity_id_hash_high)
+                })
+        }
+    };
+    let keeps_column = |column_id: u32| {
+        !(elide_entity_hash
+            && (column_id == column_ids::ENTITY_ID_HASH_LOW || column_id == column_ids::ENTITY_ID_HASH_HIGH))
+    };
+
     // Column directory: required + promoted + shredded + free-text.
     let mut columns: Vec<ColumnDescriptor> = REQUIRED_COLUMNS
         .iter()
+        .filter(|spec| keeps_column(spec.column_id))
         .map(|spec| ColumnDescriptor {
             column_id: spec.column_id,
             name: spec.name.to_owned(),
@@ -3460,6 +3487,7 @@ fn build_oe_file_sealed_in_order(
                     config.freetext_row_offset_index,
                     carries_provenance,
                     carries_relationships,
+                    elide_entity_hash,
                     wanted,
                     residual,
                 )
@@ -3549,6 +3577,7 @@ fn build_oe_file_sealed_in_order(
     let block_columns: Vec<u32> = REQUIRED_COLUMNS
         .iter()
         .map(|spec| spec.column_id)
+        .filter(|&column_id| keeps_column(column_id))
         .chain((0..config.promotion.columns.len()).map(|index| column_ids::PROMOTED_BASE + index as u32))
         .chain(shred_plan.iter().map(|entry| entry.column_id))
         .chain(freetext_entries.iter().map(|entry| entry.column_id))
@@ -5351,6 +5380,9 @@ fn build_oe_file_sealed_in_order(
     if source_form_indexes.elides_event_ids {
         required_feature_flags |= required_features::EXTERNAL_ID_EVENT_ID_ELISION;
     }
+    if elide_entity_hash {
+        required_feature_flags |= required_features::ENTITY_HASH_COLUMNS_ELIDED;
+    }
     let footer = Footer {
         audit,
         clustering,
@@ -5756,6 +5788,7 @@ fn build_granule(
     freetext_row_offset_index: bool,
     carries_provenance: bool,
     carries_relationships: bool,
+    elide_entity_hash: bool,
     wanted: Option<&HashSet<u32>>,
     build_residual: bool,
 ) -> Result<GranulePieces, FormatError> {
@@ -6405,6 +6438,28 @@ fn build_granule(
         }
     }
 
+    // A file that omits the entity hash columns stores neither block; the low hashes stay with the granule only to
+    // build its entity hash filter.
+    let mut elided_entity_hashes = Vec::new();
+    if elide_entity_hash {
+        let mut kept = Vec::with_capacity(blocks.len());
+        for block in blocks {
+            match (block.column_id, block.data) {
+                // A sparse rebuild that does not want the hashes holds placeholders for them; its filter is the
+                // source's.
+                (column_ids::ENTITY_ID_HASH_LOW, ColumnData::U64(values)) if wants(column_ids::ENTITY_ID_HASH_LOW) => {
+                    elided_entity_hashes = values;
+                }
+                (column_ids::ENTITY_ID_HASH_LOW | column_ids::ENTITY_ID_HASH_HIGH, _) => {}
+                (column_id, data) => kept.push(PendingBlock {
+                    column_id,
+                    data,
+                    ..block
+                }),
+            }
+        }
+        blocks = kept;
+    }
     if wanted.is_some() {
         blocks.retain(|block| wants(block.column_id));
     }
@@ -6416,6 +6471,7 @@ fn build_granule(
         by_event_type,
         by_source,
         dictionary_bytes,
+        elided_entity_hashes,
         freetext_row_offsets,
         has_internal_late_event,
         offsets_bytes,

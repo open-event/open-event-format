@@ -355,3 +355,19 @@ fn the_occurred_relative_ingested_at_bit_is_known_but_declared_only_by_files_tha
     );
     assert!(crate::compat::check_features(required_features::OCCURRED_RELATIVE_INGESTED_AT, 0).is_ok());
 }
+
+#[test]
+fn the_entity_hash_columns_elided_bit_is_known_but_declared_only_by_files_that_use_it() {
+    assert_eq!(required_features::ENTITY_HASH_COLUMNS_ELIDED, 1 << 35);
+    assert_eq!(
+        required_features::ENTITY_HASH_COLUMNS_ELIDED & required_features::ALL,
+        0
+    );
+    assert_eq!(
+        required_features::ENTITY_HASH_COLUMNS_ELIDED & !required_features::KNOWN,
+        0
+    );
+    assert!(crate::compat::check_features(required_features::ENTITY_HASH_COLUMNS_ELIDED, 0).is_ok());
+    // A reader that predates the bit does not know it, so it refuses such a file at open.
+    assert_eq!(required_features::ENTITY_HASH_COLUMNS_ELIDED & ((1 << 35) - 1), 0);
+}
