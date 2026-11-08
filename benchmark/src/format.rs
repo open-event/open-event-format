@@ -17,4 +17,10 @@ pub trait Format {
 
 pub trait Opened {
     fn query(&self, query: &Query) -> Result<Partial>;
+
+    /// Removes the given rows (by position in the dataset) the way the format natively can and returns the bytes it
+    /// had to write. `None` means the format cannot remove rows in place, so the caller rewrites the whole file.
+    fn redact(&self, _dataset: &Dataset, _rows: &[usize]) -> Result<Option<u64>> {
+        Ok(None)
+    }
 }

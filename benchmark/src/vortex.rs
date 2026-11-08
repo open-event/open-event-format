@@ -145,7 +145,7 @@ impl Opened for VortexReader {
                         (*name, col)
                     })
                     .collect();
-                total.add(&fold_chunk(&columns, rows, query));
+                total.add(&fold_chunk(&columns, rows, query), query.last_n);
             }
             anyhow::Ok(())
         })?;

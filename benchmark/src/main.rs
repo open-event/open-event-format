@@ -4,6 +4,7 @@
 
 mod dataset;
 mod format;
+mod ingest;
 mod json;
 mod oe;
 mod parquet;
@@ -15,7 +16,7 @@ use anyhow::{Result, bail};
 use dataset::{Profile, generate};
 use format::Format;
 use query::{Partial, Query, lookups, queries};
-use report::{Measurement, QueryTiming, Run};
+use report::{Measurement, QueryTiming, RedactionTiming, Run};
 use std::time::Instant;
 
 fn median(mut values: Vec<f64>) -> f64 {
@@ -45,16 +46,22 @@ fn main() -> Result<()> {
     let reps: usize = arg("--reps", "5").parse()?;
     let out = arg("--out", "results");
     let write_reps: usize = arg("--write-reps", "3").parse()?;
+    let scratch = std::path::PathBuf::from(arg("--scratch", &std::env::temp_dir().to_string_lossy()));
     let formats: Vec<Box<dyn Format>> = vec![
-        Box::new(oe::Oe),
+        Box::new(oe::Oe { lazy: false }),
+        Box::new(oe::Oe { lazy: true }),
         Box::new(parquet::Parquet),
         Box::new(vortex::Vortex::new()?),
         Box::new(json::Json { zstd_level: None }),
         Box::new(json::Json { zstd_level: Some(3) }),
     ];
     let wanted = arg("--formats", "");
+    let profiles = arg("--profiles", "");
     let mut runs = Vec::new();
     for profile in Profile::ALL {
+        if !profiles.is_empty() && !profiles.split(',').any(|p| p == profile.name()) {
+            continue;
+        }
         for &rows in &sizes {
             let dataset = generate(profile, rows);
             let queries = queries(&dataset);
@@ -83,6 +90,14 @@ fn main() -> Result<()> {
                     open_ms.push(millis(started));
                 }
                 let opened = opened.expect("at least one rep");
+                let mut cold_ms = Vec::new();
+                for _ in 0..reps {
+                    let copy = bytes.clone();
+                    let started = Instant::now();
+                    let fresh = format.open(&dataset, copy)?;
+                    fresh.query(&lookups[0])?;
+                    cold_ms.push(millis(started));
+                }
                 let mut timings = Vec::new();
                 for (index, query) in queries.iter().enumerate() {
                     let mut samples = Vec::new();
@@ -101,24 +116,58 @@ fn main() -> Result<()> {
                         median_ms: median(samples),
                     });
                 }
-                let mut samples = Vec::new();
-                let mut combined = Partial::default();
+                let mut grouped: Vec<(String, Vec<f64>, u64)> = Vec::new();
                 for (i, lookup) in lookups.iter().enumerate() {
                     let started = Instant::now();
                     let result = pad(opened.query(lookup)?, lookup);
-                    samples.push(millis(started));
+                    let elapsed = millis(started);
                     check(&mut expected[queries.len() + i], &result, format.name(), lookup.name)?;
-                    combined.add(&result);
+                    match grouped.iter_mut().find(|(name, _, _)| name == lookup.name) {
+                        Some((_, samples, matched)) => {
+                            samples.push(elapsed);
+                            *matched += result.rows;
+                        }
+                        None => grouped.push((lookup.name.to_owned(), vec![elapsed], result.rows)),
+                    }
                 }
-                timings.push(QueryTiming {
-                    name: "entity_lookup".to_owned(),
-                    matched_rows: combined.rows,
-                    median_ms: median(samples),
-                });
+                for (name, samples, matched_rows) in grouped {
+                    timings.push(QueryTiming {
+                        name,
+                        matched_rows,
+                        median_ms: median(samples),
+                    });
+                }
+                let mut redactions = Vec::new();
+                for (name, removed) in [
+                    ("redact_1_event", vec![rows / 2]),
+                    ("redact_1pct_of_events", (0..rows).step_by(100).collect::<Vec<_>>()),
+                ] {
+                    let mut samples = Vec::new();
+                    let mut written = 0;
+                    for _ in 0..write_reps {
+                        let started = Instant::now();
+                        written = match opened.redact(&dataset, &removed)? {
+                            Some(bytes) => bytes,
+                            None => {
+                                opened.query(&queries[0])?;
+                                format.write(&dataset.rows_without(&removed))?.len() as u64
+                            }
+                        };
+                        samples.push(millis(started));
+                    }
+                    redactions.push(RedactionTiming {
+                        bytes_written: written,
+                        median_ms: median(samples),
+                        name: name.to_owned(),
+                        rows_removed: removed.len(),
+                    });
+                }
                 measurements.push(Measurement {
+                    cold_lookup_ms: median(cold_ms),
                     format: format.name().to_owned(),
                     open_ms: median(open_ms),
                     queries: timings,
+                    redactions,
                     size_bytes: size as u64,
                     write_ms: median(write_ms),
                 });
@@ -130,7 +179,13 @@ fn main() -> Result<()> {
             });
         }
     }
-    report::write(&out, &runs, reps, write_reps)?;
+    let ingest = if arg("--skip-ingest", "no") == "yes" {
+        Vec::new()
+    } else {
+        eprintln!("durable ingest");
+        ingest::run(&scratch)?
+    };
+    report::write(&out, &runs, &ingest, reps, write_reps)?;
     Ok(())
 }
 

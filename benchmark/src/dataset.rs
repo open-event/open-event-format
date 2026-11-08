@@ -4,15 +4,17 @@ pub const FIRST_OCCURRED_AT: i64 = 1_700_000_000_000_000_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Profile {
+    Chat,
     Messages,
     Telemetry,
 }
 
 impl Profile {
-    pub const ALL: [Profile; 2] = [Profile::Telemetry, Profile::Messages];
+    pub const ALL: [Profile; 3] = [Profile::Telemetry, Profile::Messages, Profile::Chat];
 
     pub fn name(self) -> &'static str {
         match self {
+            Profile::Chat => "chat",
             Profile::Messages => "messages",
             Profile::Telemetry => "telemetry",
         }
@@ -47,6 +49,46 @@ impl Dataset {
         match self.column(name) {
             Column::I64(values) => values,
             _ => panic!("{name} is not an integer column"),
+        }
+    }
+
+    pub fn slice(&self, start: usize, end: usize) -> Dataset {
+        Dataset {
+            columns: self
+                .columns
+                .iter()
+                .map(|(name, column)| {
+                    let column = match column {
+                        Column::F64(v) => Column::F64(v[start..end].to_vec()),
+                        Column::I64(v) => Column::I64(v[start..end].to_vec()),
+                        Column::Str(v) => Column::Str(v[start..end].to_vec()),
+                    };
+                    (name.clone(), column)
+                })
+                .collect(),
+            profile: self.profile,
+            rows: end - start,
+        }
+    }
+
+    pub fn rows_without(&self, removed: &[usize]) -> Dataset {
+        let drop: std::collections::HashSet<usize> = removed.iter().copied().collect();
+        let keep = |i: &usize| !drop.contains(i);
+        Dataset {
+            columns: self
+                .columns
+                .iter()
+                .map(|(name, column)| {
+                    let column = match column {
+                        Column::F64(v) => Column::F64((0..v.len()).filter(keep).map(|i| v[i]).collect()),
+                        Column::I64(v) => Column::I64((0..v.len()).filter(keep).map(|i| v[i]).collect()),
+                        Column::Str(v) => Column::Str((0..v.len()).filter(keep).map(|i| v[i].clone()).collect()),
+                    };
+                    (name.clone(), column)
+                })
+                .collect(),
+            profile: self.profile,
+            rows: self.rows - drop.len(),
         }
     }
 
@@ -104,10 +146,96 @@ fn sentence(rng: &mut Rng) -> String {
     text
 }
 
+/// Chat traffic as a messaging app sees it: a few very busy rooms and many quiet ones, activity in bursts, a quarter
+/// of messages replying into a thread, and a stream of edits, reactions and redactions alongside the messages.
+fn generate_chat(rows: usize) -> Dataset {
+    let mut rng = Rng::new(0xC4A7 ^ rows as u64);
+    let rooms = (rows / 200).max(50) as u64;
+    let users = (rows / 20).max(100) as u64;
+    let mut event_id = Vec::with_capacity(rows);
+    let mut occurred_at = Vec::with_capacity(rows);
+    let mut entity_id = Vec::with_capacity(rows);
+    let mut event_type = Vec::with_capacity(rows);
+    let mut source = Vec::with_capacity(rows);
+    let mut thread_root = Vec::with_capacity(rows);
+    let mut sender = Vec::with_capacity(rows);
+    let mut body = Vec::with_capacity(rows);
+    let mut msgtype = Vec::with_capacity(rows);
+    let mut length = Vec::with_capacity(rows);
+    let mut recent: std::collections::HashMap<u64, Vec<usize>> = std::collections::HashMap::new();
+    let mut now = FIRST_OCCURRED_AT;
+    for i in 0..rows {
+        now += if rng.below(50) == 0 {
+            2_000_000_000 + rng.below(30_000_000_000) as i64
+        } else {
+            1_000_000 + rng.below(4_000_000) as i64
+        };
+        let outer = rng.skewed(rooms);
+        let room = rng.skewed(outer + 1);
+        let kind = rng.below(100);
+        let (kind, root) = if kind < 80 {
+            let history = recent.entry(room).or_default();
+            let root = if !history.is_empty() && rng.below(4) == 0 {
+                Some(history[rng.below(history.len() as u64) as usize])
+            } else {
+                None
+            };
+            if root.is_none() {
+                history.push(i);
+                if history.len() > 20 {
+                    history.remove(0);
+                }
+            }
+            ("m.room.message", root)
+        } else if kind < 90 {
+            ("m.reaction", None)
+        } else if kind < 97 {
+            ("m.room.message.edit", None)
+        } else {
+            ("m.room.redaction", None)
+        };
+        event_id.push(format!("{:032x}", 0xA000u128 + i as u128));
+        occurred_at.push(now);
+        entity_id.push(format!("!room{room:06}:example.org"));
+        event_type.push(kind.to_owned());
+        source.push(["web", "ios", "android", "bridge"][rng.below(4) as usize].to_owned());
+        thread_root.push(root.map(|r| format!("{:032x}", 0xA000u128 + r as u128)).unwrap_or_default());
+        sender.push(format!("@user{}:example.org", rng.skewed(users)));
+        let text = if kind == "m.room.message" || kind == "m.room.message.edit" {
+            sentence(&mut rng)
+        } else {
+            String::new()
+        };
+        length.push(text.len() as i64);
+        body.push(text);
+        msgtype.push(["m.text", "m.text", "m.text", "m.text", "m.text", "m.text", "m.text", "m.text", "m.image", "m.notice"][rng.below(10) as usize].to_owned());
+    }
+    Dataset {
+        columns: vec![
+            ("event_id".to_owned(), Column::Str(event_id)),
+            ("occurred_at".to_owned(), Column::I64(occurred_at)),
+            ("entity_id".to_owned(), Column::Str(entity_id)),
+            ("event_type".to_owned(), Column::Str(event_type)),
+            ("source".to_owned(), Column::Str(source)),
+            ("thread_root".to_owned(), Column::Str(thread_root)),
+            ("payload.body".to_owned(), Column::Str(body)),
+            ("payload.length".to_owned(), Column::I64(length)),
+            ("payload.msgtype".to_owned(), Column::Str(msgtype)),
+            ("payload.sender".to_owned(), Column::Str(sender)),
+        ],
+        profile: Profile::Chat,
+        rows,
+    }
+}
+
 pub fn generate(profile: Profile, rows: usize) -> Dataset {
+    if profile == Profile::Chat {
+        return generate_chat(rows);
+    }
     let mut rng = Rng::new(0x0E_0E_0E_0E ^ rows as u64);
     let entities = (rows / 40).max(100) as u64;
     let (types, sources): (&[&str], &[&str]) = match profile {
+        Profile::Chat => unreachable!("chat has its own generator"),
         Profile::Messages => (
             &["msg.text", "msg.text", "msg.text", "msg.text", "msg.edit", "msg.react", "msg.join", "msg.redact"],
             &["web", "ios", "android", "bridge"],
@@ -131,6 +259,7 @@ pub fn generate(profile: Profile, rows: usize) -> Dataset {
         event_id.push(format!("{:032x}", 0xA000u128 + i as u128));
         occurred_at.push(now);
         entity_id.push(match profile {
+            Profile::Chat => unreachable!(),
             Profile::Messages => format!("room-{:06}", rng.skewed(entities)),
             Profile::Telemetry => format!("dev-{:06}", rng.below(entities)),
         });
@@ -145,6 +274,7 @@ pub fn generate(profile: Profile, rows: usize) -> Dataset {
         ("source".to_owned(), Column::Str(source)),
     ];
     match profile {
+        Profile::Chat => unreachable!(),
         Profile::Messages => {
             let mut user_id = Vec::with_capacity(rows);
             let mut room = Vec::with_capacity(rows);

@@ -136,7 +136,7 @@ impl Opened for ParquetFile {
                         (*name, col)
                     })
                     .collect();
-                total.add(&fold_chunk(&columns, batch.num_rows(), query));
+                total.add(&fold_chunk(&columns, batch.num_rows(), query), query.last_n);
             }
         }
         Ok(total)

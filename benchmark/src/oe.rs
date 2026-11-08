@@ -5,10 +5,13 @@ use crate::dataset::{Column, Dataset};
 use crate::format::{Format, Opened};
 use crate::query::{Col, Partial, Predicate, Query, fold_chunk, needed};
 use anyhow::{Result, anyhow};
-use oe::artifacts::batch::{EventInput, PayloadInput};
+use oe::artifacts::batch::{EventInput, PayloadInput, build_batch};
+use oe::artifacts::frame::{FrameBuildInput, build_frame};
 use oe::columns::{FreetextDeclaration, PromotionPlan, column_ids};
 use oe::encoding::ColumnData;
 use oe::events::variant::VariantValue;
+use oe::deletes::{DeletionVector, encode_deletion_vector};
+use oe::events::relationships::{EventRelationships, RelationshipKind, RelationshipRef, TargetIdSpace};
 use oe::events::{EventEnvelope, EventFlags, EventId, StreamId, TenantId, TimestampValue};
 use oe::indexes::stable_hash;
 use oe::layout::reader::OeFile;
@@ -18,7 +21,9 @@ use oe::typed_id::TypedIdTestExt;
 use oe::writer::build::{BuildLifecycle, OeBuildConfig, OeRow, SharedStrings, build_oe_file};
 use std::collections::BTreeMap;
 
-pub struct Oe;
+pub struct Oe {
+    pub lazy: bool,
+}
 
 fn config() -> OeBuildConfig {
     OeBuildConfig {
@@ -48,77 +53,143 @@ fn config() -> OeBuildConfig {
     }
 }
 
+/// The dataset's columns resolved once, so building event `i` costs no lookups.
+pub struct EventColumns<'a> {
+    entity: &'a [String],
+    event_ids: &'a [String],
+    event_type: &'a [String],
+    occurred: &'a [i64],
+    payload: Vec<(&'a str, &'a Column)>,
+    roots: Option<&'a Vec<String>>,
+    source: &'a [String],
+}
+
+impl<'a> EventColumns<'a> {
+    pub fn new(dataset: &'a Dataset) -> Self {
+        let roots = dataset.columns.iter().find(|(name, _)| name == "thread_root").map(|(_, column)| match column {
+            Column::Str(values) => values,
+            _ => panic!("thread_root is text"),
+        });
+        Self {
+            entity: dataset.strs("entity_id"),
+            event_ids: dataset.strs("event_id"),
+            event_type: dataset.strs("event_type"),
+            occurred: dataset.i64s("occurred_at"),
+            payload: dataset
+                .columns
+                .iter()
+                .filter_map(|(name, column)| name.strip_prefix("payload.").map(|field| (field, column)))
+                .collect(),
+            roots,
+            source: dataset.strs("source"),
+        }
+    }
+
+    pub fn input(&self, i: usize) -> Result<EventInput> {
+        let mut fields = BTreeMap::new();
+        for (name, column) in &self.payload {
+            let value = match column {
+                Column::F64(values) => VariantValue::Double(values[i]),
+                Column::I64(values) => VariantValue::Int(values[i]),
+                Column::Str(values) => VariantValue::String(values[i].clone()),
+            };
+            fields.insert((*name).to_owned(), value);
+        }
+        let relationships = match self.roots {
+            Some(roots) if !roots[i].is_empty() => {
+                let root = u128::from_str_radix(&roots[i], 16)?;
+                Some(EventRelationships::new(vec![RelationshipRef::new(
+                    RelationshipKind::Root,
+                    TargetIdSpace::EventId,
+                    root.to_be_bytes().to_vec(),
+                )?])?)
+            }
+            _ => None,
+        };
+        Ok(EventInput {
+            connector_delivery_hash_high: 0,
+            connector_delivery_hash_low: 0,
+            envelope: EventEnvelope {
+                account_id: None,
+                account_id_hash_low: 0,
+                actor_id: None,
+                actor_id_hash_low: 0,
+                dedupe_hash_high: 0,
+                dedupe_hash_low: i as u64,
+                entity_id: Some(self.entity[i].clone()),
+                entity_id_hash_high: 0,
+                entity_id_hash_low: stable_hash(self.entity[i].as_bytes()),
+                entity_type: "entity".to_owned(),
+                event_id: EventId::new_test_id(0xA000 + i as u128),
+                event_type: self.event_type[i].clone(),
+                flags: EventFlags(0),
+                ingested_at: TimestampValue::from_physical_nanos(self.occurred[i] + 1_000),
+                occurred_at: TimestampValue::from_physical_nanos(self.occurred[i]),
+                schema_version: 1,
+                source: self.source[i].clone(),
+                stream_id: StreamId(1),
+                stream_sequence: i as u64,
+                tenant_id: TenantId::new_test_id(7),
+                trace_id_hash_low: 0,
+            },
+            payload: PayloadInput::Variant(VariantValue::Object(fields)),
+            provenance: None,
+            relationships,
+            source_delivery: None,
+            source_schema: None,
+        })
+    }
+}
+
+/// Appends one journal frame holding `events` (rows `first..first + events.len()` of the stream).
+pub fn journal_frame(events: &[EventInput], first: usize, batch: u64) -> Result<Vec<u8>> {
+    let payload = build_batch(events, 1, 0)?;
+    let input = FrameBuildInput {
+        committed_at_physical: 42,
+        created_at_physical: 42,
+        dictionary_generation_hint: 0,
+        durable_batch_id: batch,
+        epoch: 1,
+        event_count: events.len() as u32,
+        first_sequence: first as u64 + 1,
+        flags: 0,
+        last_sequence: (first + events.len()) as u64,
+        schema_generation: 1,
+        tenant_id: TenantId::new_test_id(7),
+        writer_id: 1,
+        writer_local_batch_id: batch,
+    };
+    Ok(build_frame(&input, &payload)?)
+}
+
 impl Format for Oe {
     fn name(&self) -> &'static str {
-        "oe"
+        if self.lazy { "oe (lazy open)" } else { "oe" }
     }
 
     fn write(&self, dataset: &Dataset) -> Result<Vec<u8>> {
-        let entity = dataset.strs("entity_id");
-        let occurred = dataset.i64s("occurred_at");
-        let event_type = dataset.strs("event_type");
-        let source = dataset.strs("source");
-        let payload_columns: Vec<(&str, &Column)> = dataset
-            .columns
-            .iter()
-            .filter_map(|(name, column)| name.strip_prefix("payload.").map(|field| (field, column)))
-            .collect();
+        let columns = EventColumns::new(dataset);
         let mut shared = SharedStrings::default();
         let mut rows = Vec::with_capacity(dataset.rows);
         for i in 0..dataset.rows {
-            let mut fields = BTreeMap::new();
-            for (name, column) in &payload_columns {
-                let value = match column {
-                    Column::F64(values) => VariantValue::Double(values[i]),
-                    Column::I64(values) => VariantValue::Int(values[i]),
-                    Column::Str(values) => VariantValue::String(values[i].clone()),
-                };
-                fields.insert((*name).to_owned(), value);
-            }
-            rows.push(shared.build_row(OeRow {
+            let mut row = shared.build_row(OeRow {
                 epoch: 1,
-                event: EventInput {
-                    connector_delivery_hash_high: 0,
-                    connector_delivery_hash_low: 0,
-                    envelope: EventEnvelope {
-                        account_id: None,
-                        account_id_hash_low: 0,
-                        actor_id: None,
-                        actor_id_hash_low: 0,
-                        dedupe_hash_high: 0,
-                        dedupe_hash_low: i as u64,
-                        entity_id: Some(entity[i].clone()),
-                        entity_id_hash_high: 0,
-                        entity_id_hash_low: stable_hash(entity[i].as_bytes()),
-                        entity_type: "entity".to_owned(),
-                        event_id: EventId::new_test_id(0xA000 + i as u128),
-                        event_type: event_type[i].clone(),
-                        flags: EventFlags(0),
-                        ingested_at: TimestampValue::from_physical_nanos(occurred[i] + 1_000),
-                        occurred_at: TimestampValue::from_physical_nanos(occurred[i]),
-                        schema_version: 1,
-                        source: source[i].clone(),
-                        stream_id: StreamId(1),
-                        stream_sequence: i as u64,
-                        tenant_id: TenantId::new_test_id(7),
-                        trace_id_hash_low: 0,
-                    },
-                    payload: PayloadInput::Variant(VariantValue::Object(fields)),
-                    provenance: None,
-                    relationships: None,
-                    source_delivery: None,
-                    source_schema: None,
-                },
+                event: columns.input(i)?,
                 sequence: i as u64 + 1,
-            }));
+            });
+            row.external_id = Some(columns.event_ids[i].as_bytes().to_vec());
+            rows.push(row);
         }
         Ok(build_oe_file(rows, &config())?.bytes)
     }
 
     fn open(&self, _dataset: &Dataset, bytes: Vec<u8>) -> Result<Box<dyn Opened>> {
-        Ok(Box::new(OeReader {
-            file: OeFile::open(bytes, None)?,
-        }))
+        let file = if self.lazy {
+            OeFile::open_lazy(bytes, None, None)?
+        } else {
+            OeFile::open(bytes, None)?
+        };
+        Ok(Box::new(OeReader { file }))
     }
 }
 
@@ -127,6 +198,42 @@ struct OeReader {
 }
 
 impl OeReader {
+    /// Totals the folded columns over the given row ordinals, reading each granule that holds one of them once.
+    fn rows_partial(&self, ordinals: &[u64], query: &Query) -> Result<Partial> {
+        let granules = &self.file.footer().granules;
+        let mut totals = Partial::default();
+        let mut i = 0;
+        while i < ordinals.len() {
+            let granule = granules
+                .iter()
+                .find(|g| ordinals[i] >= g.first_row_ordinal && ordinals[i] < g.first_row_ordinal + u64::from(g.row_count))
+                .ok_or_else(|| anyhow!("row {} is in no granule", ordinals[i]))?;
+            let end = granule.first_row_ordinal + u64::from(granule.row_count);
+            let mut picked = Vec::new();
+            while i < ordinals.len() && ordinals[i] < end {
+                picked.push((ordinals[i] - granule.first_row_ordinal) as usize);
+                i += 1;
+            }
+            let mut integers: Vec<Vec<i64>> = Vec::new();
+            for name in &query.fold {
+                let read = self.file.read_column(self.column_id(name)?, granule.granule_id)?;
+                match read.data {
+                    ColumnData::I64(values) => integers.push(picked.iter().map(|&p| values[p]).collect()),
+                    _ => return Err(anyhow!("index lookups fold integer columns only")),
+                }
+            }
+            let columns: Vec<(&str, Col)> = query.fold.iter().zip(&integers).map(|(n, v)| (*n, Col::I64(v))).collect();
+            let plain = Query {
+                fold: query.fold.clone(),
+                last_n: None,
+                name: query.name,
+                predicates: Vec::new(),
+            };
+            totals.add(&fold_chunk(&columns, picked.len(), &plain), None);
+        }
+        Ok(totals)
+    }
+
     fn column_id(&self, name: &str) -> Result<u32> {
         let physical = match name {
             "event_id" => Some(column_ids::EVENT_ID),
@@ -151,7 +258,35 @@ impl OeReader {
 }
 
 impl Opened for OeReader {
+    fn redact(&self, dataset: &Dataset, rows: &[usize]) -> Result<Option<u64>> {
+        let ids = dataset.strs("event_id");
+        let mut vector = DeletionVector::new();
+        for &row in rows {
+            let ordinal = self
+                .file
+                .row_by_external_id(ids[row].as_bytes())?
+                .ok_or_else(|| anyhow!("event {} not found", ids[row]))?;
+            vector.mark_deleted(ordinal);
+        }
+        let (_, bytes) = encode_deletion_vector(&vector);
+        assert_eq!(vector.deleted_count(), rows.len() as u64, "every redacted event was found");
+        Ok(Some(bytes.len() as u64))
+    }
+
     fn query(&self, query: &Query) -> Result<Partial> {
+        let by_index = query.predicates.iter().find_map(|p| match p {
+            Predicate::EqStr { column: "thread_root", value } => {
+                let root = u128::from_str_radix(value, 16).ok()?;
+                Some(self.file.thread_rows(TargetIdSpace::EventId, &root.to_be_bytes()))
+            }
+            Predicate::EqStr { column: "event_id", value } => {
+                Some(self.file.row_by_external_id(value.as_bytes()).map(|row| row.into_iter().collect()))
+            }
+            _ => None,
+        });
+        if let Some(rows) = by_index {
+            return self.rows_partial(&rows?, query);
+        }
         let names = needed(query);
         let ids: Vec<u32> = names.iter().map(|n| self.column_id(n)).collect::<Result<_>>()?;
         let footer = self.file.footer();
@@ -224,7 +359,7 @@ impl Opened for OeReader {
                     (*name, col)
                 })
                 .collect();
-            total.add(&fold_chunk(&columns, rows, query));
+            total.add(&fold_chunk(&columns, rows, query), query.last_n);
         }
         Ok(total)
     }
