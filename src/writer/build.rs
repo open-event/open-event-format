@@ -5171,6 +5171,20 @@ fn build_oe_file_sealed_in_order(
         optional_flags |= optional_features::TIME_SERIES_ROLLUPS;
     }
 
+    // A sparse update changes payloads and dedupe hashes only, so every row keeps its entity: the source's summary is
+    // this file's, and `rows` may hold only the rebuilt granules' rows anyway.
+    let entity_summary = match sparse_reuse {
+        Some(reuse) => reuse.source.entity_summary.clone(),
+        None => crate::indexes::entity_summary::EntitySummary::from_keys(rows.iter().map(|row| {
+            crate::indexes::entity_summary::EntityKey::new(
+                row.envelope.entity_id_hash_high,
+                row.envelope.entity_id_hash_low,
+            )
+        })),
+    };
+    // The footer carries the same summary, so a reader holding only the file recovers it.
+    optional_flags |= optional_features::ENTITY_SUMMARY;
+
     // Schema fingerprint over the column directory.
     let mut schema_hash = blake3::Hasher::new();
     for column in &columns {
@@ -5219,6 +5233,7 @@ fn build_oe_file_sealed_in_order(
         // The writer does not yet emit internal embedding/vector column blocks, so there is no per-row index to carry.
         embedding_row_offsets: Vec::new(),
         entity_hash_filters,
+        entity_summary: Some(entity_summary.clone()),
         // The writer emits only natively-known encodings, so no optional block needs a forward-compatibility escape
         // hatch.
         escape_hatches: Vec::new(),
@@ -5432,17 +5447,6 @@ fn build_oe_file_sealed_in_order(
         }
     };
 
-    // A sparse update changes payloads and dedupe hashes only, so every row keeps its entity: the source's summary is
-    // this file's, and `rows` may hold only the rebuilt granules' rows anyway.
-    let entity_summary = match sparse_reuse {
-        Some(reuse) => reuse.source.entity_summary.clone(),
-        None => crate::indexes::entity_summary::EntitySummary::from_keys(rows.iter().map(|row| {
-            crate::indexes::entity_summary::EntityKey::new(
-                row.envelope.entity_id_hash_high,
-                row.envelope.entity_id_hash_low,
-            )
-        })),
-    };
     phase_clock.transition(BuildPhase::RowDestruction);
     // The caller transfers ownership of every payload tree to the build. Releasing a large batch serially was visible
     // on the create/update critical path even after all output bytes were complete; fan the independent tree drops

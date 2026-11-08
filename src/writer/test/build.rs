@@ -4331,3 +4331,15 @@ fn granule_bounds_come_from_one_pass_that_agrees_with_separate_folds() {
         assert!((granule.first_epoch, granule.first_sequence) <= (granule.last_epoch, granule.last_sequence));
     }
 }
+
+#[test]
+fn a_built_file_carries_its_entity_summary_for_a_reader_holding_only_the_file() {
+    use crate::writer::merge::tests::{build_config, rows_of};
+    let built = build_oe_file(rows_of(1..=20), &build_config()).unwrap();
+    assert_ne!(
+        built.footer.optional_feature_flags & crate::layout::optional_features::ENTITY_SUMMARY,
+        0
+    );
+    let file = OeFile::open(built.bytes.clone(), Some(&built.file_seal)).unwrap();
+    assert_eq!(file.entity_summary(), Some(&built.entity_summary));
+}

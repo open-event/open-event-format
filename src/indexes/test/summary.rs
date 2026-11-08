@@ -33,6 +33,7 @@ fn footer_with(granules: Vec<GranuleEntry>, row_count: u64) -> Footer {
         dictionaries: FileDictionaries::default(),
         embedding_row_offsets: Vec::new(),
         entity_hash_filters: Vec::new(),
+        entity_summary: None,
         escape_hatches: Vec::new(),
         exact_counts: ExactCounts {
             row_count,
@@ -319,6 +320,9 @@ fn granule_stats_and_summaries_are_validated_against_the_footer() {
         ..summary
     };
     assert!(stale.validate_against_footer(&footer).is_err());
-    let miscounted = ManifestSummary { row_count: 9, ..summary };
+    let miscounted = ManifestSummary {
+        row_count: 9,
+        ..summary
+    };
     assert!(miscounted.validate_against_footer(&footer).is_err());
 }
