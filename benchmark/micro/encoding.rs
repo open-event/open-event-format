@@ -4,8 +4,8 @@
 //! Every input is generated deterministically, encoded once outside the timed loop with no trailing compression stage,
 //! and then decoded or filtered inside it, so a run measures only the kernel named by the benchmark id.
 //!
-//! Run: `just bench-micro encoding` or `cargo bench --bench encoding`, or name a group to run only it, e.g.
-//! `cargo bench --bench encoding -- filter/for`.
+//! Run: `just bench-micro encoding` or, from `benchmark/`, `cargo bench --bench encoding`, or name a group to run only it, e.g.
+//! `just bench-micro encoding filter/for`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 

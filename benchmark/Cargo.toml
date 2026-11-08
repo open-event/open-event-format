@@ -13,16 +13,19 @@ build = "build.rs"
 [lib]
 name = "oe_operations_benchmark"
 path = "operations/lib.rs"
+bench = false
 
 # Whole-file comparison: `compare/`.
 [[bin]]
 name = "oe-benchmark"
 path = "compare/main.rs"
+bench = false
 
 # Per-operation comparison: `operations/`.
 [[bin]]
 name = "oe-vs-parquet"
 path = "operations/main.rs"
+bench = false
 
 [features]
 # Installs the counting allocator in `allocation`, so a run can report allocation and peak-memory totals. Off by
@@ -51,7 +54,19 @@ vortex = { version = "0.93.0", features = ["tokio"] }
 zstd = "0.13"
 
 [dev-dependencies]
+criterion = "0.8.2"
 tempfile = "3"
+
+# Criterion kernel benches: `micro/`.
+[[bench]]
+name = "encoding"
+path = "micro/encoding.rs"
+harness = false
+
+[[bench]]
+name = "vector"
+path = "micro/vector.rs"
+harness = false
 
 [lints.rust]
 unsafe_code = "deny"

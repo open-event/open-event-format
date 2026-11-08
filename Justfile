@@ -4,7 +4,7 @@
 #   - micro:      Criterion kernel benches in `benchmark/micro/` (encoding, vector)
 #   - compare:    `benchmark/compare/`, OE vs Parquet, Vortex and JSON (size, write, scans, lookups, ingest)
 #   - operations: `benchmark/operations/`, OE vs Parquet and Vortex per operation (create, read, update, delete, search, diff)
-# Both comparisons are binaries of one standalone crate, `benchmark/` (kept out of the library's build so it never
+# All three suites live in one standalone crate, `benchmark/` (kept out of the library's build so it never
 # pulls in Parquet or Vortex); `--target-dir` points it at the shared `target/` so dependencies are built once.
 
 set shell := ["bash", "-euo", "pipefail", "-c"]
@@ -42,7 +42,7 @@ fuzz target seconds="60":
 
 # Compile every benchmark suite without running anything.
 bench-build:
-    cargo bench --no-run
+    cd benchmark && cargo bench --no-run --target-dir {{ target }}
     cd benchmark && cargo build --release --target-dir {{ target }}
 
 # Unit tests of the comparison harnesses.
@@ -51,7 +51,7 @@ bench-test:
 
 # Criterion micro benches. `just bench-micro encoding filter/for` runs one bench, filtered.
 bench-micro bench="" *filter:
-    cargo bench {{ if bench == "" { "" } else { "--bench " + bench } }} {{ if filter == "" { "" } else { "-- " + filter } }}
+    cd benchmark && cargo bench --target-dir {{ target }} {{ if bench == "" { "" } else { "--bench " + bench } }} {{ if filter == "" { "" } else { "-- " + filter } }}
 
 # OE vs Parquet/Vortex/JSON. Writes `benchmark/results/`. Extra flags pass through, e.g. `--profiles chat`.
 bench-compare *args="--sizes 10000,100000,1000000 --reps 5 --write-reps 3":
@@ -63,7 +63,7 @@ bench-ops dir=(target / "bench-ops") *args="":
 
 # Quick pass through every suite on small inputs; checks they all run, numbers are not meaningful.
 bench-smoke:
-    cargo bench -- --quick --warm-up-time 0.1 --measurement-time 0.2
+    cd benchmark && cargo bench --target-dir {{ target }} --benches -- --quick --warm-up-time 0.1 --measurement-time 0.2
     cd benchmark && cargo run --release --target-dir {{ target }} --bin oe-benchmark -- --sizes 10000 --reps 1 --write-reps 1 --skip-ingest yes --out {{ target }}/bench-smoke
     cd benchmark && cargo run --release --target-dir {{ target }} --bin oe-vs-parquet -- {{ target }}/bench-smoke-ops
 
