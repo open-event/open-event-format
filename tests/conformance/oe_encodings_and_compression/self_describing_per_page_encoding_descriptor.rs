@@ -95,7 +95,10 @@ fn decode_cost_planning_from_the_descriptor() {
     let fsst_block = encode_block(&ColumnData::Strings(ids), true);
 
     assert_eq!(dict_block.pipeline.transform().unwrap(), Transform::DictionaryString);
-    assert_eq!(fsst_block.pipeline.transform().unwrap(), Transform::FsstString);
+    assert!(matches!(
+        fsst_block.pipeline.transform().unwrap(),
+        Transform::FsstString | Transform::FsstPackedString
+    ));
 
     // Extract descriptors from the page headers.
     let dict_desc = extract_descriptor(dict_block.pipeline, &dict_block.bytes).unwrap();

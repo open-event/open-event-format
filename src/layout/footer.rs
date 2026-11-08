@@ -125,6 +125,9 @@ pub mod sections {
     /// Optional: the file's entity summary. Present exactly when the file declares the `ENTITY_SUMMARY` optional
     /// feature; readers that predate the id skip it.
     pub const ENTITY_SUMMARY: u32 = 42;
+    /// Optional: the file's external-id index in its packed form (see [`encode_external_ids_packed`]). Writers emit
+    /// it in place of the legacy fixed-width `EXTERNAL_IDS` section; readers accept either.
+    pub const EXTERNAL_IDS_PACKED: u32 = 43;
 }
 
 /// Logical column kind codes (stored in the column directory).
@@ -1264,12 +1267,8 @@ fn encode_sections(footer: &Footer) -> SectionArea {
 
     // The external-id index: optional, emitted only when some row carries an external id.
     if !footer.external_ids.is_empty() {
-        sections.push(sections::EXTERNAL_IDS, |out| {
-            out.put_u32(footer.external_ids.len() as u32);
-            for entry in &footer.external_ids {
-                out.put_u64(entry.id_hash);
-                out.put_u64(entry.row_ordinal);
-            }
+        sections.push(sections::EXTERNAL_IDS_PACKED, |out| {
+            encode_external_ids_packed(&footer.external_ids, out);
         });
     }
 
@@ -1436,7 +1435,11 @@ const DIRECTORY_ENTRY_LEN: usize = 4 + 8 + 8 + 32;
 /// Serializes the footer blob (preamble + section/checksum directory + sections). The caller appends `footer_len` +
 /// magic.
 pub fn encode_footer(footer: &Footer) -> Vec<u8> {
-    let sections = encode_sections(footer);
+    assemble_footer(footer, encode_sections(footer))
+}
+
+/// Writes the preamble, directory and section area for an already encoded set of sections.
+fn assemble_footer(footer: &Footer, sections: SectionArea) -> Vec<u8> {
     let area = sections.bytes.into_bytes();
     let mut out = Writer::with_capacity(PREAMBLE_LEN + sections.directory.len() * DIRECTORY_ENTRY_LEN + area.len());
     out.put_u16(footer.format_version.0);
@@ -1521,6 +1524,191 @@ fn decode_audit_trail(bytes: &[u8]) -> Result<AuditTrail, FormatError> {
 
 fn require<'a>(section: Option<&'a [u8]>, rule: &'static str) -> Result<&'a [u8], FormatError> {
     section.ok_or(FormatError::Structural { rule })
+}
+
+/// Entries per hash-delta block of the packed external-id index; each block carries its own bit width.
+const EXTERNAL_ID_BLOCK: usize = 128;
+
+/// Bits needed to hold `value` (0 for 0).
+fn bit_width(value: u64) -> u8 {
+    (u64::BITS - value.leading_zeros()) as u8
+}
+
+/// Little-endian bit packer: values are appended least-significant bit first.
+struct BitPacker {
+    bytes: Vec<u8>,
+    acc: u128,
+    bits: u32,
+}
+
+impl BitPacker {
+    fn new() -> Self {
+        Self {
+            bytes: Vec::new(),
+            acc: 0,
+            bits: 0,
+        }
+    }
+
+    fn put(&mut self, value: u64, width: u8) {
+        if width == 0 {
+            return;
+        }
+        let mask = if width >= 64 { u64::MAX } else { (1u64 << width) - 1 };
+        self.acc |= u128::from(value & mask) << self.bits;
+        self.bits += u32::from(width);
+        while self.bits >= 8 {
+            self.bytes.push(self.acc as u8);
+            self.acc >>= 8;
+            self.bits -= 8;
+        }
+    }
+
+    /// Flushes the partial byte (zero padded) and returns the packed bytes.
+    fn finish(mut self) -> Vec<u8> {
+        if self.bits > 0 {
+            self.bytes.push(self.acc as u8);
+        }
+        self.bytes
+    }
+}
+
+/// Reads `width`-bit values packed by [`BitPacker`] from a slice already sized by the caller; never panics.
+/// Unpacks `n` values of `width` bits (least-significant first) from `bytes`, handing each to `sink`. The input is
+/// copied once into a buffer padded by 16 zero bytes so every value is one unaligned 16-byte window load, a shift and
+/// a mask, with no per-value bounds branch beyond the slice lookup. `bytes` must hold exactly `ceil(n * width / 8)`
+/// bytes (the caller takes that many from the section), so nothing past the input is ever read as data.
+fn unpack_bits(bytes: &[u8], width: u8, n: usize, mut sink: impl FnMut(u64)) -> Result<(), FormatError> {
+    if width == 0 {
+        for _ in 0..n {
+            sink(0);
+        }
+        return Ok(());
+    }
+    let width = usize::from(width);
+    if bytes.len() * 8 < n * width {
+        return Err(FormatError::Structural {
+            rule: "external id packed bits truncated",
+        });
+    }
+    let mut padded = Vec::with_capacity(bytes.len() + 16);
+    padded.extend_from_slice(bytes);
+    padded.resize(bytes.len() + 16, 0);
+    let mask = if width == 64 { u64::MAX } else { (1u64 << width) - 1 };
+    let mut bit = 0usize;
+    for _ in 0..n {
+        let start = bit / 8;
+        let window: [u8; 16] =
+            padded
+                .get(start..start + 16)
+                .and_then(|w| w.try_into().ok())
+                .ok_or(FormatError::Structural {
+                    rule: "external id packed bits truncated",
+                })?;
+        sink(((u128::from_le_bytes(window) >> (bit % 8)) as u64) & mask);
+        bit += width;
+    }
+    Ok(())
+}
+
+/// Packed external-id index (section `EXTERNAL_IDS_PACKED`):
+/// `count u32`, then when `count > 0`: `ordinal_width u8 | first_hash u64`, then the `count - 1` hash deltas in blocks
+/// of 128 as `width u8 | ceil(n * width / 8) bytes`, then all row ordinals packed at `ordinal_width` bits
+/// (`ceil(count * ordinal_width / 8)` bytes). Bits are packed least-significant first; deltas wrap modulo 2^64.
+pub fn encode_external_ids_packed(entries: &[ExternalIdEntry], out: &mut Writer) {
+    out.put_u32(entries.len() as u32);
+    let Some(first) = entries.first() else {
+        return;
+    };
+    let max_ordinal = entries.iter().map(|entry| entry.row_ordinal).max().unwrap_or(0);
+    let ordinal_width = bit_width(max_ordinal);
+    out.put_u8(ordinal_width);
+    out.put_u64(first.id_hash);
+    let deltas: Vec<u64> = entries
+        .windows(2)
+        .map(|pair| match pair {
+            [a, b] => b.id_hash.wrapping_sub(a.id_hash),
+            _ => 0,
+        })
+        .collect();
+    for block in deltas.chunks(EXTERNAL_ID_BLOCK) {
+        let width = block.iter().copied().map(bit_width).max().unwrap_or(0);
+        out.put_u8(width);
+        let mut packer = BitPacker::new();
+        for &delta in block {
+            packer.put(delta, width);
+        }
+        out.put_slice(&packer.finish());
+    }
+    let mut packer = BitPacker::new();
+    for entry in entries {
+        packer.put(entry.row_ordinal, ordinal_width);
+    }
+    out.put_slice(&packer.finish());
+}
+
+fn packed_len(count: usize, width: u8) -> Result<usize, FormatError> {
+    count
+        .checked_mul(usize::from(width))
+        .map(|bits| bits.div_ceil(8))
+        .ok_or(FormatError::Structural {
+            rule: "external id packed length overflows",
+        })
+}
+
+/// Decodes [`encode_external_ids_packed`]; every length is checked against the section before allocation.
+pub fn decode_external_ids_packed(bytes: &[u8]) -> Result<Vec<ExternalIdEntry>, FormatError> {
+    let mut r = Reader::new(bytes);
+    let count = r.u32("external id count")? as usize;
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let ordinal_width = r.u8("external id ordinal width")?;
+    let mut hash = r.u64("external id first hash")?;
+    // Each delta block costs at least its width byte, so the block count bounds the entry count before allocating.
+    let blocks = (count - 1).div_ceil(EXTERNAL_ID_BLOCK);
+    if blocks > r.remaining() || ordinal_width > 64 {
+        return Err(FormatError::Structural {
+            rule: "external id count exceeds input",
+        });
+    }
+    let mut entries = Vec::with_capacity(count);
+    entries.push(ExternalIdEntry {
+        id_hash: hash,
+        row_ordinal: 0,
+    });
+    let mut left = count - 1;
+    while left > 0 {
+        let n = left.min(EXTERNAL_ID_BLOCK);
+        let width = r.u8("external id delta width")?;
+        if width > 64 {
+            return Err(FormatError::Structural {
+                rule: "external id delta width exceeds 64",
+            });
+        }
+        let bytes = r.take(packed_len(n, width)?, "external id deltas")?;
+        unpack_bits(bytes, width, n, |delta| {
+            hash = hash.wrapping_add(delta);
+            entries.push(ExternalIdEntry {
+                id_hash: hash,
+                row_ordinal: 0,
+            });
+        })?;
+        left -= n;
+    }
+    let bytes = r.take(packed_len(count, ordinal_width)?, "external id rows")?;
+    let mut slots = entries.iter_mut();
+    unpack_bits(bytes, ordinal_width, count, |row| {
+        if let Some(entry) = slots.next() {
+            entry.row_ordinal = row;
+        }
+    })?;
+    if r.remaining() != 0 {
+        return Err(FormatError::Structural {
+            rule: "external id index has trailing bytes",
+        });
+    }
+    Ok(entries)
 }
 
 /// Refusing bound on a decoded element count, checked before any allocation: a count whose minimum encoding cannot
@@ -2104,9 +2292,11 @@ pub fn decode_footer(blob: &[u8]) -> Result<Footer, FormatError> {
         }
     }
 
-    // The external-id index: optional. Fixed entry size: 8 (id hash) + 8 (row ordinal) = 16 bytes.
+    // The external-id index: optional. The packed form wins; the legacy fixed 16-byte-entry form still opens.
     let mut external_ids = Vec::new();
-    if let Some(index_bytes) = decode_section(&directory, section_area, sections::EXTERNAL_IDS)? {
+    if let Some(index_bytes) = decode_section(&directory, section_area, sections::EXTERNAL_IDS_PACKED)? {
+        external_ids = decode_external_ids_packed(index_bytes)?;
+    } else if let Some(index_bytes) = decode_section(&directory, section_area, sections::EXTERNAL_IDS)? {
         let mut r = Reader::new(index_bytes);
         let count = r.u32("external id count")? as usize;
         let count = bounded_count(count, 16, &r, "external id count exceeds input")?;

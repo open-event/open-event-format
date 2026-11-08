@@ -2,7 +2,12 @@ use super::*;
 use crate::artifacts::batch::{EventInput, PayloadInput};
 use crate::artifacts::state_chunk::build_state_tree;
 use crate::columns::{FreetextDeclaration, PromotedColumn, PromotionPlan, column_ids};
-use crate::compat::tests::{PRE_GRAPH_KNOWN, PRE_TIME_SERIES_REQUIRED_KNOWN};
+use crate::compat::tests::{PRE_GRAPH_KNOWN as PRE_GRAPH_BITS, PRE_TIME_SERIES_REQUIRED_KNOWN as PRE_TIME_SERIES_BITS};
+
+/// The fixtures' rows store `ingested_at` relative to `occurred_at`, a later bit orthogonal to the ones these tests
+/// pin, so the "older" readers below are granted it and the tests keep isolating the bit they are about.
+const PRE_GRAPH_KNOWN: u64 = PRE_GRAPH_BITS | required_features::OCCURRED_RELATIVE_INGESTED_AT;
+const PRE_TIME_SERIES_REQUIRED_KNOWN: u64 = PRE_TIME_SERIES_BITS | required_features::OCCURRED_RELATIVE_INGESTED_AT;
 use crate::events::variant::VariantValue;
 use crate::events::{
     EventEnvelope, EventFlags, EventId, RelationshipKind, RelationshipRef, StreamId, TenantId, TimestampValue,

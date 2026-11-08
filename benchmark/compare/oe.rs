@@ -296,7 +296,7 @@ impl OeReader {
                     _ => return Err(anyhow!("entity_id is not a string column")),
                 }
             } else {
-                filter_string_block_or_decode(raw.pipeline, raw.body, &entity_test)?
+                filter_string_block_or_decode(raw.pipeline, &raw.body, &entity_test)?
             };
             let mut picked: Vec<usize> = keep.iter().enumerate().filter(|(_, k)| **k).map(|(i, _)| i).collect();
             if picked.is_empty() {
@@ -306,11 +306,11 @@ impl OeReader {
                 let raw = self.file.read_column_raw(column_ids::EVENT_TYPE_ID, id)?;
                 if picked.len() * SPARSE_TAKE_DIVISOR < keep.len() {
                     // A quiet entity's few rows are tested alone, each event type read straight from its packed lane.
-                    let verdicts = test.filter_decoded(&take_block_rows(raw.pipeline, raw.body, &picked)?);
+                    let verdicts = test.filter_decoded(&take_block_rows(raw.pipeline, &raw.body, &picked)?);
                     let mut verdict = verdicts.iter();
                     picked.retain(|_| verdict.next().copied().unwrap_or(false));
                 } else {
-                    let verdicts = filter_numeric_block_or_decode(raw.pipeline, raw.body, test)?;
+                    let verdicts = filter_numeric_block_or_decode(raw.pipeline, &raw.body, test)?;
                     picked.retain(|&row| verdicts.get(row).copied().unwrap_or(false));
                 }
                 if picked.is_empty() {
@@ -339,9 +339,9 @@ impl OeReader {
             && raw.presence.is_empty()
         {
             if rows.len() == row_count {
-                return Ok(decode_block(raw.pipeline, raw.body)?);
+                return Ok(decode_block(raw.pipeline, &raw.body)?);
             }
-            return Ok(take_block_rows(raw.pipeline, raw.body, rows)?);
+            return Ok(take_block_rows(raw.pipeline, &raw.body, rows)?);
         }
         let ColumnData::I64(values) = self.file.read_column(column, granule)?.data else {
             return Err(anyhow!("fold column is not i64"));

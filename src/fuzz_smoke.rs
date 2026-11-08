@@ -361,3 +361,59 @@ fn mutated_graph_footer_sections_never_panic() {
         }
     }
 }
+
+/// Flips bytes across a valid packed-lengths FSST block and truncates it: every read path refuses or answers, never
+/// panics, and every truncation is refused by a whole-block decode.
+#[test]
+fn mutated_packed_fsst_block_never_panics() {
+    let mut values = super::encoding::StringColumn::new();
+    for i in 0..400u64 {
+        values.push((i % 7 != 0).then(|| format!("@user{}:example.org", i * 37)).as_deref());
+    }
+    let block = super::encoding::encode_block(&ColumnData::Strings(values), true);
+    assert_eq!(block.pipeline.transform().unwrap(), Transform::FsstPackedString);
+    assert!(decode_block(block.pipeline, &block.bytes).is_ok());
+    let mut rng = XorShift(41);
+    for position in 0..block.bytes.len() {
+        let mut mutated = block.bytes.clone();
+        mutated[position] ^= (rng.next() as u8) | 1;
+        let _ = decode_block(block.pipeline, &mutated);
+        let _ = super::encoding::decode_block_range(block.pipeline, &mutated, 3, 90);
+        let _ = super::encoding::take_block_rows(block.pipeline, &mutated, &[0, 5, 399]);
+        let _ = super::encoding::decode_string_block_views(block.pipeline, &mutated);
+        let equals = super::encoding::predicate::StringPredicate::Equals("@user37:example.org".to_owned());
+        let _ = super::encoding::predicate::filter_string_block(block.pipeline, &mutated, &equals);
+    }
+    for cut in 0..block.bytes.len() {
+        assert!(decode_block(block.pipeline, &block.bytes[..cut]).is_err());
+    }
+}
+
+/// Flips bytes across a valid occurred-relative `ingested_at` body and truncates it: resolving it against its
+/// `occurred_at` refuses or answers, never panics, and every truncation is refused.
+#[test]
+fn mutated_occurred_residual_block_never_panics() {
+    let occurred: Vec<i64> = (0..600i64)
+        .map(|i| 1_000_000_000 + i * 1_013 + (i * 7919) % 257)
+        .collect();
+    let ingested: Vec<i64> = occurred
+        .iter()
+        .enumerate()
+        .map(|(i, value)| value + (i % 3) as i64)
+        .collect();
+    let block =
+        super::encoding::encode_occurred_residual(&ingested, &occurred, CascadeStrategy::DecodeOptimized).unwrap();
+    assert_eq!(block.pipeline.transform().unwrap(), Transform::OccurredResidual);
+    let (plain, body) = super::encoding::resolve_occurred_residual(&block.bytes, &occurred).unwrap();
+    assert_eq!(decode_block(plain, &body).unwrap(), ColumnData::I64(ingested));
+    let mut rng = XorShift(43);
+    for position in 0..block.bytes.len() {
+        let mut mutated = block.bytes.clone();
+        mutated[position] ^= (rng.next() as u8) | 1;
+        let _ = decode_block(block.pipeline, &mutated);
+        let _ = super::encoding::resolve_occurred_residual(&mutated, &occurred);
+    }
+    for cut in 0..block.bytes.len() {
+        assert!(super::encoding::resolve_occurred_residual(&block.bytes[..cut], &occurred).is_err());
+    }
+}

@@ -3,6 +3,7 @@ use crate::encoding::StringColumn;
 use crate::events::relationships::{EventRelationships, RelationshipKind, RelationshipRef, TargetIdSpace};
 use crate::events::variant::VariantValue;
 use crate::layout::LayoutTargets;
+use crate::layout::required_features;
 use crate::writer::build::{BuildLifecycle, BuildRow, build_oe_file};
 use crate::writer::source_form::tests::{plain_row, source_form_config, source_form_row};
 use std::collections::BTreeMap;
@@ -509,4 +510,163 @@ fn present_strings_stop_at_the_first_error() {
     });
     assert!(result.is_err());
     assert_eq!(calls, 1);
+}
+
+/// The row's event id as a `u128`, the value an elided external id is rebuilt from.
+fn event_id_of(row: &BuildRow) -> u128 {
+    row.envelope.event_id.uuid().as_u128()
+}
+
+/// Rows whose external ids are, by `i % 4`: the event id's raw bytes, its lowercase hex text, an unrelated id, and
+/// none. Granules hold three rows, so every granule mixes stored and elided ids.
+fn mixed_elision_rows() -> (Vec<BuildRow>, Vec<Option<Vec<u8>>>) {
+    let mut rows = Vec::new();
+    let mut ids = Vec::new();
+    for i in 0..12u64 {
+        let mut row = plain_row(i);
+        let event_id = event_id_of(&row);
+        let id = match i % 4 {
+            0 => Some(event_id.to_be_bytes().to_vec()),
+            1 => Some(format!("{event_id:032x}").into_bytes()),
+            2 => Some(format!("$other-{i}").into_bytes()),
+            _ => None,
+        };
+        row.external_id = id.clone();
+        rows.push(row);
+        ids.push(id);
+    }
+    (rows, ids)
+}
+
+#[test]
+fn external_ids_repeating_the_event_id_store_a_sentinel_and_read_back_whole() {
+    let (rows, ids) = mixed_elision_rows();
+    let built = build_oe_file(rows.clone(), &source_form_config(3)).unwrap();
+    assert_ne!(
+        built.footer.required_feature_flags & required_features::EXTERNAL_ID_EVENT_ID_ELISION,
+        0,
+        "a file that elides an id declares it"
+    );
+    let file = OeFile::open(built.bytes, Some(&built.file_seal)).unwrap();
+
+    // The stored text is the sentinel for matching rows and the hex of the id otherwise.
+    for (i, id) in ids.iter().enumerate() {
+        let stored = file
+            .with_source_form_text(column_ids::EXTERNAL_ID, i as u64, |text| text.map(str::to_owned))
+            .unwrap();
+        let expected = match i % 4 {
+            0 => Some("r".to_owned()),
+            1 => Some("h".to_owned()),
+            _ => id
+                .as_ref()
+                .map(|id| hex_simd::encode_to_string(id, hex_simd::AsciiCase::Lower)),
+        };
+        assert_eq!(stored, expected, "row {i}");
+        assert_eq!(file.external_id(i as u64).unwrap(), *id, "row {i}");
+    }
+    let expected: Vec<(u64, Vec<u8>)> = ids
+        .iter()
+        .enumerate()
+        .filter_map(|(i, id)| id.clone().map(|id| (i as u64, id)))
+        .collect();
+    assert_eq!(file.external_ids().unwrap(), expected);
+
+    // Lookups hash the original id and confirm candidates against the expanded one.
+    for (i, id) in ids.iter().enumerate() {
+        if let Some(id) = id {
+            assert_eq!(file.row_by_external_id(id).unwrap(), Some(i as u64), "row {i}");
+            assert_eq!(file.rows_with_external_id(id).unwrap(), vec![i as u64]);
+        }
+    }
+    // Another row's event id, in either form, is not this row's external id.
+    let row3 = rows.get(3).map(event_id_of).unwrap();
+    assert_eq!(file.row_by_external_id(&row3.to_be_bytes()).unwrap(), None);
+    assert_eq!(
+        file.row_by_external_id(format!("{row3:032x}").as_bytes()).unwrap(),
+        None
+    );
+    // Upper-case hex is not the canonical text, so it does not match row 1's elided id.
+    let row1 = rows.get(1).map(event_id_of).unwrap();
+    assert_eq!(
+        file.row_by_external_id(format!("{row1:032X}").as_bytes()).unwrap(),
+        None
+    );
+}
+
+#[test]
+fn external_ids_that_do_not_repeat_the_event_id_declare_no_elision() {
+    let rows: Vec<BuildRow> = (0..6u64)
+        .map(|i| {
+            let mut row = plain_row(i);
+            let event_id = event_id_of(&row);
+            // Near misses: the raw id without its first byte, and the upper-case hex text.
+            row.external_id = Some(if i % 2 == 0 {
+                event_id.to_be_bytes().get(1..).unwrap().to_vec()
+            } else {
+                format!("{event_id:032X}").into_bytes()
+            });
+            row
+        })
+        .collect();
+    let built = build_oe_file(rows.clone(), &source_form_config(3)).unwrap();
+    assert_eq!(
+        built.footer.required_feature_flags & required_features::EXTERNAL_ID_EVENT_ID_ELISION,
+        0
+    );
+    let file = OeFile::open(built.bytes, Some(&built.file_seal)).unwrap();
+    for (i, row) in rows.iter().enumerate() {
+        assert_eq!(file.external_id(i as u64).unwrap(), row.external_id);
+        assert_eq!(
+            file.row_by_external_id(row.external_id.as_deref().unwrap()).unwrap(),
+            Some(i as u64)
+        );
+    }
+}
+
+#[test]
+fn a_reader_from_before_elision_refuses_the_file_and_a_stray_sentinel_is_an_error() {
+    let (rows, _) = mixed_elision_rows();
+    let built = build_oe_file(rows, &source_form_config(3)).unwrap();
+    // The occurred-relative `ingested_at` bit is a later, orthogonal one these rows happen to use.
+    let pre_elision_known: u64 = ((1 << 32) - 1) | required_features::OCCURRED_RELATIVE_INGESTED_AT;
+    let declared = built.footer.required_feature_flags;
+    assert_eq!(
+        declared & !pre_elision_known,
+        required_features::EXTERNAL_ID_EVENT_ID_ELISION,
+        "an older reader sees exactly the elision bit as unknown and refuses"
+    );
+    assert!(crate::compat::check_features(declared, 0).is_ok());
+    assert_eq!(
+        required_features::EXTERNAL_ID_EVENT_ID_ELISION & required_features::ALL,
+        0,
+        "only files that elide an id declare the bit"
+    );
+
+    // Without the declaration a sentinel never decodes as an id.
+    let mut out = Vec::new();
+    assert!(expand_external_id("r", false, || Ok(7), &mut out).is_err());
+    assert!(expand_external_id("h", false, || Ok(7), &mut out).is_err());
+    expand_external_id("h", true, || Ok(0xab), &mut out).unwrap();
+    assert_eq!(out, format!("{:032x}", 0xab).into_bytes());
+    expand_external_id("0aff", true, || Err(MISSING_EVENT_ID), &mut out).unwrap();
+    assert_eq!(out, vec![0x0a, 0xff], "a stored id never reads the event id");
+}
+
+#[test]
+fn elided_external_id_reads_decode_each_granule_once() {
+    let (rows, _) = mixed_elision_rows();
+    let built = build_oe_file(rows, &source_form_config(3)).unwrap();
+    let file = OeFile::open(built.bytes, Some(&built.file_seal)).unwrap();
+    for i in 0..12u64 {
+        file.external_id(i).unwrap();
+    }
+    let before = file.column_block_reads();
+    for i in 0..12u64 {
+        file.external_id(i).unwrap();
+    }
+    assert_eq!(
+        file.column_block_reads(),
+        before,
+        "external-id and event-id blocks are cached"
+    );
 }

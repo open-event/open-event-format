@@ -67,6 +67,39 @@ String columns SHALL use dictionary encoding for low-cardinality, FSST for high-
 - **WHEN** a query needs a single granule of an FSST-encoded `event_id` column
 - **THEN** the reader decodes only that granule via marks/mini-block offsets
 
+### Requirement: FSST blocks may store bitpacked value lengths
+An FSST string block that stores no per-value keys SHALL be rewritten by the writer into the packed-lengths layout (pipeline transform 15) whenever that layout is smaller: the same null stream, symbol table and present count, then each present value's compressed length in a FastLanes bitpacked stream (count, bit width, packed words) in place of the four-byte offset table, then the same code arena. The lengths SHALL sum to exactly the arena's length and their count SHALL equal the present count; a block that disagrees SHALL be refused as structurally invalid. A reader SHALL rebuild the classic offset table from the lengths (an unpack and prefix sum, no entropy decode) and SHALL then answer every decode, range decode, row take, Arrow view decode and compressed-form string predicate exactly as it would for the equivalent transform-9 block. The packed layout SHALL NOT carry per-value keys and SHALL NOT ride the seekable Zstandard framing. A file that stores at least one packed-lengths block SHALL declare the required feature `packed_string_offsets` (bit 33), which is not part of the set every file declares, so a reader or rewriter that predates the transform refuses the file at open. A conformance run that forces transform 9 SHALL get the classic layout.
+
+#### Scenario: Short high-cardinality strings drop the offset table
+- **WHEN** a block of mostly distinct short strings is encoded as FSST without per-value keys
+- **THEN** it is stored as transform 15, smaller than the transform-9 form, and every read path returns the same values and predicate masks as the transform-9 form
+
+#### Scenario: An old reader refuses the file
+- **WHEN** a reader that does not know required feature bit 33 opens a file holding a packed-lengths FSST block
+- **THEN** it refuses the file at open instead of failing part-way through a query
+
+### Requirement: Ingested-at blocks may be stored relative to occurred-at
+A single-page, dense `ingested_at` block SHALL also be trial-encoded relative to the same granule's `occurred_at` (pipeline transform 16, value kind i64, no trailing stage on the outer id): the body is the four-byte pipeline id of an inner block followed by that inner block, an ordinary i64 integer block (frame-of-reference, delta, RLE or plain, with any trailing stage and no side stream) of the wrapping residuals `ingested_at - occurred_at` row by row. The writer SHALL keep the relative form only when it is strictly smaller than the direct encoding of `ingested_at`, and SHALL NOT use it for a block whose values are one constant (constant elision applies instead), a multi-page block, or any other column. The block's recorded statistics, the granule's `ingested_at` bounds and the page statistics SHALL describe the `ingested_at` values themselves, never the residuals, so time pruning on `ingested_at` is unchanged. A reader SHALL rebuild the block from the granule's decoded `occurred_at` (decoding it at most once per granule through its decoded-block cache) into the equivalent uncompressed plain i64 block before any decode, range decode, row take or predicate sees it, SHALL NOT share that rebuild with another granule's aliased extent, and SHALL refuse as structurally invalid a transform-16 block on any column other than `ingested_at`, on a page of a multi-page block, with an inner block of another kind, or whose residual count differs from the granule's `occurred_at` count. An update that rewrites a granule's `occurred_at` block SHALL re-encode that granule's `ingested_at` block rather than borrow it from the source. A file that stores at least one such block SHALL declare the required feature `occurred_relative_ingested_at` (bit 34), which is not part of the set every file declares.
+
+#### Scenario: Ingested-at equal to occurred-at costs almost nothing
+- **WHEN** a file's rows carry `ingested_at` equal to, or a few units after, their `occurred_at` and `occurred_at` is not itself trivially encodable
+- **THEN** its `ingested_at` blocks are stored as transform 16, smaller than the direct encoding, every read path returns the original `ingested_at` values, and the granule `ingested_at` bounds equal the values' own minimum and maximum
+
+#### Scenario: A rewritten occurred-at re-encodes ingested-at
+- **WHEN** an update changes the `occurred_at` of a row in a granule whose `ingested_at` block is stored relative to `occurred_at`
+- **THEN** the updated file's `ingested_at` reads back the updated rows' values exactly, never the source block decoded against the new `occurred_at`
+
+#### Scenario: An old reader refuses an occurred-relative file
+- **WHEN** a reader that does not know required feature bit 34 opens a file holding a transform-16 block
+- **THEN** it refuses the file at open instead of failing part-way through a query
+
+### Requirement: Dictionary trial covers random-access and replayed string blocks
+A string block that selection sends to FSST SHALL also be trial-encoded as a dictionary whenever its distinct values are at most three quarters of its present rows, and the smaller form SHALL be kept. The trial SHALL run on random-access (shredded and free-text) blocks too, since a dictionary block's bitpacked codes are per-value addressable, and on blocks replaying an FSST capture, so a column whose segment head sampled as FSST still stores its repeating blocks as dictionaries.
+
+#### Scenario: Repeating shredded strings become a dictionary
+- **WHEN** a shredded payload string column holds a few hundred distinct values across a granule's rows
+- **THEN** its block is stored as a dictionary block with bitpacked codes and answers equality and range filters from the codes
+
 ### Requirement: Index, bitmap, and payload compression families
 Bitmaps SHALL use Roaring native compression, Ribbon filters their compact representation, and split-block Bloom filters their split-block representation with outer compression only when range reads still work. `variant_shredded_field_blocks` SHALL use adaptive encoding that preserves random access in compressed form (whole-block heavyweight compression forbidden on shredded scan-path columns); `variant_residual_blocks` SHALL be uncompressed in hot granules with page-level Zstd-3 allowed for cold/rewritten granules (optionally with trained ZDICT dictionaries keyed by internal `(tenant_id, event_type_id)`, rebuilt at rewrite when the ratio regresses); `variant_dictionary_blocks` SHALL use dictionary+FSST supporting key→field_id binary search without full-block decode; text token indexes and footer metadata SHALL use Zstd level 1 or a better adaptive choice.
 

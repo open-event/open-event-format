@@ -18,7 +18,7 @@ use crate::deletes::SubjectId;
 use crate::encoding::{
     BlockStats, CascadeStrategy, ColumnData, FsstTable, ReplayCapture, SideStream, StringColumn, Transform, ValueKind,
     count_set_bits, encode_block_replayed, encode_block_with_shared_dictionary, encode_block_with_xor_floats,
-    seekable_zstd,
+    encode_occurred_residual, seekable_zstd,
 };
 use crate::error::FormatError;
 use crate::events::provenance::{SignedEventProvenance, hex_lower_into};
@@ -581,10 +581,14 @@ struct UpdateReuse<'a> {
 }
 
 impl UpdateReuse<'_> {
+    /// Whether `(granule_id, column_id)` must be re-encoded rather than borrowed from the source. An `ingested_at`
+    /// block may be stored relative to its granule's `occurred_at`, so it counts as changed whenever that granule's
+    /// `occurred_at` does: a borrowed residual block over rewritten `occurred_at` values would decode wrong.
     fn block_changed(&self, granule_id: u32, column_id: u32) -> bool {
-        self.changed_columns_by_granule
-            .get(&granule_id)
-            .is_some_and(|columns| columns.contains(&column_id))
+        self.changed_columns_by_granule.get(&granule_id).is_some_and(|columns| {
+            columns.contains(&column_id)
+                || (column_id == column_ids::INGESTED_AT && columns.contains(&column_ids::OCCURRED_AT))
+        })
     }
 }
 
@@ -2249,6 +2253,13 @@ fn plan_update_reuse_from<'a, 'b>(
             changed_payload_granules.insert(granule_id);
         }
     }
+    // `ingested_at` may be stored relative to `occurred_at` (see `UpdateReuse::block_changed`): wherever the latter is
+    // rebuilt, so is the former, which also puts it in a sparse plan's build set.
+    for changed in changed_columns_by_granule.values_mut() {
+        if changed.contains(&column_ids::OCCURRED_AT) {
+            changed.insert(column_ids::INGESTED_AT);
+        }
+    }
     Some(UpdateReuse {
         changed_columns_by_granule,
         changed_payload_granules,
@@ -3824,6 +3835,7 @@ fn build_oe_file_sealed_in_order(
         replay: Option<&ReplayCapture>,
         shared: Option<&[String]>,
         xor_floats: bool,
+        occurred: Option<&[i64]>,
     ) -> BlockProduct<'static> {
         // A time-series file's float blocks also try Chimp XOR floats, which never replay a capture.
         let encode = |data: &ColumnData| {
@@ -3958,6 +3970,17 @@ fn build_oe_file_sealed_in_order(
             }
         } else {
             let mut encoded = encode(&block.data);
+            // An `ingested_at` block is also tried relative to the granule's `occurred_at` and stored that way only
+            // when strictly smaller. A constant block is left alone: layout elides it whatever its pipeline.
+            if block.column_id == column_ids::INGESTED_AT
+                && block.presence.is_empty()
+                && let (ColumnData::I64(ingested), Some(occurred)) = (&block.data, occurred)
+                && encoded.stats.min_i128 != encoded.stats.max_i128
+                && let Some(residual) = encode_occurred_residual(ingested, occurred, strategy)
+                && residual.bytes.len() < encoded.bytes.len()
+            {
+                encoded = residual;
+            }
             fsst = encoded.fsst.take();
             let mut prefix = Writer::with_capacity(block.presence.len() + 8);
             crate::layout::encode_presence(&block.presence, entry.row_count, &mut prefix);
@@ -4328,6 +4351,19 @@ fn build_oe_file_sealed_in_order(
                         captures.get(&(column_id, granule_idx / REPLAY_SEGMENT_GRANULES)),
                         shared_alphabets.get(&column_id).map(Vec::as_slice),
                         config.profile == Profile::TimeSeries,
+                        (column_id == column_ids::INGESTED_AT)
+                            .then(|| {
+                                granule.blocks.iter().find_map(|occurred| match occurred {
+                                    PendingBlock {
+                                        column_id: column_ids::OCCURRED_AT,
+                                        data: ColumnData::I64(values),
+                                        presence,
+                                        ..
+                                    } if presence.is_empty() => Some(values.as_slice()),
+                                    _ => None,
+                                })
+                            })
+                            .flatten(),
                     )),
                     None => Err(FormatError::Structural {
                         rule: "a sparse update encodes only blocks it built",
@@ -4524,6 +4560,18 @@ fn build_oe_file_sealed_in_order(
         std::iter::once(piece.pipeline)
             .chain(piece.pages.iter().map(|page| page.1))
             .any(|pipeline| pipeline.transform() == Ok(Transform::Chimp))
+    });
+    // Whether any block stores `ingested_at` relative to `occurred_at`.
+    let occurred_relative_ingested_at = pieces.iter().any(|piece| {
+        std::iter::once(piece.pipeline)
+            .chain(piece.pages.iter().map(|page| page.1))
+            .any(|pipeline| pipeline.transform() == Ok(Transform::OccurredResidual))
+    });
+    // Whether any block or page stores FSST with bitpacked value lengths.
+    let packed_string_offsets = pieces.iter().any(|piece| {
+        std::iter::once(piece.pipeline)
+            .chain(piece.pages.iter().map(|page| page.1))
+            .any(|pipeline| pipeline.transform() == Ok(Transform::FsstPackedString))
     });
 
     // The promotion plan is the column-heat measurement: promoted columns are precisely the columns whose planner
@@ -5288,8 +5336,17 @@ fn build_oe_file_sealed_in_order(
     if xor_float_blocks {
         required_feature_flags |= required_features::XOR_FLOAT_BLOCKS;
     }
+    if packed_string_offsets {
+        required_feature_flags |= required_features::PACKED_STRING_OFFSETS;
+    }
+    if occurred_relative_ingested_at {
+        required_feature_flags |= required_features::OCCURRED_RELATIVE_INGESTED_AT;
+    }
     if !state_roots.is_empty() {
         required_feature_flags |= required_features::GRAPH_STATE_ROOTS;
+    }
+    if source_form_indexes.elides_event_ids {
+        required_feature_flags |= required_features::EXTERNAL_ID_EVENT_ID_ELISION;
     }
     let footer = Footer {
         audit,

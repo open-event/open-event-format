@@ -121,7 +121,7 @@ pub fn extract_descriptor_with_body(pipeline: PipelineId, body: &[u8]) -> Result
             let entries = super::read_dictionary_values(&mut reader, dict_count, side)?;
             Ok(PageDescriptor::Dictionary { entries })
         }
-        Transform::FsstString => {
+        Transform::FsstString | Transform::FsstPackedString => {
             let _ = super::NullStream::read(&mut reader)?;
             let symbol_count = reader.u16("fsst symbol count")?;
             Ok(PageDescriptor::Fsst { symbol_count })

@@ -5379,7 +5379,7 @@ fn xor_float_blocks_round_trip_bit_for_bit_through_the_pipeline() {
         expected[3..900]
     );
     // A transform id past the ones this reader knows is refused, never decoded as something else.
-    assert!(PipelineId(15).transform().is_err());
+    assert!(PipelineId(17).transform().is_err());
 }
 
 #[test]
@@ -6091,4 +6091,163 @@ fn a_wide_fsst_block_stores_its_value_frames_raw_and_its_key_frames_compressed()
         decode_block_range(block.pipeline, &block.bytes, 2500, 2600).unwrap(),
         ColumnData::Strings(values.slice(2500, 2600))
     );
+}
+
+/// A high-cardinality short-string block the selector sends to FSST: mostly distinct values with nulls mixed in.
+fn packed_fsst_sample() -> StringColumn {
+    let mut values = StringColumn::new();
+    for i in 0..3000u64 {
+        if i % 11 == 0 {
+            values.push(None);
+        } else {
+            values.push(Some(&format!("@user{}:example.org", i.wrapping_mul(7919) % 100_000)));
+        }
+    }
+    values
+}
+
+/// FSST blocks without per-value keys store bitpacked value lengths instead of the four-byte offset table, and every
+/// read path — whole decode, range decode, row take, Arrow views, compressed-form filters — reproduces the classic
+/// layout's answers.
+#[test]
+fn packed_fsst_round_trips_through_every_read_path() {
+    let values = packed_fsst_sample();
+    let data = ColumnData::Strings(values.clone());
+    for random_access in [false, true] {
+        let block = encode_block(&data, random_access);
+        assert_eq!(block.pipeline.transform().unwrap(), Transform::FsstPackedString);
+        let classic = encode_block_forced_for_conformance(
+            &data,
+            random_access,
+            CascadeStrategy::DecodeOptimized,
+            Transform::FsstString,
+        )
+        .unwrap();
+        assert_eq!(classic.pipeline.transform().unwrap(), Transform::FsstString);
+        assert!(block.uncompressed_len < classic.uncompressed_len);
+        assert_eq!(decode_block(block.pipeline, &block.bytes).unwrap(), data);
+        assert_eq!(
+            decode_block_range(block.pipeline, &block.bytes, 17, 1234).unwrap(),
+            decode_block_range(classic.pipeline, &classic.bytes, 17, 1234).unwrap()
+        );
+        let rows = [0usize, 1, 11, 500, 2999];
+        assert_eq!(
+            take_block_rows(block.pipeline, &block.bytes, &rows).unwrap(),
+            take_block_rows(classic.pipeline, &classic.bytes, &rows).unwrap()
+        );
+        let views = decode_string_block_views(block.pipeline, &block.bytes)
+            .unwrap()
+            .unwrap();
+        let classic_views = decode_string_block_views(classic.pipeline, &classic.bytes)
+            .unwrap()
+            .unwrap();
+        assert_eq!(views.len(), 3000);
+        assert!(views.is_null(0));
+        for row in [1usize, 2, 500, 2999] {
+            assert_eq!(views.value(row), classic_views.value(row));
+        }
+        for predicate in [
+            predicate::StringPredicate::Equals("@user7919:example.org".to_owned()),
+            predicate::StringPredicate::NotEquals("@user7919:example.org".to_owned()),
+        ] {
+            assert_eq!(
+                predicate::filter_string_block(block.pipeline, &block.bytes, &predicate).unwrap(),
+                predicate::filter_string_block(classic.pipeline, &classic.bytes, &predicate).unwrap()
+            );
+            assert_eq!(
+                predicate::filter_string_block_or_decode(block.pipeline, &block.bytes, &predicate).unwrap(),
+                predicate.filter_decoded(&values)
+            );
+        }
+        assert_eq!(
+            lazy::fsst_uncompressed_len(block.pipeline, &block.bytes).unwrap(),
+            lazy::fsst_uncompressed_len(classic.pipeline, &classic.bytes).unwrap()
+        );
+    }
+}
+
+/// A replayed block of a column whose head stored packed FSST stores packed FSST too.
+#[test]
+fn packed_fsst_replays() {
+    let data = ColumnData::Strings(packed_fsst_sample());
+    let head = encode_block(&data, false);
+    let capture = ReplayCapture::from_head(&data, head.pipeline, head.uncompressed_len, head.fsst.clone()).unwrap();
+    let (block, kept) = encode_block_replayed(&data, false, CascadeStrategy::DecodeOptimized, Some(&capture), None);
+    assert!(kept);
+    assert_eq!(block.pipeline.transform().unwrap(), Transform::FsstPackedString);
+    assert_eq!(decode_block(block.pipeline, &block.bytes).unwrap(), data);
+}
+
+/// Packed lengths that disagree with the arena or the present count are refused, never decoded into a table that
+/// points outside the codes.
+#[test]
+fn packed_fsst_rejects_inconsistent_lengths() {
+    let data = ColumnData::Strings(packed_fsst_sample());
+    let block = encode_block(&data, true);
+    assert_eq!(block.pipeline.compression().unwrap(), Compression::None);
+    let mut short = block.bytes.clone();
+    short.pop();
+    assert!(decode_block(block.pipeline, &short).is_err());
+    let mut long = block.bytes.clone();
+    long.push(0);
+    assert!(decode_block(block.pipeline, &long).is_err());
+    // The same body read under an integer value kind is refused, never reinterpreted.
+    let wrong_kind = PipelineId::new(Transform::FsstPackedString, Compression::None, ValueKind::U64);
+    assert!(decode_block(wrong_kind, &block.bytes).is_err());
+}
+
+/// A mid-cardinality block on a random-access (shredded) column is trial-encoded as a dictionary too, and stored as
+/// one when that is smaller; its codes stay per-value addressable.
+#[test]
+fn random_access_blocks_take_the_dictionary_trial() {
+    let mut values = StringColumn::new();
+    for i in 0..4096u64 {
+        values.push(Some(&format!("!room{}:example.org", (i * 31) % 1500)));
+    }
+    let data = ColumnData::Strings(values);
+    let block = encode_block(&data, true);
+    assert_eq!(block.pipeline.transform().unwrap(), Transform::DictionaryString);
+    assert_eq!(decode_block(block.pipeline, &block.bytes).unwrap(), data);
+    let ColumnData::Strings(range) = decode_block_range(block.pipeline, &block.bytes, 100, 200).unwrap() else {
+        panic!("string block decodes to strings");
+    };
+    assert_eq!(range.len(), 100);
+}
+
+#[test]
+fn occurred_residual_round_trips_and_refuses_malformed_inner_blocks() {
+    let occurred: Vec<i64> = (0..3_000i64)
+        .map(|i| 1_700_000_000_000 + i * 1_009 + (i * 7_919) % 613)
+        .collect();
+    // Equal timestamps: the residuals are all zero and the block shrinks to a few bytes.
+    let block = encode_occurred_residual(&occurred, &occurred, CascadeStrategy::DecodeOptimized).unwrap();
+    let direct = encode_block(&ColumnData::I64(occurred.clone()), false);
+    assert!(block.bytes.len() * 20 < direct.bytes.len());
+    // Stats describe the ingested values, not the residuals.
+    assert_eq!(block.stats.min_i128, direct.stats.min_i128);
+    assert_eq!(block.stats.max_i128, direct.stats.max_i128);
+    let (plain, body) = resolve_occurred_residual(&block.bytes, &occurred).unwrap();
+    assert_eq!(plain.transform().unwrap(), Transform::PlainU64);
+    assert_eq!(decode_block(plain, &body).unwrap(), ColumnData::I64(occurred.clone()));
+    // Wrapping residuals survive the extremes.
+    let wild: Vec<i64> = occurred
+        .iter()
+        .enumerate()
+        .map(|(i, v)| if i % 2 == 0 { i64::MIN } else { v ^ i64::MAX })
+        .collect();
+    let block = encode_occurred_residual(&wild, &occurred, CascadeStrategy::DecodeOptimized).unwrap();
+    let (plain, body) = resolve_occurred_residual(&block.bytes, &occurred).unwrap();
+    assert_eq!(decode_block(plain, &body).unwrap(), ColumnData::I64(wild));
+    assert!(encode_occurred_residual(&[], &[], CascadeStrategy::DecodeOptimized).is_none());
+    assert!(encode_occurred_residual(&[1, 2], &[1], CascadeStrategy::DecodeOptimized).is_none());
+    // A nested residual, a float inner block, or a u64 inner block are all refused.
+    for inner in [
+        PipelineId::new(Transform::OccurredResidual, Compression::None, ValueKind::I64),
+        PipelineId::new(Transform::PlainF64, Compression::None, ValueKind::F64),
+        PipelineId::new(Transform::PlainU64, Compression::None, ValueKind::U64),
+    ] {
+        let mut body = inner.0.to_le_bytes().to_vec();
+        body.extend_from_slice(&block.bytes[4..]);
+        assert!(resolve_occurred_residual(&body, &occurred).is_err());
+    }
 }

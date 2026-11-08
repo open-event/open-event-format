@@ -578,16 +578,48 @@ pub mod required_features {
     /// vectors it must not.
     pub const VECTOR_COLUMNS: u64 = 1 << 31;
 
+    /// At least one row of the `external_id` column stores a one-byte sentinel instead of its id because the id
+    /// repeats the row's own event id: `r` for the event id's 16 raw big-endian bytes, `h` for its 32-character
+    /// lowercase hex text. Readers expand the sentinel from the row's `event_id`; the external-id index still hashes
+    /// the original id. Required and refusing on purpose: a reader that predates it would fail to decode the sentinel
+    /// as hex only when it came to that row, after answering from other columns, and a rewriter that predates it
+    /// could not recover the id, so it must reject the file at open instead. Declared only when some row is elided.
+    pub const EXTERNAL_ID_EVENT_ID_ELISION: u64 = 1 << 32;
+
+    /// At least one string block stores FSST with bitpacked value lengths (pipeline transform 15) in place of the
+    /// four-byte offset table. Required and refusing on purpose: a reader that predates the transform would refuse
+    /// each such block only when it came to decode it, after it had already answered from the file's other columns,
+    /// and a rewriter that predates it would copy the blocks into a file that no longer declares them — the same
+    /// reasoning as [`XOR_FLOAT_BLOCKS`].
+    pub const PACKED_STRING_OFFSETS: u64 = 1 << 33;
+
+    /// At least one `ingested_at` block stores its values relative to the same rows' `occurred_at` (pipeline
+    /// transform 16): the wrapping residuals `ingested_at - occurred_at` under an inner integer block. Required and
+    /// refusing on purpose: a reader that predates it could not decode such a block at all (its body needs the
+    /// granule's `occurred_at`), and a rewriter that predates it would copy the blocks into a file that no longer
+    /// declares them — the same reasoning as [`XOR_FLOAT_BLOCKS`]. Declared only when some block is stored that way.
+    pub const OCCURRED_RELATIVE_INGESTED_AT: u64 = 1 << 34;
+
     /// Every required feature this reader implements.
-    pub const KNOWN: u64 = (1 << 32) - 1;
+    pub const KNOWN: u64 = (1 << 35) - 1;
 
     /// The full required set every v1 file declares, `COLUMNAR_MARKS` included — the writer emits the columnar,
     /// per-stripe marks form. Excludes `FOOTER_ENCRYPTED` (opt-in per build, set only when the caller requests footer
     /// encryption), the graph bits (set only on a graph file that carries their blocks), `AUDIT_HASH_CHAIN` (set
     /// only on an audit file), `XOR_FLOAT_BLOCKS` (set only on a file that stores a Chimp block) and `VECTOR_COLUMNS` (set
-    /// only on a file with vector columns); declaring a bit
-    /// before it applies would misrepresent the file.
-    pub const ALL: u64 = KNOWN & !FOOTER_ENCRYPTED & !GRAPH & !AUDIT_HASH_CHAIN & !XOR_FLOAT_BLOCKS & !VECTOR_COLUMNS;
+    /// only on a file with vector columns), `EXTERNAL_ID_EVENT_ID_ELISION` (set only on a file that elides an
+    /// external id), `PACKED_STRING_OFFSETS` (set only on a file that stores a packed-lengths FSST block) and
+    /// `OCCURRED_RELATIVE_INGESTED_AT` (set only on a file that stores an occurred-relative `ingested_at` block); declaring a
+    /// bit before it applies would misrepresent the file.
+    pub const ALL: u64 = KNOWN
+        & !FOOTER_ENCRYPTED
+        & !GRAPH
+        & !AUDIT_HASH_CHAIN
+        & !XOR_FLOAT_BLOCKS
+        & !VECTOR_COLUMNS
+        & !EXTERNAL_ID_EVENT_ID_ELISION
+        & !PACKED_STRING_OFFSETS
+        & !OCCURRED_RELATIVE_INGESTED_AT;
 }
 
 /// Optional feature flags: unknown optional features are ignored; known ones are validated and used.

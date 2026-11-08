@@ -259,7 +259,11 @@ fn a_reader_from_before_audit_files_refuses_one_and_event_files_stay_readable() 
     assert_ne!(built.footer.required_feature_flags & !pre_audit_known, 0);
     assert_eq!(required_features::ALL & required_features::AUDIT_HASH_CHAIN, 0);
     let event_file = build_oe_file(rows(0..3), &source_form_config(4)).unwrap();
-    assert_eq!(event_file.footer.required_feature_flags & !pre_audit_known, 0);
+    // The occurred-relative `ingested_at` bit is a later, orthogonal one the event rows happen to use.
+    assert_eq!(
+        event_file.footer.required_feature_flags & !pre_audit_known & !required_features::OCCURRED_RELATIVE_INGESTED_AT,
+        0
+    );
     assert_eq!(event_file.footer.audit, None);
 }
 
