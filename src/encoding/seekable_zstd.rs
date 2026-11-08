@@ -15,8 +15,8 @@
 use crate::error::FormatError;
 use std::borrow::Cow;
 use std::cell::RefCell;
-use zeekstd::{BytesWrapper, EncodeOptions, FrameSizePolicy, SeekTable};
-use zstd::bulk::Decompressor;
+use zeekstd::{BytesWrapper, SeekTable};
+use zstd::bulk::{Compressor, Decompressor};
 
 /// Plaintext bytes one frame holds. Big enough that a frame's own zstd frame header and its seek-table entry stay
 /// noise against the compressed body, and that back-references still find matches inside the frame; small enough that
@@ -113,32 +113,93 @@ pub fn compress(bytes: &[u8]) -> Option<Vec<u8>> {
 /// of the arena, out of order, or repeated is ignored. The stored form is an ordinary seekable stream either way — a
 /// reader resolves ranges through the seek table and needs no notice of where the frames fall.
 pub fn compress_with_breaks(bytes: &[u8], breaks: &[usize]) -> Option<Vec<u8>> {
+    compress_with_breaks_keeping(bytes, breaks, EVERY_FRAME_COMPRESSED)
+}
+
+/// The per-frame bar (see [`compress_with_breaks_keeping`]) that keeps every frame compressed, whatever it saves.
+pub const EVERY_FRAME_COMPRESSED: (usize, usize) = (1, 0);
+
+/// [`compress_with_breaks`] with a per-frame savings bar: a frame is stored compressed only when its compressed form
+/// is at most `bar.0 / bar.1` of its plaintext, and raw otherwise ([`EVERY_FRAME_COMPRESSED`] keeps them all). A raw
+/// frame is an ordinary Zstandard frame of stored blocks, so the result is the same seekable stream any reader
+/// already reads, and inflating a raw frame is a copy: Zstandard costs about as much per byte to inflate whether it
+/// saved a fifth or two thirds, so a frame that saves little is cheaper to read stored.
+pub fn compress_with_breaks_keeping(bytes: &[u8], breaks: &[usize], bar: (usize, usize)) -> Option<Vec<u8>> {
+    compress_with_breaks_by(bytes, breaks, |_| bar)
+}
+
+/// [`compress_with_breaks_keeping`] with a bar per frame: `bar_at` is told where a frame's plaintext starts and
+/// answers the bar that frame must meet, so the sections of one body (a header, the values, their keys) can each be
+/// held to the bar that suits them.
+pub fn compress_with_breaks_by(
+    bytes: &[u8],
+    breaks: &[usize],
+    bar_at: impl Fn(usize) -> (usize, usize),
+) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(bytes.len());
-    let options = EncodeOptions::try_new()?
-        .compression_level(LEVEL)
-        .frame_size_policy(FrameSizePolicy::Uncompressed(FRAME_BYTES));
-    let mut encoder = options.into_encoder(&mut out).ok()?;
+    let mut table = SeekTable::new();
+    let mut compressor = Compressor::new(LEVEL).ok()?;
+    let mut scratch = Vec::with_capacity(zstd::zstd_safe::compress_bound(FRAME_BYTES as usize));
     let mut consumed = 0;
     for end in breaks.iter().copied().chain([bytes.len()]) {
         if end <= consumed || end > bytes.len() {
             continue;
         }
-        while consumed < end {
-            match encoder.compress(bytes.get(consumed..end)?) {
-                // A compress call that consumes nothing would spin forever; treat it as a failed encode.
-                Ok(0) => return None,
-                Ok(progress) => consumed += progress,
-                Err(_) => return None,
+        for (index, frame) in bytes.get(consumed..end)?.chunks(FRAME_BYTES as usize).enumerate() {
+            scratch.clear();
+            compressor.compress_to_buffer(frame, &mut scratch).ok()?;
+            let stored_start = out.len();
+            let bar = bar_at(consumed + index * FRAME_BYTES as usize);
+            if scratch.len().saturating_mul(bar.1) <= frame.len().saturating_mul(bar.0) {
+                out.extend_from_slice(&scratch);
+            } else {
+                push_raw_frame(frame, &mut out);
             }
+            table
+                .log_frame(
+                    u32::try_from(out.len() - stored_start).ok()?,
+                    u32::try_from(frame.len()).ok()?,
+                )
+                .ok()?;
         }
-        // `finish` ends the last frame itself; ending it here too would log an empty frame behind it.
-        if end < bytes.len() {
-            encoder.end_frame().ok()?;
-        }
+        consumed = end;
     }
-    encoder.finish().ok()?;
+    let mut serializer = table.into_serializer();
+    let table_start = out.len();
+    out.resize(table_start + serializer.encoded_len(), 0);
+    let written = serializer.write_into(out.get_mut(table_start..)?);
+    out.truncate(table_start + written);
     Some(out)
 }
+
+/// Appends `plain` as one Zstandard frame made of raw (stored) blocks: a single-segment frame header recording the
+/// content size, then the bytes verbatim in blocks of at most [`MAX_RAW_BLOCK_BYTES`]. Any conforming decoder
+/// inflates it, and inflating it is a copy.
+fn push_raw_frame(plain: &[u8], out: &mut Vec<u8>) {
+    out.extend_from_slice(&ZSTD_FRAME_MAGIC.to_le_bytes());
+    // Frame header descriptor: a four-byte content size (flag 2) and single segment, so no window descriptor; no
+    // checksum and no dictionary id.
+    out.push(0b1010_0000);
+    out.extend_from_slice(&(plain.len() as u32).to_le_bytes());
+    let mut blocks = plain.chunks(MAX_RAW_BLOCK_BYTES).peekable();
+    if blocks.peek().is_none() {
+        // An empty frame still needs its one (last, empty) block.
+        out.extend_from_slice(&[1, 0, 0]);
+    }
+    while let Some(block) = blocks.next() {
+        let last = u32::from(blocks.peek().is_none());
+        // Block header: bit 0 marks the last block, bits 1-2 the block type (0, raw), the rest the block's size.
+        let header = last | ((block.len() as u32) << 3);
+        out.extend_from_slice(&header.to_le_bytes()[..3]);
+        out.extend_from_slice(block);
+    }
+}
+
+/// The magic number every Zstandard frame opens with.
+const ZSTD_FRAME_MAGIC: u32 = 0xFD2F_B528;
+
+/// The most bytes one Zstandard block may carry.
+const MAX_RAW_BLOCK_BYTES: usize = 128 * 1024;
 
 /// Reads the seek table of a stored form [`compress`] produced. Callers hold on to the result: it answers which frame
 /// covers a decompressed offset, and every read needs that answer.
@@ -198,6 +259,90 @@ pub fn decompress_all(stored: &[u8]) -> Result<Vec<u8>, FormatError> {
 pub fn decompress_all_into(stored: &[u8], plain: &mut Vec<u8>) -> Result<(), FormatError> {
     let table = seek_table(stored)?;
     inflate_exact(stored, table.size_decomp(), plain)
+}
+
+/// The leading plaintext of a stored form, inflated into `plain` (emptied first) only as far as the caller needs.
+///
+/// Frames are inflated from the first, and after each one `needed` is handed the plaintext so far: it answers how many
+/// leading plaintext bytes the caller wants in all — read off a header at the front of the body — or `None` while
+/// that header has not been reached in full. Once it answers, only the frames covering that prefix are inflated,
+/// straight after the ones already in the buffer, so the trailing frames (a run of per-value keys a scan never reads,
+/// say) stay compressed; a `needed` that never answers gets the whole stream. `plain` may come back longer than asked
+/// for, up to the end of the last frame inflated, and never shorter: a prefix past the plaintext's end refuses.
+pub fn decompress_prefix_into(
+    stored: &[u8],
+    plain: &mut Vec<u8>,
+    mut needed: impl FnMut(&[u8]) -> Option<usize>,
+) -> Result<(), FormatError> {
+    let table = seek_table(stored)?;
+    let total = table.size_decomp();
+    if total > MAX_RANGE_BYTES {
+        return Err(failed(
+            "seekable zstd range is inverted or exceeds the per-call ceiling",
+        ));
+    }
+    plain.clear();
+    if table.num_frames() == 0 {
+        return inflate_exact(stored, total, plain);
+    }
+    plain.reserve_exact(total as usize);
+    let frames = table.num_frames();
+    let mut next = 0;
+    while next < frames {
+        inflate_frames_onto(stored, &table, next, next, plain)?;
+        next += 1;
+        let Some(want) = needed(plain) else { continue };
+        let want = want as u64;
+        if want > total {
+            return Err(failed("seekable zstd prefix runs past the stored plaintext"));
+        }
+        if want > plain.len() as u64 {
+            inflate_frames_onto(stored, &table, next, table.frame_index_decomp(want - 1), plain)?;
+        }
+        break;
+    }
+    Ok(())
+}
+
+/// Inflates frames `first..=last` of a stored form in one decode call onto the end of `plain`, which must already
+/// hold exactly the plaintext of the frames before `first` and have room for these. Refuses output that is not exactly
+/// the plaintext the seek table promises for those frames.
+fn inflate_frames_onto(
+    stored: &[u8],
+    table: &SeekTable,
+    first: u32,
+    last: u32,
+    plain: &mut Vec<u8>,
+) -> Result<(), FormatError> {
+    let outside = || failed("seekable zstd frame index is outside the seek table");
+    let start = table.frame_start_comp(first).map_err(|_| outside())?;
+    let end = table.frame_end_comp(last).map_err(|_| outside())?;
+    let expected_end = table.frame_end_decomp(last).map_err(|_| outside())?;
+    let expected_start = table.frame_start_decomp(first).map_err(|_| outside())?;
+    if plain.len() as u64 != expected_start {
+        return Err(failed("seekable zstd frames inflated out of order"));
+    }
+    let compressed = usize::try_from(start)
+        .ok()
+        .zip(usize::try_from(end).ok())
+        .and_then(|(start, end)| stored.get(start..end))
+        .ok_or_else(|| failed("seekable zstd frame runs past the stored bytes"))?;
+    let expected = (expected_end - expected_start) as usize;
+    plain.reserve(expected);
+    #[cfg(test)]
+    FRAMES_INFLATED.with(|count| count.set(count.get() + (last - first + 1) as usize));
+    // The cursor writes the frames straight into the spare capacity after what `plain` already holds.
+    let mut cursor = std::io::Cursor::new(std::mem::take(plain));
+    cursor.set_position(expected_start);
+    let result = DECODER.with(|slot| slot.borrow_mut().decompress_to_buffer(compressed, &mut cursor));
+    *plain = cursor.into_inner();
+    let written = result.map_err(|_| failed("seekable zstd frame failed to decompress"))?;
+    if written != expected || plain.len() as u64 != expected_end {
+        return Err(failed(
+            "seekable zstd range decompressed short of its seek table's length",
+        ));
+    }
+    Ok(())
 }
 
 /// A stored form read one range at a time: only the frames a requested byte range falls in are decompressed, and each

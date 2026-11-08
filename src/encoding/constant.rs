@@ -202,3 +202,9 @@ pub const FSST_TRAILING_MAX_RATIO_NUM: usize = 1;
 
 /// Denominator of the FSST trailing bar. See [`FSST_TRAILING_MAX_RATIO_NUM`].
 pub const FSST_TRAILING_MAX_RATIO_DEN: usize = 2;
+
+/// The smallest random-access FSST block whose seekable frames are held to the FSST trailing bar one by one (frames of
+/// values that Zstandard cannot halve stored raw). Below it the block is framed whole, as every other transform is:
+/// inflating a block this small costs little beside its fixed per-block costs, and the few raw-stored codes would
+/// only push it past its plain form.
+pub const FSST_PER_FRAME_BAR_MIN_BLOCK_BYTES: usize = 4 * 1024;

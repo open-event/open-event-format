@@ -202,12 +202,21 @@ impl Format for Oe {
 
 /// Every value as 32 lowercase hex digits, laid end to end in one string.
 fn hex_arena(values: &[u128]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut out = Vec::with_capacity(values.len() * 32);
-    for value in values {
-        for byte in value.to_be_bytes() {
-            out.push(DIGITS[usize::from(byte >> 4)]);
-            out.push(DIGITS[usize::from(byte & 0xF)]);
+    /// The two hex digits of every byte value.
+    const PAIRS: [[u8; 2]; 256] = {
+        const DIGITS: &[u8; 16] = b"0123456789abcdef";
+        let mut pairs = [[0u8; 2]; 256];
+        let mut byte = 0;
+        while byte < 256 {
+            pairs[byte] = [DIGITS[byte >> 4], DIGITS[byte & 0xF]];
+            byte += 1;
+        }
+        pairs
+    };
+    let mut out = vec![0u8; values.len() * 32];
+    for (value, digits) in values.iter().zip(out.chunks_exact_mut(32)) {
+        for (byte, pair) in value.to_be_bytes().iter().zip(digits.chunks_exact_mut(2)) {
+            pair.copy_from_slice(&PAIRS[usize::from(*byte)]);
         }
     }
     String::from_utf8(out).unwrap_or_default()
@@ -462,12 +471,9 @@ impl Opened for OeReader {
                             };
                             Col::Str(values.iter().map(|v| dictionary[*v as usize].as_str()).collect())
                         }
-                        ColumnData::U128(_) => Col::Str(
-                            hex.as_bytes()
-                                .chunks_exact(32)
-                                .map(|digits| std::str::from_utf8(digits).unwrap_or(""))
-                                .collect(),
-                        ),
+                        ColumnData::U128(values) => {
+                            Col::Str((0..values.len()).map(|i| hex.get(i * 32..i * 32 + 32).unwrap_or("")).collect())
+                        }
                         ColumnData::Decimal { .. } => panic!("unexpected decimal column {name}"),
                     };
                     (*name, col)

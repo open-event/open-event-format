@@ -450,3 +450,122 @@ fn whole_stream_and_per_frame_inflate_timing() {
         );
     }
 }
+
+/// Pseudo-random bytes no codec shrinks.
+fn noise(len: usize) -> Vec<u8> {
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 24) as u8
+        })
+        .collect()
+}
+
+/// A frame that does not save its bar's share is stored raw, one that does stays compressed, and the result is still
+/// one ordinary stream: every range, the whole arena, and a plain Zstandard decoder recover the plaintext.
+#[test]
+fn frames_that_do_not_pay_for_inflating_are_stored_raw() {
+    let mut plain = noise(3 * FRAME_BYTES as usize + 123);
+    let break_at = plain.len();
+    plain.extend_from_slice(&arena(4096));
+    let stored = compress_with_breaks_keeping(&plain, &[break_at], (1, 2)).unwrap();
+    let table = seek_table(&stored).unwrap();
+    let raw_frames = table.frame_index_decomp(break_at as u64 - 1) + 1;
+    for frame in 0..table.num_frames() {
+        let comp = table.frame_size_comp(frame).unwrap();
+        let decomp = table.frame_size_decomp(frame).unwrap();
+        if frame < raw_frames {
+            // Magic, descriptor, content size, and one three-byte header per block.
+            assert_eq!(comp, decomp + 4 + 1 + 4 + 3, "frame {frame} is stored raw");
+        } else {
+            assert!(comp * 2 <= decomp, "frame {frame} keeps its compression");
+        }
+    }
+    assert_eq!(decompress_all(&stored).unwrap(), plain);
+    assert_eq!(zstd::stream::decode_all(stored.as_slice()).unwrap(), plain);
+    let (start, end) = (break_at as u64 - 70_000, break_at as u64 + 9_000);
+    assert_eq!(
+        decompress_range(&stored, &table, start, end).unwrap(),
+        &plain[start as usize..end as usize]
+    );
+    let mut window = Window::open(&stored).unwrap();
+    assert_eq!(window.read(10, 100_000).unwrap(), &plain[10..100_010]);
+}
+
+/// A raw frame holds a frame of any length, including an empty one and one wider than a single Zstandard block.
+#[test]
+fn raw_frames_of_any_length_decode() {
+    for len in [
+        0usize,
+        1,
+        200,
+        MAX_RAW_BLOCK_BYTES,
+        MAX_RAW_BLOCK_BYTES + 1,
+        3 * MAX_RAW_BLOCK_BYTES + 7,
+    ] {
+        let plain = noise(len);
+        let mut stored = Vec::new();
+        push_raw_frame(&plain, &mut stored);
+        assert_eq!(
+            zstd::stream::decode_all(stored.as_slice()).unwrap(),
+            plain,
+            "{len} bytes"
+        );
+    }
+}
+
+/// A bar no frame can meet stores every frame raw, and one every frame meets keeps them all compressed; either way
+/// the stream decodes to the plaintext.
+#[test]
+fn the_frame_bar_decides_which_frames_stay_compressed() {
+    let plain = arena(8192);
+    let all_raw = compress_with_breaks_keeping(&plain, &[], (0, 1)).unwrap();
+    let all_compressed = compress_with_breaks_keeping(&plain, &[], (1, 1)).unwrap();
+    assert!(all_raw.len() > plain.len());
+    assert!(all_compressed.len() * 4 < plain.len());
+    assert_eq!(all_compressed, compress_with_breaks(&plain, &[]).unwrap());
+    for stored in [all_raw, all_compressed] {
+        assert_eq!(decompress_all(&stored).unwrap(), plain);
+    }
+}
+
+/// A prefix read inflates the first frame, asks how far the caller needs to go, and inflates only the frames up to
+/// there — never fewer bytes than asked for, the whole stream when the caller cannot tell, and a refusal for a
+/// prefix past the plaintext.
+#[test]
+fn a_prefix_read_inflates_only_the_frames_it_needs() {
+    let plain = arena(8192);
+    let stored = compress(&plain).unwrap();
+    let table = seek_table(&stored).unwrap();
+    assert!(table.num_frames() > 4);
+    let mut out = Vec::new();
+    for want in [
+        1usize,
+        FRAME_BYTES as usize,
+        FRAME_BYTES as usize + 1,
+        3 * FRAME_BYTES as usize - 5,
+    ] {
+        let _ = take_frames_inflated();
+        decompress_prefix_into(&stored, &mut out, |head| {
+            assert_eq!(head, &plain[..FRAME_BYTES as usize]);
+            Some(want)
+        })
+        .unwrap();
+        assert!(out.len() >= want);
+        assert_eq!(out, &plain[..out.len()]);
+        assert_eq!(
+            take_frames_inflated(),
+            want.div_ceil(FRAME_BYTES as usize),
+            "frames inflated for a {want}-byte prefix"
+        );
+    }
+    decompress_prefix_into(&stored, &mut out, |_| None).unwrap();
+    assert_eq!(out, plain);
+    assert!(decompress_prefix_into(&stored, &mut out, |_| Some(plain.len() + 1)).is_err());
+    let empty = compress(&[]).unwrap();
+    decompress_prefix_into(&empty, &mut out, |_| Some(0)).unwrap();
+    assert!(out.is_empty());
+}

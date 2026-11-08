@@ -3080,9 +3080,15 @@ impl OeFile {
             payload.offsets_len as usize,
             "payload offsets",
         )?;
+        // A table of exactly one entry is the collapsed form: every row of the granule holds that one slot.
+        let entry_index = if offsets.len() == ROW_OFFSET_ENTRY_LEN {
+            0
+        } else {
+            row_in_granule as usize
+        };
         let entry = slice(
             offsets,
-            row_in_granule as usize * ROW_OFFSET_ENTRY_LEN,
+            entry_index * ROW_OFFSET_ENTRY_LEN,
             ROW_OFFSET_ENTRY_LEN,
             "payload offset entry",
         )?;
