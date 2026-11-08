@@ -188,7 +188,7 @@ impl Maintenance {
             ledger,
             &self.config.sweep,
             oldest_live_snapshot,
-            &|_| Vec::new(),
+            None,
             clock,
         ) {
             Ok(sweep) => report.objects = Some(sweep),

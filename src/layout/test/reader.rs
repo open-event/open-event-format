@@ -44,6 +44,7 @@ fn minimal_footer(mark: ColumnMark) -> Footer {
         dictionaries: Default::default(),
         embedding_row_offsets: Vec::new(),
         entity_hash_filters: Vec::new(),
+        entity_summary: None,
         escape_hatches: Vec::new(),
         exact_counts: ExactCounts {
             row_count: 1,

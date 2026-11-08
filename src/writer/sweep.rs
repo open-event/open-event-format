@@ -20,6 +20,7 @@
 use super::publish::PublishFailure;
 use super::retire::SweepPolicy;
 use crate::clock::Clock;
+use crate::deletion_store::{deletion_vector_object_keys, dropped_deletion_vector_object_keys};
 use crate::error::StorageError;
 use crate::invariants::PublishedSet;
 use crate::lifecycle::{ManifestGeneration, OeFileEntry, retired_artifact_keys};
@@ -78,6 +79,9 @@ impl DroppedObjectLedger for SimDroppedObjectLedger {
     }
 }
 
+/// The application's further sidecar object keys of one file entry, for [`sweep_dropped_objects`].
+pub type SidecarKeys = dyn Fn(&OeFileEntry) -> Vec<String>;
+
 /// What one object sweep did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ObjectSweepReport {
@@ -100,8 +104,9 @@ fn named_objects(generation: &ManifestGeneration, into: &mut HashSet<String>) {
     );
 }
 
-/// Notes and deletes the objects the catalogue has dropped: footer mirrors, index artifacts, and the sidecar objects
-/// (`sidecars`, typically a file's deletion-vector objects) of each file entry that left the catalogue.
+/// Notes and deletes the objects the catalogue has dropped: footer mirrors, index artifacts, the external
+/// deletion-vector objects its file entries stopped referencing (found from the entries themselves), and any further
+/// application sidecar objects (`sidecars`, optional) of each file entry that left the catalogue.
 ///
 /// `oldest_live_snapshot` is the oldest generation any running query reads (the head when none runs), the same value
 /// [`sweep_retired_files`](super::retire::sweep_retired_files) takes. The walk compares each pair of consecutive
@@ -118,7 +123,7 @@ pub fn sweep_dropped_objects(
     ledger: &mut dyn DroppedObjectLedger,
     policy: &SweepPolicy,
     oldest_live_snapshot: u64,
-    sidecars: &dyn Fn(&OeFileEntry) -> Vec<String>,
+    sidecars: Option<&SidecarKeys>,
     clock: &dyn Clock,
 ) -> Result<ObjectSweepReport, PublishFailure> {
     let safety_window = policy.safety_window_nanos.max(policy.in_flight_query_horizon_nanos);
@@ -133,18 +138,21 @@ pub fn sweep_dropped_objects(
         while from < horizon {
             let next = published.generation(from + 1).map_err(PublishFailure::Publish)?;
             let mut dropped = retired_artifact_keys(&previous, &next);
+            dropped.extend(dropped_deletion_vector_object_keys(&previous, &next));
             if let Some(mirror) = &previous.footer_mirror
                 && next.footer_mirror.as_ref().is_none_or(|kept| kept.path != mirror.path)
             {
                 dropped.push(mirror.path.clone());
             }
             let kept_files: HashSet<u128> = next.files.iter().map(|entry| entry.file_id).collect();
-            for entry in previous
-                .files
-                .iter()
-                .filter(|entry| !kept_files.contains(&entry.file_id))
-            {
-                dropped.extend(sidecars(entry));
+            if let Some(sidecars) = sidecars {
+                for entry in previous
+                    .files
+                    .iter()
+                    .filter(|entry| !kept_files.contains(&entry.file_id))
+                {
+                    dropped.extend(sidecars(entry));
+                }
             }
             for key in dropped {
                 ledger.note_dropped(&key, now).map_err(PublishFailure::Storage)?;
@@ -170,8 +178,11 @@ pub fn sweep_dropped_objects(
     for generation in horizon..=head_id {
         let generation = published.generation(generation).map_err(PublishFailure::Publish)?;
         named_objects(&generation, &mut still_named);
-        for entry in &generation.files {
-            still_named.extend(sidecars(entry));
+        still_named.extend(deletion_vector_object_keys(&generation));
+        if let Some(sidecars) = sidecars {
+            for entry in &generation.files {
+                still_named.extend(sidecars(entry));
+            }
         }
     }
     for key in due {
