@@ -30,9 +30,9 @@ use constant::{
     FSST_TRAILING_MAX_RATIO_NUM,
     DICTIONARY_FSST_MAX_VALUE_LEN, DICTIONARY_MAX_CARDINALITY_DIVISOR, DICTIONARY_TRIAL_MIN_REPEAT, FASTLANES_SPARSE_MAX_VALUES,
     FSST_LOSSY_PHT_HASH_MULTIPLIER, FSST_LOSSY_PHT_HASH_SHIFT, FSST_MAX_AVERAGE_VALUE_LEN, FSST_MAX_SYMBOL_COUNT,
-    FSST_MIN_SAMPLE_COUNT, FSST_VALUE_KEYS_MAX_PLAINTEXT_DIVISOR, MAX_RLE_EXPANSION_VALUES, PREFIX_KEY_BYTES,
-    PREFIX_SUM_CHUNK, REPLAY_TRIP_DEN, REPLAY_TRIP_NUM, SIZE_OPTIMIZED_SAVINGS_DIVISOR, TRANSFORM_SAMPLE_RUNS,
-    TRANSFORM_SAMPLE_SIZE, ZSTD_LENGTH_PREFIX_BYTES,
+    FSST_MIN_SAMPLE_COUNT, FSST_PER_FRAME_BAR_MIN_BLOCK_BYTES, FSST_VALUE_KEYS_MAX_PLAINTEXT_DIVISOR,
+    MAX_RLE_EXPANSION_VALUES, PREFIX_KEY_BYTES, PREFIX_SUM_CHUNK, REPLAY_TRIP_DEN, REPLAY_TRIP_NUM,
+    SIZE_OPTIMIZED_SAVINGS_DIVISOR, TRANSFORM_SAMPLE_RUNS, TRANSFORM_SAMPLE_SIZE, ZSTD_LENGTH_PREFIX_BYTES,
 };
 use multiversion::multiversion;
 use std::borrow::Cow;
@@ -2924,29 +2924,63 @@ fn decode_dictionary_string(
             rule: "shared-scope dictionary block without its file alphabet",
         })?;
         let codes = bitunpack(reader)?;
-        return merge_nulls(&nulls, codes.len(), |index| dictionary_entry(&codes, alphabet, index));
+        let entries: Vec<&str> = alphabet.iter().map(String::as_str).collect();
+        return merge_nulls_dictionary(&nulls, &codes, &entries);
     }
     let dict_count = reader.u32("dictionary count")? as usize;
     let dictionary = DictionaryValues::read(reader, dict_count, side)?;
     let entries = dictionary.entries()?;
     let codes = bitunpack(reader)?;
-    merge_nulls(&nulls, codes.len(), |index| dictionary_entry(&codes, &entries, index))
+    merge_nulls_dictionary(&nulls, &codes, &entries)
 }
 
-/// The dictionary entry that stored code `index` names, borrowed rather than copied: the codes outnumber the entries,
-/// so a dense column would otherwise copy the same handful of values once per row.
-fn dictionary_entry<'a, T: AsRef<str>>(
+/// Threads a dictionary block's codes back through its null stream into a column, each row's text copied from its
+/// entry. Every code is checked against the dictionary once, up front, so the copy loop that follows does no lookup
+/// that can fail and sizes the column's text exactly before writing any of it.
+fn merge_nulls_dictionary(
+    nulls: &NullStream<'_>,
     codes: &[u64],
-    dictionary: &'a [T],
-    index: usize,
-) -> Result<&'a str, FormatError> {
-    codes
-        .get(index)
-        .and_then(|&code| dictionary.get(code as usize))
-        .map(AsRef::as_ref)
-        .ok_or(FormatError::RefOutOfRange {
+    entries: &[&str],
+) -> Result<StringColumn, FormatError> {
+    if codes.iter().any(|&code| code >= entries.len() as u64) {
+        return Err(FormatError::RefOutOfRange {
             what: "dictionary code",
-        })
+        });
+    }
+    if nulls.present_count() != codes.len() {
+        return Err(FormatError::Structural {
+            rule: "null bitmap disagrees with present count",
+        });
+    }
+    let lengths: Vec<u64> = entries.iter().map(|entry| entry.len() as u64).collect();
+    let text_bytes: u64 = codes
+        .iter()
+        .map(|&code| lengths.get(code as usize).copied().unwrap_or(0))
+        .sum();
+    let row_count = nulls.row_count();
+    let mut text = String::with_capacity(text_bytes as usize);
+    let mut offsets = Vec::with_capacity(row_count + 1);
+    offsets.push(0u64);
+    let mut present = Vec::with_capacity(row_count);
+    if matches!(nulls.form, NullStreamForm::AllPresent) {
+        present.resize(row_count, true);
+        for &code in codes {
+            text.push_str(entries.get(code as usize).copied().unwrap_or_default());
+            offsets.push(text.len() as u64);
+        }
+    } else {
+        let mut next = codes.iter();
+        nulls.each_row(|set| {
+            if set {
+                let code = next.next().copied().unwrap_or(0);
+                text.push_str(entries.get(code as usize).copied().unwrap_or_default());
+            }
+            offsets.push(text.len() as u64);
+            present.push(set);
+            Ok(())
+        })?;
+    }
+    Ok(StringColumn::from_parts(offsets, present, text))
 }
 
 /// fsst-rs's lossy perfect-hash-table size (`fsst::lossy_pht::HASH_TABLE_SIZE`), pinned with fsst-rs 0.5.11. A slot
@@ -3003,10 +3037,10 @@ impl FsstArena {
 /// Decompresses a whole FSST arena at once rather than one value at a time.
 ///
 /// `offsets` names the compressed values inside `data`, one offset per value boundary. The values decompress one
-/// after another into this thread's reusable buffer (see [`fsst_decompress_values`]), which is UTF-8-validated once
-/// and copied out as the arena. Callers read the values straight out of that arena through [`FsstArena::value`]
-/// instead of paying an allocation and a check per value. A caller that only searches the arena should use
-/// [`with_fsst_arena_bytes`], which needs neither the copy nor the validation.
+/// after another straight into the arena's own buffer (see [`fsst_decompress_values`]), which is UTF-8-validated once.
+/// Callers read the values straight out of that arena through [`FsstArena::value`], or take its text whole (see
+/// [`merge_nulls_arena`]), instead of paying an allocation and a check per value. A caller that only searches the
+/// arena should use [`with_fsst_arena_bytes`], which needs no allocation and no validation.
 fn fsst_decompress_arena(
     table: &FsstDecodeTable,
     data: &[u8],
@@ -3014,13 +3048,16 @@ fn fsst_decompress_arena(
     what: &'static str,
     rule: &'static str,
 ) -> Result<FsstArena, FormatError> {
-    with_arena_buffer(|buffer| {
-        let bounds = fsst_decompress_values_with_table(table, data, offsets, what, rule, buffer)?;
-        let text = simdutf8::basic::from_utf8(buffer.as_slice())
-            .map_err(|_| FormatError::InvalidUtf8 { what })?
-            .to_owned();
-        Ok(FsstArena { bounds, text })
-    })
+    // The values decompress straight into the arena's own allocation, so the plaintext is written once and never
+    // copied out of a scratch buffer. The worst-case reservation is trimmed back afterwards; for a large arena that
+    // shrink is an in-place remap rather than a copy.
+    let mut buffer = Vec::new();
+    let bounds = fsst_decompress_values_with_table(table, data, offsets, what, rule, &mut buffer)?;
+    buffer.shrink_to_fit();
+    simdutf8::basic::from_utf8(&buffer).map_err(|_| FormatError::InvalidUtf8 { what })?;
+    // SAFETY: validated as UTF-8 just above.
+    let text = unsafe { String::from_utf8_unchecked(buffer) };
+    Ok(FsstArena { bounds, text })
 }
 
 /// Runs `search` over an FSST block's whole plaintext arena and its value bounds, without allocating the arena.
@@ -3588,7 +3625,50 @@ fn decode_fsst_string(reader: &mut Reader<'_>) -> Result<StringColumn, FormatErr
         "fsst value",
         "fsst offsets must be non-decreasing",
     )?;
-    merge_nulls(&nulls, arena.len(), |index| fsst_arena_value(&arena, index))
+    merge_nulls_arena(&nulls, arena)
+}
+
+/// Threads a decompressed FSST arena's values back through a block's null stream, handing the arena's text to the
+/// column as is: only the per-row spans are built, and no value is copied.
+fn merge_nulls_arena(nulls: &NullStream<'_>, arena: FsstArena) -> Result<StringColumn, FormatError> {
+    let FsstArena { bounds, text } = arena;
+    let count = bounds.len().saturating_sub(1);
+    // Every bound must fall on a character boundary, or a value would not be text of its own.
+    if !bounds.iter().all(|&bound| text.is_char_boundary(bound)) {
+        return Err(FormatError::InvalidUtf8 { what: "fsst value" });
+    }
+    if nulls.present_count() != count {
+        return Err(FormatError::Structural {
+            rule: "null bitmap disagrees with present count",
+        });
+    }
+    let row_count = nulls.row_count();
+    let mut present = Vec::with_capacity(row_count);
+    let offsets: Vec<u64> = match nulls.form {
+        NullStreamForm::AllPresent => {
+            present.resize(row_count, true);
+            if count == 0 {
+                vec![0]
+            } else {
+                bounds.iter().map(|&bound| bound as u64).collect()
+            }
+        }
+        _ => {
+            let mut offsets = Vec::with_capacity(row_count + 1);
+            offsets.push(0u64);
+            let mut next = 0usize;
+            nulls.each_row(|set| {
+                if set {
+                    next += 1;
+                }
+                offsets.push(bounds.get(next).copied().unwrap_or(0) as u64);
+                present.push(set);
+                Ok(())
+            })?;
+            offsets
+        }
+    };
+    Ok(StringColumn::from_parts(offsets, present, text))
 }
 
 fn decode_raw_string(reader: &mut Reader<'_>) -> Result<StringColumn, FormatError> {
@@ -4296,6 +4376,14 @@ fn apply_captured_trailing(body: Vec<u8>, captured: Compression, strategy: Casca
 /// stored layout still tells a reader which frames one row's bytes fall in
 /// ([`Transform::keeps_range_access_under_framing`]). A frame also ends at each of `frame_breaks` — the body offsets
 /// where a run a filter reads on its own begins — so such a filter inflates that run's frames and no other's.
+///
+/// An FSST block is judged frame by frame: its codes are already entropy-dense, so a frame of its values (the header,
+/// offset table and codes) keeps the codec only when it at least halves — the bar [`FSST_TRAILING_MAX_RATIO_NUM`]
+/// sets the whole block off the random-access path — and is stored raw otherwise, while the frames of its per-value
+/// keys, which compress far better and which a scan never reads, keep it. A scan then copies the values' frames
+/// instead of entropy-decoding them, and the block keeps the framing whenever it comes out smaller at all. Every other
+/// transform, and an FSST block under [`FSST_PER_FRAME_BAR_MIN_BLOCK_BYTES`], compresses every frame and keeps the
+/// framing only past the strategy's whole-block savings bar.
 fn apply_seekable_frames(
     transform: Transform,
     body: Vec<u8>,
@@ -4308,7 +4396,20 @@ fn apply_seekable_frames(
     let Some(threshold) = trailing_threshold(strategy, body.len()) else {
         return (Compression::None, body);
     };
-    let Some(candidate) = seekable_zstd::compress_with_breaks(&body, frame_breaks) else {
+    let (codes, threshold) = if transform == Transform::FsstString && body.len() >= FSST_PER_FRAME_BAR_MIN_BLOCK_BYTES {
+        // An FSST block's first break, when it keeps per-value keys, is where its values end and the keys begin.
+        (0..frame_breaks.first().copied().unwrap_or(body.len()), body.len())
+    } else {
+        (0..0, threshold)
+    };
+    let bar_at = |frame_start: usize| {
+        if codes.contains(&frame_start) {
+            (FSST_TRAILING_MAX_RATIO_NUM, FSST_TRAILING_MAX_RATIO_DEN)
+        } else {
+            seekable_zstd::EVERY_FRAME_COMPRESSED
+        }
+    };
+    let Some(candidate) = seekable_zstd::compress_with_breaks_by(&body, frame_breaks, bar_at) else {
         return (Compression::None, body);
     };
     if candidate.len() < threshold {
@@ -5667,9 +5768,32 @@ pub fn decode_block_shared(
     bytes: &[u8],
     shared: Option<&[String]>,
 ) -> Result<ColumnData, FormatError> {
+    let transform = pipeline.transform()?;
+    if pipeline.compression()? == Compression::SeekableZstd
+        && matches!(transform, Transform::FsstString | Transform::RawString)
+    {
+        // A whole-block decode needs the values and nothing after them: per-value keys, when the block keeps any,
+        // start a frame of their own and are left compressed.
+        return decompressor::with_inflate_buffer(|scratch| {
+            seekable_zstd::decompress_prefix_into(bytes, scratch, |head| string_values_end(transform, head))?;
+            decode_block_shared_with_body(pipeline, scratch, shared)
+        });
+    }
     with_trailing_removed(pipeline.compression()?, bytes, |body| {
         decode_block_shared_with_body(pipeline, body, shared)
     })
+}
+
+/// Where an FSST or raw string block's value arena ends — everything a decode of its values reads — told from the
+/// block's leading bytes alone, or `None` when `head` stops before the offset table's last entry.
+fn string_values_end(transform: Transform, head: &[u8]) -> Option<usize> {
+    let header = read_string_header(transform, &mut Reader::new(head)).ok()?;
+    let arena_start = header
+        .offsets_start
+        .checked_add(header.present_count.checked_add(1)?.checked_mul(4)?)?;
+    let last_at = arena_start.checked_sub(4)?;
+    let last = u32::from_le_bytes(head.get(last_at..arena_start)?.try_into().ok()?);
+    arena_start.checked_add(last as usize)
 }
 
 /// [`decode_block_shared`] for a caller that already holds this block's decompressed body — reused, for instance,

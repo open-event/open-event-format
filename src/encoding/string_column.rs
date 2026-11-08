@@ -42,6 +42,14 @@ impl StringColumn {
         }
     }
 
+    /// A column over `text` whose row `i` spans `offsets[i]..offsets[i + 1]` and is absent unless `present[i]`. The
+    /// caller guarantees `offsets` opens with `0`, is one longer than `present`, never decreases, ends inside `text`,
+    /// and lands on character boundaries; every accessor still reads through checked slicing.
+    pub(crate) fn from_parts(offsets: Vec<u64>, present: Vec<bool>, text: String) -> Self {
+        debug_assert_eq!(offsets.len(), present.len() + 1);
+        Self { offsets, present, text }
+    }
+
     /// Appends one row — its text, or `None` for a row that carries no value. The text is copied into the shared
     /// buffer, so the caller's own copy can be dropped straight away.
     pub fn push(&mut self, value: Option<&str>) {

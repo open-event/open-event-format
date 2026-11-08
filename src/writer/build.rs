@@ -5608,6 +5608,9 @@ fn encode_residual(
     // Shared across every row's residual so the encode recursion's container buffers are cleared and reused instead
     // of allocated fresh per container per row.
     let mut scratch = EncodeScratch::new();
+    // The slot the previous encoded row landed in: a row whose residual encodes to exactly the same bytes (an empty
+    // object every row carries, say) points at that slot instead of storing its own copy.
+    let mut previous: Option<(usize, usize)> = None;
     for (row_residual, external) in residuals.iter().zip(external_refs.iter()) {
         match (row_residual, external) {
             (Some(value), _) => {
@@ -5623,8 +5626,21 @@ fn encode_residual(
                         encode_value_into_with_scratch(value, &dictionary, &mut scratch, &mut residual)?
                     }
                 }
-                offsets.put_u32(start as u32);
-                offsets.put_u32((residual.len() - start) as u32);
+                let len = residual.len() - start;
+                let repeated = previous.filter(|&(prev_start, prev_len)| {
+                    prev_len == len
+                        && residual.bytes().get(prev_start..prev_start + len) == residual.bytes().get(start..)
+                });
+                let slot_start = match repeated {
+                    Some((prev_start, _)) => {
+                        residual.truncate(start);
+                        prev_start
+                    }
+                    None => start,
+                };
+                previous = Some((slot_start, len));
+                offsets.put_u32(slot_start as u32);
+                offsets.put_u32(len as u32);
             }
             (None, Some(reference)) => {
                 offsets.put_u32(residual.len() as u32);
@@ -5637,8 +5653,18 @@ fn encode_residual(
             }
         }
     }
-    Ok((dictionary_bytes, offsets.into_bytes(), residual.into_bytes()))
+    let mut offsets = offsets.into_bytes();
+    // A table whose every row holds the same slot is stored as that one entry, which then stands for every row.
+    if let Some((first, rest)) = offsets.split_first_chunk::<RESIDUAL_OFFSET_ENTRY_LEN>()
+        && rest.chunks_exact(RESIDUAL_OFFSET_ENTRY_LEN).all(|entry| entry == first)
+    {
+        offsets.truncate(RESIDUAL_OFFSET_ENTRY_LEN);
+    }
+    Ok((dictionary_bytes, offsets, residual.into_bytes()))
 }
+
+/// Bytes one `(offset, len)` entry of a granule's residual offsets table takes.
+const RESIDUAL_OFFSET_ENTRY_LEN: usize = 8;
 
 /// The lowest and highest of `values` from one pass, or `None` when there are none — so a granule's bounds cost one
 /// walk of its rows rather than one for the minimum and another for the maximum.

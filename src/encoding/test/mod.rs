@@ -5962,3 +5962,133 @@ fn the_needle_encoder_matches_the_crate_compressor() {
         }
     }
 }
+
+/// A whole-block decode of a framed FSST block reads its values and nothing after them: it returns the same column a
+/// decode of the unframed body does, nulls and empty strings included, while the frames holding only the per-value
+/// keys stay compressed.
+#[test]
+fn a_framed_fsst_block_decodes_whole_without_inflating_its_key_frames() {
+    for (name, values) in fsst_layout_columns() {
+        let present = present_values(&values);
+        let mut out = Writer::new();
+        let (side, _, breaks) = encode_fsst_string(&values, &present, None, &mut out).unwrap();
+        let body = out.into_bytes();
+        let framed = seekable_zstd::compress_with_breaks(&body, &breaks).unwrap();
+        let pipeline =
+            PipelineId::new(Transform::FsstString, Compression::SeekableZstd, ValueKind::String).with_side_stream(side);
+        let plain_pipeline =
+            PipelineId::new(Transform::FsstString, Compression::None, ValueKind::String).with_side_stream(side);
+        let _ = seekable_zstd::take_frames_inflated();
+        let decoded = decode_block(pipeline, &framed).unwrap();
+        let inflated = seekable_zstd::take_frames_inflated();
+        assert_eq!(decoded, ColumnData::Strings(values.clone()), "{name}: framed decode");
+        assert_eq!(
+            decode_block(plain_pipeline, &body).unwrap(),
+            decoded,
+            "{name}: framed and unframed decodes agree"
+        );
+        let table = seekable_zstd::seek_table(&framed).unwrap();
+        if let Some(&keys_start) = breaks.first().filter(|_| !present.is_empty()) {
+            let value_frames = table.frame_index_decomp(keys_start as u64 - 1) as usize + 1;
+            assert!(
+                inflated <= value_frames,
+                "{name}: inflated {inflated} frames, the values span only {value_frames}"
+            );
+            assert!(
+                (table.num_frames() as usize) > value_frames,
+                "{name}: the keys sit in frames of their own"
+            );
+        }
+    }
+}
+
+/// A dictionary block decodes to exactly its column whatever its nulls look like, and a code past the dictionary is
+/// refused rather than read.
+#[test]
+fn a_dictionary_block_decodes_every_null_shape_and_refuses_a_code_past_its_entries() {
+    let words = ["m.text", "m.image", "", "m.notice"];
+    let shapes: Vec<StringColumn> = vec![
+        (0..3000).map(|i| Some(words[i % words.len()])).collect(),
+        (0..3000)
+            .map(|i| (i % 3 != 0).then_some(words[i % words.len()]))
+            .collect(),
+        (0..3000)
+            .map(|i| (i >= 1000).then_some(words[i % words.len()]))
+            .collect(),
+        (0..10).map(|_| None::<&str>).collect(),
+    ];
+    for values in shapes {
+        let block = encode_block(&ColumnData::Strings(values.clone()), true);
+        if block.pipeline.transform().unwrap() == Transform::DictionaryString {
+            assert_eq!(
+                decode_block(block.pipeline, &block.bytes).unwrap(),
+                ColumnData::Strings(values)
+            );
+        }
+    }
+    let nulls = NullStream::from_values(&(0..4).map(|_| Some("x")).collect::<StringColumn>());
+    assert!(matches!(
+        merge_nulls_dictionary(&nulls, &[0, 1, 2, 3], &["a", "b", "c"]),
+        Err(FormatError::RefOutOfRange { .. })
+    ));
+    assert!(matches!(
+        merge_nulls_dictionary(&nulls, &[0, 1, 2], &["a", "b", "c"]),
+        Err(FormatError::Structural { .. })
+    ));
+}
+
+/// A wide random-access FSST block of free text is framed frame by frame: the frames of its values, whose codes
+/// Zstandard cannot halve, are stored raw, while the frames of its per-value keys stay compressed — and the block still
+/// decodes whole and by range to its own rows.
+#[test]
+fn a_wide_fsst_block_stores_its_value_frames_raw_and_its_key_frames_compressed() {
+    const WORDS: [&str; 24] = [
+        "the", "meeting", "moved", "to", "thursday", "please", "review", "draft", "before", "lunch", "shipping",
+        "tonight", "thanks", "again", "for", "quick", "fix", "on", "staging", "build", "looks", "good", "merge", "now",
+    ];
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    let mut next = move |below: u64| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state % below
+    };
+    let values: StringColumn = (0..6000)
+        .map(|row| {
+            (row % 11 != 0).then(|| {
+                (0..6 + next(30))
+                    .map(|_| WORDS[next(WORDS.len() as u64) as usize])
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+        })
+        .collect();
+    let block = encode_block(&ColumnData::Strings(values.clone()), true);
+    assert_eq!(block.pipeline.transform().unwrap(), Transform::FsstString);
+    assert_eq!(block.pipeline.side_stream().unwrap(), SideStream::FsstValueKeys);
+    assert_eq!(block.pipeline.compression().unwrap(), Compression::SeekableZstd);
+    let plain = remove_trailing(Compression::SeekableZstd, &block.bytes).unwrap();
+    let keys_start = string_values_end(Transform::FsstString, &plain).unwrap();
+    let table = seekable_zstd::seek_table(&block.bytes).unwrap();
+    let (mut raw_value_frames, mut compressed_key_frames) = (0, 0);
+    for frame in 0..table.num_frames() {
+        let start = table.frame_start_decomp(frame).unwrap() as usize;
+        let ratio = table.frame_size_comp(frame).unwrap() as f64 / table.frame_size_decomp(frame).unwrap() as f64;
+        if start < keys_start {
+            assert!(ratio > 0.5, "value frame {frame} keeps a codec that does not halve it");
+            raw_value_frames += usize::from(ratio > 1.0);
+        } else {
+            assert!(ratio <= 1.0, "key frame {frame} stays compressed");
+            compressed_key_frames += usize::from(ratio < 0.75);
+        }
+    }
+    assert!(raw_value_frames > 0 && compressed_key_frames > 0);
+    assert_eq!(
+        decode_block(block.pipeline, &block.bytes).unwrap(),
+        ColumnData::Strings(values.clone())
+    );
+    assert_eq!(
+        decode_block_range(block.pipeline, &block.bytes, 2500, 2600).unwrap(),
+        ColumnData::Strings(values.slice(2500, 2600))
+    );
+}

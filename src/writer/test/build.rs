@@ -1989,6 +1989,62 @@ fn residuals_larger_than_the_arena_estimate_still_round_trip() {
     }
 }
 
+/// Rows whose residuals encode to the same bytes as the row before share one stored copy, and a granule whose every row
+/// holds the same slot stores its offsets table as that one entry. Either way every row reads back its own payload,
+/// including rows between runs that keep residuals of their own.
+#[test]
+fn repeated_residuals_share_one_copy_and_still_round_trip() {
+    let with_details = |index: u64, group: u64| {
+        let mut built = row(index);
+        let PayloadInput::Variant(VariantValue::Object(fields)) = &mut built.event.payload else {
+            panic!("the generated payload is an object");
+        };
+        fields.clear();
+        fields.insert(
+            "details".to_owned(),
+            VariantValue::Object(BTreeMap::from([
+                ("group".to_owned(), VariantValue::Int(group as i64)),
+                (
+                    "tags".to_owned(),
+                    VariantValue::Array(vec![VariantValue::String("t".repeat(64))]),
+                ),
+            ])),
+        );
+        built
+    };
+    let uniform: Vec<OeRow> = (0..64).map(|index| with_details(index, 0)).collect();
+    let runs: Vec<OeRow> = (0..64).map(|index| with_details(index, index / 3)).collect();
+    for (name, rows, uniform_slots) in [("uniform", uniform, true), ("runs", runs, false)] {
+        let built = build_oe_file(rows.clone(), &config()).unwrap();
+        let file = OeFile::open(built.bytes.clone(), Some(&built.file_seal)).unwrap();
+        for (ordinal, input) in rows.iter().enumerate() {
+            let PayloadRead::Value(value) = file.payload(ordinal as u64).unwrap() else {
+                panic!("{name}: payload present");
+            };
+            let PayloadInput::Variant(expected) = &input.event.payload else {
+                panic!("variant input");
+            };
+            assert_eq!(&value, expected, "{name}: row {ordinal}");
+        }
+        let residual: u64 = built
+            .footer
+            .payload_granules
+            .iter()
+            .map(|payload| payload.residual_len)
+            .sum();
+        let distinct = if uniform_slots { 1 } else { rows.len().div_ceil(3) };
+        assert!(
+            residual <= (distinct + built.footer.payload_granules.len()) as u64 * 128,
+            "{name}: {residual} residual bytes for {distinct} distinct residuals"
+        );
+        if uniform_slots {
+            for payload in &built.footer.payload_granules {
+                assert_eq!(payload.offsets_len, 8, "{name}: one shared entry per granule");
+            }
+        }
+    }
+}
+
 #[test]
 fn identical_input_builds_identical_files() {
     let rows: Vec<OeRow> = (0..32).map(row).collect();

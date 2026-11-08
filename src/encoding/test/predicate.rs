@@ -1446,8 +1446,15 @@ fn a_framed_fsst_block_counts_substrings_frame_by_frame_like_the_whole_block_ker
     ];
     for (values, side, needles) in cases {
         let column: StringColumn = values.into();
-        let block = encode_block(&ColumnData::Strings(column.clone()), true);
+        let mut block = encode_block(&ColumnData::Strings(column.clone()), true);
         assert_eq!(block.pipeline.transform().unwrap(), Transform::FsstString);
+        if block.pipeline.compression().unwrap() == Compression::None {
+            // Short identifiers' codes do not halve under Zstandard, so the writer stores such a block unframed; the
+            // kernel still meets framed blocks of them (one whose codes do halve), so frame this one the same way.
+            block.bytes = super::super::seekable_zstd::compress(&block.bytes).unwrap();
+            block.pipeline = PipelineId::new(Transform::FsstString, Compression::SeekableZstd, ValueKind::String)
+                .with_side_stream(side);
+        }
         assert_eq!(block.pipeline.compression().unwrap(), Compression::SeekableZstd);
         assert_eq!(block.pipeline.side_stream().unwrap(), side);
         let frames = super::super::seekable_zstd::seek_table(&block.bytes)
@@ -1514,9 +1521,18 @@ fn a_framed_contains_scan_leaves_the_prefix_key_frames_compressed() {
     let fingerprint_frames = frames_over(fingerprints_start, body.len());
     assert!(prefix_frames.is_disjoint(&fingerprint_frames));
     assert!(prefix_frames.len() >= 2, "the prefix keys span frames of their own");
-    // A needle found in every arena frame inflates the header, the offsets, the arena, and the fingerprints; one no
-    // fingerprint admits inflates only what it takes to learn that.
-    let dense = frames_over(0, prefixes_start).union(&fingerprint_frames).count();
+    // A needle found all through the arena inflates the header, the offsets, the arena up to its last candidate
+    // value, and the fingerprints; one no fingerprint admits inflates only what it takes to learn that.
+    let last_hit = column
+        .iter_present()
+        .enumerate()
+        .filter(|(_, value)| value.contains("escalation-path"))
+        .map(|(index, _)| index)
+        .last()
+        .unwrap();
+    let dense = frames_over(0, data_start + offsets[last_hit + 1])
+        .union(&fingerprint_frames)
+        .count();
     let pruned = frames_over(0, data_start).union(&fingerprint_frames).count();
     assert!(dense < table.num_frames() as usize && pruned < dense);
     for (needle, expected) in [("escalation-path", dense), ("zz", pruned)] {
