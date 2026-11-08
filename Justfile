@@ -2,10 +2,10 @@
 #
 # Benchmarks come in three suites that share one target directory (`target/`):
 #   - micro:      Criterion kernel benches in `benchmark/micro/` (encoding, vector)
-#   - compare:    `benchmark/`, OE vs Parquet, Vortex and JSON (size, write, scans, lookups, ingest)
+#   - compare:    `benchmark/compare/`, OE vs Parquet, Vortex and JSON (size, write, scans, lookups, ingest)
 #   - operations: `benchmark/operations/`, OE vs Parquet and Vortex per operation (create, read, update, delete, search, diff)
-# The two comparison harnesses are standalone crates (they pin different Vortex versions), so each keeps its own
-# lockfile; `--target-dir` points them at the shared `target/` so dependencies are built once.
+# Both comparisons are binaries of one standalone crate, `benchmark/` (kept out of the library's build so it never
+# pulls in Parquet or Vortex); `--target-dir` points it at the shared `target/` so dependencies are built once.
 
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
@@ -44,7 +44,10 @@ fuzz target seconds="60":
 bench-build:
     cargo bench --no-run
     cd benchmark && cargo build --release --target-dir {{ target }}
-    cd benchmark/operations && cargo build --release --target-dir {{ target }}
+
+# Unit tests of the comparison harnesses.
+bench-test:
+    cd benchmark && cargo test --release --target-dir {{ target }}
 
 # Criterion micro benches. `just bench-micro encoding filter/for` runs one bench, filtered.
 bench-micro bench="" *filter:
@@ -52,17 +55,17 @@ bench-micro bench="" *filter:
 
 # OE vs Parquet/Vortex/JSON. Writes `benchmark/results/`. Extra flags pass through, e.g. `--profiles chat`.
 bench-compare *args="--sizes 10000,100000,1000000 --reps 5 --write-reps 3":
-    cd benchmark && cargo run --release --target-dir {{ target }} -- --out results {{ args }}
+    cd benchmark && cargo run --release --target-dir {{ target }} --bin oe-benchmark -- --out results {{ args }}
 
 # Per-operation OE vs Parquet/Vortex into a work directory. Extra flags pass through, e.g. `--format oe --toml`.
 bench-ops dir=(target / "bench-ops") *args="":
-    cd benchmark/operations && cargo run --release --target-dir {{ target }} --bin oe-vs-parquet -- {{ dir }} {{ args }}
+    cd benchmark && cargo run --release --target-dir {{ target }} --bin oe-vs-parquet -- {{ dir }} {{ args }}
 
 # Quick pass through every suite on small inputs; checks they all run, numbers are not meaningful.
 bench-smoke:
     cargo bench -- --quick --warm-up-time 0.1 --measurement-time 0.2
-    cd benchmark && cargo run --release --target-dir {{ target }} -- --sizes 10000 --reps 1 --write-reps 1 --skip-ingest yes --out {{ target }}/bench-smoke
-    cd benchmark/operations && cargo run --release --target-dir {{ target }} --bin oe-vs-parquet -- {{ target }}/bench-smoke-ops
+    cd benchmark && cargo run --release --target-dir {{ target }} --bin oe-benchmark -- --sizes 10000 --reps 1 --write-reps 1 --skip-ingest yes --out {{ target }}/bench-smoke
+    cd benchmark && cargo run --release --target-dir {{ target }} --bin oe-vs-parquet -- {{ target }}/bench-smoke-ops
 
 # Every suite at full size.
 bench: bench-micro bench-compare bench-ops

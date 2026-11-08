@@ -41,6 +41,7 @@ use vortex::io::runtime::current::CurrentThreadRuntime;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::layout::segments::{SegmentFuture, SegmentId, SegmentSource};
 
+use vortex::scan::strict_sorted_buffer::StrictSortedBuffer;
 use vortex::session::VortexSession;
 
 /// The columns of the Vortex struct, mirroring the Parquet schema field for field so a scan of one file is a scan of
@@ -161,13 +162,22 @@ impl<'a> VortexFormat<'a> {
         let mut scan = file
             .scan()
             .map_err(|error| anyhow!("planning a Vortex scan: {error}"))?;
+        let dtype = file.dtype();
         if let Some(projection) = projection {
+            let projection = projection
+                .bind(dtype)
+                .map_err(|error| anyhow!("binding a Vortex projection: {error}"))?;
             scan = scan.with_projection(projection);
         }
         if let Some(filter) = filter {
+            let filter = filter
+                .bind(dtype)
+                .map_err(|error| anyhow!("binding a Vortex filter: {error}"))?;
             scan = scan.with_filter(filter);
         }
         if let Some(rows) = rows {
+            let rows = StrictSortedBuffer::try_new(rows)
+                .map_err(|error| anyhow!("Vortex row indices must be strictly sorted: {error}"))?;
             scan = scan.with_row_indices(rows);
         }
         let iter = scan
@@ -705,7 +715,8 @@ fn columns_of(chunk: &ArrayRef, ctx: &mut ExecutionCtx) -> Result<Arc<[ArrayRef]
         .execute::<Array<Struct>>(ctx)
         .map_err(|error| anyhow!("executing a Vortex chunk as a struct: {error}"))?
         .into_data_parts()
-        .fields)
+        .fields
+        .into())
 }
 
 /// Writes `bytes` to `path` and waits for them to land, so a write's cost includes making it durable.

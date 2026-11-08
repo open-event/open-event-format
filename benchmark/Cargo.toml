@@ -1,24 +1,60 @@
 [package]
 name = "oe-benchmark"
-description = "Compares OE with Parquet, Vortex and JSON on the same events: file size, write speed, scans, filters and lookups."
+description = "Compares OE with Parquet, Vortex and JSON: whole-file comparison (size, write, scans, lookups, ingest) and per-operation comparison (create, read, update, delete, search, diff)."
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.96"
 publish = false
+build = "build.rs"
 
+# Standalone so the library's own build never pulls in Parquet or Vortex.
 [workspace]
+
+[lib]
+name = "oe_operations_benchmark"
+path = "operations/lib.rs"
+
+# Whole-file comparison: `compare/`.
+[[bin]]
+name = "oe-benchmark"
+path = "compare/main.rs"
+
+# Per-operation comparison: `operations/`.
+[[bin]]
+name = "oe-vs-parquet"
+path = "operations/main.rs"
+
+[features]
+# Installs the counting allocator in `allocation`, so a run can report allocation and peak-memory totals. Off by
+# default so an ordinary timing run measures the default allocator.
+alloc-counting = []
 
 [dependencies]
 anyhow = "1"
 arrow = { version = "59", default-features = false }
+arrow-array = "59.2.0"
+arrow-schema = "59.2.0"
 bytes = "1"
+chrono = "0.4"
 futures = "0.3"
+libc = "0.2.186"
+memchr = "2"
 oe = { path = "..", features = ["write"] }
-parquet = { version = "59", default-features = false, features = ["arrow", "zstd"] }
+parquet = "59.0.0"
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread"] }
-zstd = "0.13"
+toml = "1"
+uuid = { version = "1", features = ["v4"] }
 vortex = { version = "0.93.0", features = ["tokio"] }
+zstd = "0.13"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.rust]
+unsafe_code = "deny"
 
 [profile.release]
 debug = false
