@@ -95,6 +95,10 @@ impl PartialOrd for PartState {
 pub struct OeFileEntry {
     /// The contiguous journal range this file covers.
     pub coverage: SequenceRange,
+    /// The file's saved row-level deletion vector, current generation, so readers load it instead of rebuilding it
+    /// (see [`crate::deletion_store`]). `None` when no row was ever deleted, and on entries written before it existed.
+    #[serde(default)]
+    pub deletion_vector: Option<crate::deletion_store::StoredDeletionVector>,
     /// Day-scoped service rollup payload. Valid only on `GenerationPart` entries with `part_index == 0`; must be
     /// `None` on all other entries.
     pub feature_metadata: Option<Vec<u8>>,

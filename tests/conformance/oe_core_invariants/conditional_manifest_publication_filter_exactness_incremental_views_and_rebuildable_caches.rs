@@ -50,6 +50,7 @@ fn lost_manifest_cas_rebases_instead_of_overwriting() {
         footer_len: None,
         graph_event_id_filter: None,
         graph_summary: None,
+        deletion_vector: None,
         optional_feature_flags: 0,
         part_index: 0,
         part_state: oe::lifecycle::PartState::Active,

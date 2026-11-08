@@ -134,6 +134,7 @@ fn entry(file_id: u128, first_sequence: u64, last_sequence: u64, part_state: Par
         footer_len: None,
         graph_event_id_filter: None,
         graph_summary: None,
+        deletion_vector: None,
         optional_feature_flags: 0,
         part_index: 0,
         part_state,
