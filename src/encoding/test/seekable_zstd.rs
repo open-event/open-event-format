@@ -397,7 +397,7 @@ fn whole_stream_and_per_frame_inflate_timing() {
     let stored = &block.bytes;
     let table = seek_table(stored).unwrap();
     let rounds = 2_000;
-    let best_of = |mut run: &mut dyn FnMut()| {
+    let best_of = |run: &mut dyn FnMut()| {
         (0..5)
             .map(|_| {
                 let started = std::time::Instant::now();

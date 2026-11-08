@@ -318,7 +318,9 @@ pub fn plan_compaction_cycle(
         // run does not block its small tail from merging.
         let mut start = 0usize;
         while start + 2 <= run.len() {
-            let window = &run[start..run.len().min(start + policy.max_merge_width)];
+            let window = run
+                .get(start..run.len().min(start + policy.max_merge_width))
+                .unwrap_or_default();
             let total: u64 = window.iter().map(|entry| entry.size_bytes).sum();
             let largest = window.iter().map(|entry| entry.size_bytes).max().unwrap_or(0);
             let qualifies =

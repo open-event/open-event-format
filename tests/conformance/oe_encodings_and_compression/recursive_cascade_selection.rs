@@ -49,7 +49,7 @@ fn cascade_an_encoding_s_exception_stream() {
 #[test]
 fn bounded_recursion_depth() {
     // The format declares a small maximum depth, and the encoder's gate refuses a level that would exceed it.
-    assert!(MAX_CASCADE_DEPTH <= 4, "the declared maximum stays small");
+    const { assert!(MAX_CASCADE_DEPTH <= 4, "the declared maximum stays small") };
     assert!(cascade_level_fits(MAX_CASCADE_DEPTH - 1));
     assert!(
         !cascade_level_fits(MAX_CASCADE_DEPTH),

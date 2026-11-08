@@ -828,7 +828,7 @@ fn encode_for_bitpack(values: &[u64], out: &mut Writer) {
     let max_delta = values.iter().map(|v| v.wrapping_sub(base)).max().unwrap_or(0);
     out.put_u64(base);
     bitpack_with(values.len(), bits_needed(max_delta), out, |i| {
-        values[i].wrapping_sub(base)
+        values.get(i).map_or(0, |value| value.wrapping_sub(base))
     });
 }
 
@@ -888,7 +888,10 @@ fn encode_delta_bitpack(values: &[u64], out: &mut Writer) {
     let first = values.first().copied().unwrap_or(0);
     out.put_u64(first);
     let len = values.len().saturating_sub(1);
-    let delta_at = |i: usize| zigzag(values[i + 1].wrapping_sub(values[i]) as i64);
+    let delta_at = |i: usize| match (values.get(i), values.get(i + 1)) {
+        (Some(previous), Some(next)) => zigzag(next.wrapping_sub(*previous) as i64),
+        _ => 0,
+    };
     let max = (0..len).map(delta_at).max().unwrap_or(0);
     bitpack_with(len, bits_needed(max), out, delta_at);
 }
@@ -1167,7 +1170,7 @@ fn encode_i64_with(transform: Transform, values: &[i64], out: &mut Writer) {
                 for (slot, value) in chunk.iter_mut().zip(slice) {
                     *slot = zigzag(*value);
                 }
-                out.put_u64_slice(&chunk[..slice.len()]);
+                out.put_u64_slice(chunk.get(..slice.len()).unwrap_or_default());
             }
         }
     }
@@ -1407,7 +1410,8 @@ fn encode_alp(values: &[f64], strategy: CascadeStrategy, out: &mut Writer) -> Op
     // size each escaped vector.
     for vector_index in &escaped {
         let start = *vector_index as usize * FASTLANES_VECTOR;
-        for value in &values[start..(start + FASTLANES_VECTOR).min(values.len())] {
+        let end = (start + FASTLANES_VECTOR).min(values.len());
+        for value in values.get(start..end).unwrap_or_default() {
             out.put_u64(value.to_bits());
         }
     }
@@ -1447,7 +1451,7 @@ fn apply_alp_escapes(reader: &mut Reader<'_>, escaped: &[u32], values: &mut [f64
             });
         }
         let end = (start + FASTLANES_VECTOR).min(values.len());
-        for slot in &mut values[start..end] {
+        for slot in values.get_mut(start..end).unwrap_or_default() {
             *slot = f64::from_bits(reader.u64("alp escaped value")?);
         }
     }
@@ -3306,15 +3310,24 @@ impl FsstDecodeTable {
                 let slot = fsst_lossy_pht_slot(word) as usize;
                 let word_index = slot / u64::BITS as usize;
                 let bit = 1u64 << (slot % u64::BITS as usize);
-                if occupied_long_slots[word_index] & bit != 0 {
+                let occupied = occupied_long_slots.get_mut(word_index).ok_or(FormatError::Structural {
+                    rule: "fsst long-symbol slot beyond the decoder hash",
+                })?;
+                if *occupied & bit != 0 {
                     return Err(FormatError::Structural {
                         rule: "fsst long-symbol table collides in the decoder hash",
                     });
                 }
-                occupied_long_slots[word_index] |= bit;
+                *occupied |= bit;
             }
-            table.lengths[index] = len;
-            table.symbols[index] = word;
+            let (Some(length_slot), Some(symbol_slot)) = (table.lengths.get_mut(index), table.symbols.get_mut(index))
+            else {
+                return Err(FormatError::Structural {
+                    rule: "fsst symbol count beyond 255",
+                });
+            };
+            *length_slot = len;
+            *symbol_slot = word;
         }
         Ok(table)
     }
@@ -4009,7 +4022,7 @@ fn pick_trailing(bytes: Vec<u8>, threshold: usize, lz4: Vec<u8>, zstd_framed: Ve
 thread_local! {
     /// One [`trailing_sample`] scratch buffer per thread, reused for every large block that thread samples instead of
     /// a fresh up-to-[`TRAILING_SAMPLE_WINDOW_BYTES`]` * `[`TRAILING_SAMPLE_WINDOWS`]-byte allocation per call.
-    static TRAILING_SAMPLE_SCRATCH: RefCell<Vec<u8>> = RefCell::new(Vec::new());
+    static TRAILING_SAMPLE_SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Builds a small representative sample of `bytes` — concatenating [`TRAILING_SAMPLE_WINDOWS`] evenly spaced windows
@@ -4620,8 +4633,13 @@ fn encode_chosen_form(
                 Transform::FsstString => encode_fsst_string(values, &present, replay_fsst, &mut out),
                 _ => encode_raw_string(values, &present, &mut out).map(|()| (SideStream::None, None, Vec::new())),
             };
-            (side, fsst, frame_breaks) =
+            #[expect(
+                clippy::expect_used,
+                reason = "the writer bounds a granule far below u32 arena offsets"
+            )]
+            let parts =
                 encoded.expect("string-block arena offsets fit u32: the writer bounds a granule far below that");
+            (side, fsst, frame_breaks) = parts;
             (transform, ValueKind::String)
         }
     };

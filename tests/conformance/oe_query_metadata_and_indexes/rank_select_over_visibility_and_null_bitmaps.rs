@@ -1,25 +1,7 @@
 //! Checks that rank and select over visibility and null bitmaps work as the spec requires: without expanding the bitmap into row ids, and with the deletion anti-join computed as bitmap AND-NOT rather than row-by-row.
 
-use oe::indexes::bitmap::{RoaringRangeBitmap, RowRange};
+use oe::indexes::bitmap::RoaringRangeBitmap;
 use oe::indexes::rank_select::RankSelect;
-use std::collections::BTreeSet;
-
-/// Reference gather: materialise all live rows, then index into the list.
-fn naive_gather(live: &[u64], logical_positions: &[u64]) -> Vec<u64> {
-    logical_positions
-        .iter()
-        .filter_map(|&k| live.get(k as usize).copied())
-        .collect()
-}
-
-/// Reference anti-join: row-by-row filter.
-fn naive_anti_join(rows: &BTreeSet<u64>, deleted: &BTreeSet<u64>) -> BTreeSet<u64> {
-    rows.difference(deleted).copied().collect()
-}
-
-fn rows_of(bitmap: &RoaringRangeBitmap) -> BTreeSet<u64> {
-    bitmap.ranges().iter().flat_map(|r| r.start..r.end).collect()
-}
 
 /// conformance: oe-query-metadata-and-indexes/rank-select-over-visibility-and-null-bitmaps/gather-survivors-without-expanding-the-bitmap
 #[test]

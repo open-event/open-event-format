@@ -182,7 +182,7 @@ fn built_file_row(i: u64) -> OeRow {
     payload.insert("kind".to_owned(), VariantValue::String(format!("k{}", i % 3)));
     // Jittered, so a learned-position build over this shredded column is refused as unsorted.
     payload.insert("amount".to_owned(), VariantValue::Int(1_000 + (i as i64 * 37) % 91));
-    if i % 2 == 0 {
+    if i.is_multiple_of(2) {
         payload.insert(
             "attributes".to_owned(),
             VariantValue::Object(std::collections::BTreeMap::from([(

@@ -54,11 +54,12 @@ impl FixedClock {
 
     /// Moves the clock forward by `nanos`.
     pub fn advance(&self, nanos: i64) {
-        self.now_nanos
+        // The closure always returns `Some`, so the update cannot fail.
+        let _ = self
+            .now_nanos
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |now| {
                 Some(now.saturating_add(nanos))
-            })
-            .expect("closure always returns Some");
+            });
     }
 }
 

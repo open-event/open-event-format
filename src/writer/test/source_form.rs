@@ -4,7 +4,7 @@ use crate::columns::{FreetextDeclaration, PromotionPlan};
 use crate::events::provenance::hex_lower;
 use crate::events::transcode::{SourceFormat, transcode};
 use crate::events::variant::VariantValue;
-use crate::events::{EventEnvelope, EventFlags, EventId, SignatureScheme, StreamId, TenantId, TimestampValue};
+use crate::events::{EventEnvelope, EventFlags, EventId, StreamId, TenantId, TimestampValue};
 use crate::layout::LayoutTargets;
 use crate::layout::reader::{OeFile, PayloadRead};
 use crate::security::FooterEncryption;

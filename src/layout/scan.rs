@@ -55,8 +55,6 @@ struct ScanBlock {
 /// granule directory says about it.
 struct ScanGranule {
     blocks: std::ops::Range<usize>,
-    /// Sum of the blocks' [`estimated_decode_bytes`].
-    estimated_bytes: u64,
     granule_id: u32,
     row_count: u32,
 }
@@ -222,7 +220,6 @@ impl OeFile {
             window_used = window_used.saturating_add(estimated_bytes);
             window.push(ScanGranule {
                 blocks: first..blocks.len(),
-                estimated_bytes,
                 granule_id,
                 row_count,
             });

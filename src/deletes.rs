@@ -66,7 +66,10 @@ impl DeletionVector {
             merged.end = merged.end.max(run.end);
             past += 1;
         }
-        let absorbed: u64 = self.deleted_runs[first..past]
+        let absorbed: u64 = self
+            .deleted_runs
+            .get(first..past)
+            .unwrap_or_default()
             .iter()
             .map(|run| run.end - run.start)
             .sum();
@@ -109,13 +112,15 @@ impl DeletionVector {
     pub fn exclude_deleted(&self, first_ordinal: u64, keep: &mut [bool]) {
         let past_last_ordinal = first_ordinal + keep.len() as u64;
         let first_run = self.deleted_runs.partition_point(|run| run.end <= first_ordinal);
-        for run in &self.deleted_runs[first_run..] {
+        for run in self.deleted_runs.get(first_run..).unwrap_or_default() {
             if run.start >= past_last_ordinal {
                 break;
             }
             let from = (run.start.max(first_ordinal) - first_ordinal) as usize;
             let past = (run.end.min(past_last_ordinal) - first_ordinal) as usize;
-            keep[from..past].fill(false);
+            if let Some(span) = keep.get_mut(from..past) {
+                span.fill(false);
+            }
         }
     }
 

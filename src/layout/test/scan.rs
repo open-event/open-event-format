@@ -36,7 +36,12 @@ fn row(i: u64) -> OeRow {
                 occurred_at: TimestampValue::from_physical_nanos(1_000 + i as i64 * 3),
                 ingested_at: TimestampValue::from_physical_nanos(2_000 + i as i64 * 3),
                 source: "crm".to_owned(),
-                event_type: if i % 3 == 0 { "deal.updated" } else { "deal.created" }.to_owned(),
+                event_type: if i.is_multiple_of(3) {
+                    "deal.updated"
+                } else {
+                    "deal.created"
+                }
+                .to_owned(),
                 entity_type: "opportunity".to_owned(),
                 entity_id_hash_low: i * 7919,
                 entity_id_hash_high: 1,
@@ -286,7 +291,7 @@ fn projected_scan_refuses_unknown_columns_and_granules_and_stops_on_sink_error()
 fn projected_scan_of_nothing_is_empty_but_well_formed() {
     let file = file(20, 6);
     let granules = all_granules(&file);
-    let batches = file.scan_projected(&[], &granules, |_| Ok(())).map(|()| ());
+    let batches = file.scan_projected(&[], &granules, |_| Ok(()));
     assert!(batches.is_ok());
     let mut rows = 0;
     file.scan_projected(&[], &granules, |batch| {

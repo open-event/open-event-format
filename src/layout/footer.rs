@@ -972,6 +972,10 @@ fn encode_sections(footer: &Footer) -> SectionArea {
                 .iter()
                 .map(|granule| (granule.granule_id, granule.stripe_id))
                 .collect::<BTreeMap<_, _>>();
+            #[expect(
+                clippy::expect_used,
+                reason = "the footer builder only records marks for granules it also lists in the granule directory"
+            )]
             let columnar = encode_columnar_marks(&footer.marks, &footer.page_directory, &granule_stripe_ids)
                 .expect("columnar marks encode: every mark's granule must appear in the granule directory");
             out.put_slice(&columnar);
@@ -2198,7 +2202,10 @@ pub fn decode_footer(blob: &[u8]) -> Result<Footer, FormatError> {
             }
             // Sorted-code assignment is the contract every shared-scope evaluator binary-searches against; an
             // unsorted alphabet would make predicate pushdown silently diverge from decode-then-filter.
-            if !values.windows(2).all(|pair| pair[0] < pair[1]) {
+            if !values
+                .windows(2)
+                .all(|pair| matches!(pair, [prev, next] if prev < next))
+            {
                 return Err(FormatError::Structural {
                     rule: "shared dictionary alphabet must be strictly ascending",
                 });
@@ -2593,9 +2600,14 @@ fn validate_page_directory_entry(entry: &PageDirectoryEntry) -> Result<(), Forma
                 rule: "page directory float bounds must be both present or both absent",
             });
         }
-        // `!(min <= max)` rather than `min > max` so a NaN bound — which no comparison can order, and which would
+        // Anything other than `min <= max` rather than `min > max` so a NaN bound — which no comparison can order, and which would
         // leave the pruning decision undefined — is rejected too.
-        (Some(min), Some(max)) if !(min <= max) => {
+        (Some(min), Some(max))
+            if !matches!(
+                min.partial_cmp(&max),
+                Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+            ) =>
+        {
             return Err(FormatError::Structural {
                 rule: "page directory float min exceeds max",
             });

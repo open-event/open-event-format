@@ -27,15 +27,6 @@ pub enum RewriteSegment {
     Fresh { len: u64 },
 }
 
-impl RewriteSegment {
-    /// How many bytes of the replacement this span covers.
-    fn len(self) -> u64 {
-        match self {
-            RewriteSegment::CopyFromSource { len, .. } | RewriteSegment::Fresh { len } => len,
-        }
-    }
-}
-
 /// Builds the ordered spans for rewriting a file: the header, each stripe (reused by reference or rebuilt, per `plan`),
 /// any inter-stripe padding, and the trailing footer — together tiling `[0, file_len)`.
 ///

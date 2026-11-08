@@ -65,6 +65,10 @@ pub struct ContainsMatcher {
 /// `memmem`'s runtime-selected SIMD finder is materially cheaper than a general multi-pattern automaton. Empty and
 /// multi-needle/case-insensitive queries retain their exact existing semantics.
 #[derive(Clone, Debug)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the inline finder keeps the single-needle hot path free of an extra indirection"
+)]
 enum ContainsSearch {
     MatchAll,
     Multiple(Arc<AhoCorasick>),
@@ -127,8 +131,8 @@ impl ContainsMatcher {
 
     fn matches_bytes(&self, value: &[u8]) -> bool {
         match &self.search {
-            ContainsSearch::MatchAll => return true,
-            ContainsSearch::Single(finder) => return finder.find(value).is_some(),
+            ContainsSearch::MatchAll => true,
+            ContainsSearch::Single(finder) => finder.find(value).is_some(),
             ContainsSearch::Multiple(automaton) => self.matches_automaton(automaton, value),
         }
     }
@@ -164,11 +168,15 @@ impl ContainsMatcher {
     /// runs past its end straddles two neighbours that are only adjacent because they share a buffer, and is no match.
     fn mark_arena(&self, text: &[u8], bounds: &[usize]) -> Vec<bool> {
         match &self.search {
-            ContainsSearch::MatchAll => return vec![true; bounds.len().saturating_sub(1)],
+            ContainsSearch::MatchAll => vec![true; bounds.len().saturating_sub(1)],
             ContainsSearch::Single(finder) => {
                 let mut marks = vec![false; bounds.len().saturating_sub(1)];
-                visit_single_matches(finder, text, bounds, |value| marks[value] = true);
-                return marks;
+                visit_single_matches(finder, text, bounds, |value| {
+                    if let Some(mark) = marks.get_mut(value) {
+                        *mark = true;
+                    }
+                });
+                marks
             }
             ContainsSearch::Multiple(automaton) => self.mark_arena_automaton(automaton, text, bounds),
         }
@@ -227,7 +235,7 @@ impl ContainsMatcher {
 fn visit_single_matches(finder: &Finder<'_>, text: &[u8], bounds: &[usize], mut visit: impl FnMut(usize)) {
     let mut search_from = 0;
     while search_from <= text.len() {
-        let Some(relative) = finder.find(&text[search_from..]) else {
+        let Some(relative) = text.get(search_from..).and_then(|rest| finder.find(rest)) else {
             break;
         };
         let start = search_from + relative;
@@ -276,6 +284,10 @@ impl Eq for ContainsMatcher {}
 /// `Contains` asks for every one of its needles, and is case-sensitive unless its matcher was built to ignore ASCII
 /// case. A null row never satisfies any of these — comparing with an unknown value yields no match, matching SQL.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the contains matcher is held inline so the scan kernels read it without an extra indirection"
+)]
 pub enum StringPredicate {
     Contains(ContainsMatcher),
     Equals(String),

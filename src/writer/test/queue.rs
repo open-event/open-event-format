@@ -213,7 +213,7 @@ fn an_admitted_batch_lands_exactly_what_per_record_pushes_would() {
     assert_eq!(batched.dirty_cursor(), per_record.dirty_cursor());
     assert_eq!(batched.copy_pending().unwrap(), per_record.copy_pending().unwrap());
 
-    let mut small = CommitQueue::new(1024);
+    let small = CommitQueue::new(1024);
     let too_many: Vec<PendingRecord> = (0..64).map(|i| record(i, 1)).collect();
     assert!(
         small.admit(&too_many).unwrap().is_none(),

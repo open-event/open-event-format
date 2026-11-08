@@ -3,11 +3,11 @@
 //! Before reading any column bytes, a scan can consult two lightweight flags recorded in the page or granule metadata:
 //!
 //! - **`all_null`**: every value in the block is NULL.  Any predicate that
-//! requires a non-NULL value is immediately falsified without touching the block.
+//!   requires a non-NULL value is immediately falsified without touching the block.
 //! - **`constant_value`**: the block holds exactly one distinct non-NULL value
-//! and no NULLs.  An equality predicate on this column becomes a flag comparison: `AllRowsMatch` if the constant equals
-//! the filter target, `NoRowsMatch` otherwise.  A projection of the column is also filled from the constant without
-//! decoding the block.
+//!   and no NULLs.  An equality predicate on this column becomes a flag comparison: `AllRowsMatch` if the constant equals
+//!   the filter target, `NoRowsMatch` otherwise.  A projection of the column is also filled from the constant without
+//!   decoding the block.
 //!
 //! Both flags are exact: a block marked `all_null` truly contains no non-NULL values, and a `constant_value` truly
 //! equals every row's value.  No residual filter is needed when either flag answers the predicate.
@@ -86,7 +86,7 @@ impl ColumnFlags {
 /// decoding the column block.
 ///
 /// - All-null block: no row holds any non-NULL value, so no row can equal
-/// `target` → `NoRowsMatch`.
+///   `target` → `NoRowsMatch`.
 /// - Constant block whose value equals `target`: every row matches → `AllRowsMatch`.
 /// - Constant block whose value differs from `target`: no row matches → `NoRowsMatch`.
 /// - Mixed block: flags cannot answer → `MustDecode`.

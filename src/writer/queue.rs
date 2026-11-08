@@ -665,7 +665,10 @@ impl CommitQueue {
         self.admit_placed(
             records.len(),
             records.len() * PENDING_RECORD_CAPACITY_HINT,
-            |index, out| encode_pending_into(&records[index], &mut scratch, out).map_err(|_| QueueError::Codec),
+            |index, out| {
+                let record = records.get(index).ok_or(QueueError::Codec)?;
+                encode_pending_into(record, &mut scratch, out).map_err(|_| QueueError::Codec)
+            },
         )
     }
 
@@ -679,7 +682,7 @@ impl CommitQueue {
             return Ok(None);
         };
         self.admit_placed(records.len(), total_len, |index, out| {
-            out.put_slice(records[index]);
+            out.put_slice(records.get(index).ok_or(QueueError::Codec)?);
             Ok(())
         })
     }

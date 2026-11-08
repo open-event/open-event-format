@@ -4,12 +4,12 @@
 //! these:
 //!
 //! - **Whole-file BLAKE3**, spread across threads for big files but byte-for-byte
-//! identical to a single-threaded hash, so a file's identity never depends on the machine that produced it
-//! ([`hash_tree`]).
+//!   identical to a single-threaded hash, so a file's identity never depends on the machine that produced it
+//!   ([`hash_tree`]).
 //! - **A CRC-64/NVME precheck** ([`crc64_nvme`]) — a fast, *non-authoritative*
-//! gate that may reject early but never admits bytes BLAKE3 would reject.
+//!   gate that may reject early but never admits bytes BLAKE3 would reject.
 //! - **An outboard BLAKE3 tree** ([`verify_object_range`]) that verifies any byte
-//! range against an authenticated root without re-hashing the unread bytes.
+//!   range against an authenticated root without re-hashing the unread bytes.
 //!
 //! BLAKE3 is always the authoritative check. The outboard tree is kept *after* the file's own bytes, so the root stays
 //! exactly `BLAKE3(content)` whether or not a tree is present; when the tree is absent or unusable, verification falls
@@ -203,8 +203,13 @@ pub fn build_outboard_tree_and_root(content: &[u8], chunk_group_bytes: usize) ->
     let _ = subtree_nodes_into(content, 0, content.len(), group, &mut nodes);
     // A non-empty outboard begins with the root parent: its two child CVs merge with the ROOT flag into the ordinary
     // BLAKE3 digest, while every lower parent uses the non-root merge inside `subtree_nodes_into`.
-    let left = cv_at(&nodes[..NODE_LEN], 0).expect("root outboard node has a left CV");
-    let right = cv_at(&nodes[..NODE_LEN], blake3::OUT_LEN).expect("root outboard node has a right CV");
+    // `tree_len` is non-zero, so `nodes` holds at least the root node and both CVs are present.
+    let (Ok(left), Ok(right)) = (cv_at(&nodes, 0), cv_at(&nodes, blake3::OUT_LEN)) else {
+        return BuiltOutboard {
+            root: *hash_tree(content).as_bytes(),
+            tree: None,
+        };
+    };
     BuiltOutboard {
         root: *merge_subtrees_root(&left, &right, Mode::Hash).as_bytes(),
         tree: Some(nodes),
@@ -459,8 +464,9 @@ fn subtree_nodes_into(content: &[u8], lo: usize, hi: usize, group: usize, out: &
         || subtree_nodes_into(content, lo, mid, group, left_out),
         || subtree_nodes_into(content, mid, hi, group, right_out),
     );
-    node[..blake3::OUT_LEN].copy_from_slice(&left_cv);
-    node[blake3::OUT_LEN..].copy_from_slice(&right_cv);
+    let (left_node, right_node) = node.split_at_mut(blake3::OUT_LEN);
+    left_node.copy_from_slice(&left_cv);
+    right_node.copy_from_slice(&right_cv);
     merge_subtrees_non_root(&left_cv, &right_cv, Mode::Hash)
 }
 

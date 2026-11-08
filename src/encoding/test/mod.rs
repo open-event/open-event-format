@@ -2,7 +2,6 @@ use super::*;
 use crate::benchmarks::{XorFloatMeasurement, xor_float_gate_passes};
 use crate::file::bytes::{Reader, Writer};
 use arrow_array::Array;
-use miniz_oxide::deflate::compress_to_vec;
 use std::collections::BTreeMap;
 
 /// A transform chosen from a sample can encode the full block larger than simply writing the values out — which for
@@ -2225,7 +2224,7 @@ fn the_arena_fsst_decode_matches_decoding_the_values_one_by_one() {
         }
         // Then a fault in the offsets, some of the time.
         let fault = pseudo_random(&mut state);
-        if values > 0 && fault % 4 == 0 {
+        if values > 0 && fault.is_multiple_of(4) {
             let at = 1 + (fault >> 8) as usize % values;
             offsets[at] = offsets[at].saturating_sub(1 + (fault >> 16) as usize % 8);
         } else if fault % 4 == 1 {

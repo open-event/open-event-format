@@ -408,9 +408,10 @@ pub fn decode_artifact_directory(
     Ok((header, coverage, directory))
 }
 
-fn decode_artifact_prefix(
-    bytes: &[u8],
-) -> Result<(ArtifactHeader, ArtifactCoverage, Vec<ArtifactPageEntry>, &[u8]), FormatError> {
+/// An artifact's decoded header, coverage and page directory, plus the bytes that follow them.
+type ArtifactPrefix<'a> = (ArtifactHeader, ArtifactCoverage, Vec<ArtifactPageEntry>, &'a [u8]);
+
+fn decode_artifact_prefix(bytes: &[u8]) -> Result<ArtifactPrefix<'_>, FormatError> {
     let mut reader = Reader::new(bytes);
     let magic = reader.take(4, "artifact magic")?;
     if magic != ARTIFACT_MAGIC {
@@ -781,7 +782,7 @@ pub fn build_learned_position_artifact(
         );
         row_count = row_count.max(granule.first_row_ordinal + u64::from(granule.row_count));
     }
-    if keys.windows(2).any(|pair| pair[1] < pair[0]) {
+    if keys.windows(2).any(|pair| matches!(pair, [prev, next] if next < prev)) {
         return Err(FormatError::Structural {
             rule: "a learned position artifact requires the column sorted ascending",
         });

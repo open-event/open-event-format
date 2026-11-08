@@ -18,13 +18,16 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 /// dropped once its guard window has passed so the store does not grow for the life of the test.
 ///
 /// See: oe-write-path/spec.md
+/// A retry row's key: the tenant and its delivery identity.
+type RetryRowKey = (TenantId, (u64, u64));
+
 #[derive(Debug, Default)]
 pub struct SimSafeRetryStore {
     /// `(tenant, dedupe)` -> the delivery identities whose receipt carries that dedupe identity.
-    dedupe_index: HashMap<(TenantId, (u64, u64)), Vec<(u64, u64)>>,
+    dedupe_index: HashMap<RetryRowKey, Vec<(u64, u64)>>,
     /// Expiry -> row keys recorded with that expiry. An overwritten row leaves a stale entry behind; eviction checks
     /// the row's current expiry before dropping it, so a stale entry is discarded without touching the row.
-    expiry_queue: BTreeMap<i64, Vec<(TenantId, (u64, u64))>>,
+    expiry_queue: BTreeMap<i64, Vec<RetryRowKey>>,
     rows: HashMap<(TenantId, (u64, u64)), RetryReceipt>,
 }
 

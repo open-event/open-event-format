@@ -50,11 +50,12 @@ impl SimClock {
     /// Advances both wall and monotonic time.
     pub fn advance(&self, nanos: u64) {
         self.now.advance(nanos as i64);
-        self.monotonic_nanos
+        // The closure always returns `Some`, so the update cannot fail.
+        let _ = self
+            .monotonic_nanos
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |now| {
                 Some(now.saturating_add(nanos))
-            })
-            .expect("closure always returns Some");
+            });
     }
 
     /// Makes every later reading of the clock also move it forward by `nanos`, so a test can model time passing

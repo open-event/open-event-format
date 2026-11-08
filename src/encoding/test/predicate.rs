@@ -1229,7 +1229,7 @@ fn for_encoded_i64_splits_signed_ranges_across_the_zigzag_parity() {
         NumericPredicate::Equals(i128::from(i64::MAX) + 1), // beyond the domain
         NumericPredicate::NotEquals(hit),
         NumericPredicate::NotEquals(i128::MIN),
-        NumericPredicate::InSet(vec![hit, 0, -1, i128::from(i64::MIN), i128::from(u64::MAX) as i128 + 9]),
+        NumericPredicate::InSet(vec![hit, 0, -1, i128::from(i64::MIN), i128::from(u64::MAX) + 9]),
         range(Some((-500, true)), Some((500, true))), // straddles zero: even and odd halves both live
         range(Some((-500, false)), Some((500, false))),
         range(Some((-99_000, true)), Some((-3, false))), // wholly negative: odd codes only
