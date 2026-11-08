@@ -275,7 +275,15 @@ fn backlog_entries_follow_their_events_into_the_compacted_file() {
     let subject = <crate::deletes::SubjectId as crate::typed_id::TypedIdTestExt>::new_test_id(9);
     backlog.resolve(events[3], subject).unwrap();
 
-    let mut maintenance = Maintenance::new(config(build_config()));
+    // Two files of near-equal size never meet the default doubling bound; this test is about the backlog, not the
+    // planner, so it lets any pair merge.
+    let mut maintenance = Maintenance::new(MaintenanceConfig {
+        compaction: CompactionPolicy {
+            min_output_over_largest: 1,
+            ..CompactionPolicy::default()
+        },
+        ..config(build_config())
+    });
     maintenance.backlog = Some(backlog.clone());
     let (head_id, _) = published.head().unwrap();
     let report = maintenance.run_once(

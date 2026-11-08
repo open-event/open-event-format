@@ -58,6 +58,7 @@ fn graph_file(file_id: u128, part_state: PartState) -> OeFileEntry {
             last_sequence: 99,
         },
         feature_metadata: None,
+        field_deletion_vectors: Vec::new(),
         file_seal: [0; 32],
         file_id,
         file_type: FileType::OeFile,

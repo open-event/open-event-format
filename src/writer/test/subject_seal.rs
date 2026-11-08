@@ -237,3 +237,57 @@ fn unsorted_and_repeated_object_fields_encode_like_a_normalized_object_with_the_
     expected[2].1 = VariantValue::Int(9);
     assert_eq!(encode_object(&fields).unwrap(), encode(&object_of(&expected)).unwrap());
 }
+
+#[test]
+fn erasing_one_subject_of_a_multi_subject_event_redacts_only_its_fields() {
+    let alice = SubjectId::new_test_id(1);
+    let bob = SubjectId::new_test_id(2);
+    let mut rows: Vec<BuildRow> = (0..3).map(|i| row(i, None)).collect();
+    // Row 0 mentions both subjects; row 1 only bob; row 2 nobody.
+    let map = |i: usize, _: &BuildRow| match i {
+        0 => crate::security::FieldSubjects::from([("body".to_owned(), alice), ("n".to_owned(), bob)]),
+        1 => crate::security::FieldSubjects::from([("body".to_owned(), bob)]),
+        _ => crate::security::FieldSubjects::new(),
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let keys =
+        crate::security::FileSubjectKeyStore::open(dir.path(), crate::security::TenantDek::new([3; 32])).unwrap();
+    seal_subject_field_rows(&mut rows, map, &keys).unwrap();
+
+    let built = build_oe_file(rows, &config()).unwrap();
+    assert!(!built.bytes.windows(9).any(|window| window == b"message 0"));
+    let file = OeFile::open(built.bytes, Some(&built.file_seal)).unwrap();
+    let read = |i: u64| crate::security::read_subject_fields(&file, i, &keys).unwrap().unwrap();
+    for i in 0..3 {
+        assert_eq!(read(i).value, payload(i), "row {i} reads while both keys live");
+    }
+
+    keys.erase_subject_under_profile(alice, Some(1), &crate::clock::FixedClock::at(9))
+        .unwrap();
+
+    let after = read(0);
+    let VariantValue::Object(fields) = &after.value else {
+        panic!()
+    };
+    assert_eq!(fields["body"], VariantValue::Null, "alice's field is tombstoned");
+    assert_eq!(
+        fields["n"],
+        VariantValue::Int(0),
+        "bob's field of the same event survives"
+    );
+    assert_eq!(after.redacted.len(), 1);
+    assert_eq!(read(1).value, payload(1));
+    assert_eq!(read(2).value, payload(2));
+
+    let vector = crate::security::field_deletion_vector_for_subject(&file, alice)
+        .unwrap()
+        .unwrap();
+    assert!(vector.column_redacted("body", 0));
+    assert!(!vector.column_redacted("body", 1));
+    assert!(!vector.column_redacted("n", 0));
+    assert!(
+        crate::security::field_deletion_vector_for_subject(&file, SubjectId::new_test_id(9))
+            .unwrap()
+            .is_none()
+    );
+}

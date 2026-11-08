@@ -18,6 +18,7 @@ fn outdated_file_after_replacement() {
     let outdated = OeFileEntry {
         coverage,
         feature_metadata: None,
+        field_deletion_vectors: Vec::new(),
         file_seal: [0; 32],
         file_id: 1,
         file_type: oe::lifecycle::FileType::OeFile,

@@ -60,6 +60,7 @@ fn erasure_is_logged_overwrites_the_key_and_is_permanent() {
         erasure,
         SubjectErasure {
             erased_at_nanos: 1_000,
+            jurisdiction_profile_version: None,
             subject: erased
         }
     );
@@ -181,4 +182,42 @@ fn retargeting_the_backlog_moves_a_replaced_files_entries_and_keeps_their_subjec
             },
         ]
     );
+}
+
+#[test]
+fn the_erasure_log_pins_the_jurisdiction_profile_version_and_reads_legacy_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let legacy = SubjectId::new_test_id(10);
+    let pinned = SubjectId::new_test_id(11);
+    // A record of the original, unversioned log format.
+    let mut record = [0u8; ERASURE_RECORD_LEN];
+    record[..16].copy_from_slice(&legacy.uuid().as_u128().to_le_bytes());
+    record[16..].copy_from_slice(&77u64.to_le_bytes());
+    std::fs::write(dir.path().join("erasures.log"), record).unwrap();
+
+    let store = FileSubjectKeyStore::open(dir.path(), dek()).unwrap();
+    assert!(store.is_erased(legacy).unwrap(), "a legacy erasure is finished on open");
+    store.sealing_key(pinned).unwrap().unwrap();
+    let erasure = store
+        .erase_subject_under_profile(pinned, Some(3), &FixedClock::at(500))
+        .unwrap();
+    assert_eq!(erasure.jurisdiction_profile_version, Some(3));
+
+    let reopened = FileSubjectKeyStore::open(dir.path(), dek()).unwrap();
+    assert_eq!(
+        reopened.erasures().unwrap(),
+        vec![
+            SubjectErasure {
+                erased_at_nanos: 77,
+                jurisdiction_profile_version: None,
+                subject: legacy
+            },
+            SubjectErasure {
+                erased_at_nanos: 500,
+                jurisdiction_profile_version: Some(3),
+                subject: pinned
+            },
+        ]
+    );
+    assert!(reopened.opening_key(pinned).unwrap().is_none());
 }

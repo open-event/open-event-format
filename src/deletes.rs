@@ -209,6 +209,7 @@ impl Default for DeletionVector {
 ///
 /// Used for multi-subject events where one subject must be forgotten: only that subject's data-class-labeled fields are
 /// redacted; the event row survives for co-mentioned subjects.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldDeletionVector {
     affected_ordinals: BTreeSet<u64>,
     redacted_columns: Vec<String>,
@@ -243,6 +244,16 @@ impl FieldDeletionVector {
     /// The list of columns being redacted.
     pub fn redacted_columns(&self) -> &[String] {
         &self.redacted_columns
+    }
+
+    /// The affected row ordinals, ascending.
+    pub fn affected_ordinals(&self) -> impl Iterator<Item = u64> + '_ {
+        self.affected_ordinals.iter().copied()
+    }
+
+    /// How many rows have field-level redaction applied.
+    pub fn affected_count(&self) -> u64 {
+        self.affected_ordinals.len() as u64
     }
 }
 
@@ -589,6 +600,10 @@ pub struct SubjectContentKey {
     key_epoch: u64,
     scheme: AeadScheme,
 }
+
+// A subject key's material lives only in its `SealedContentKey`, which scrubs itself on drop; every clone handed out
+// by a key store (see `FileSubjectKeyStore`) is scrubbed when the caller drops it.
+impl zeroize::ZeroizeOnDrop for SubjectContentKey {}
 
 impl SubjectContentKey {
     /// Creates a live key from 32 bytes of key material, sealing under the default AEAD at key epoch 0.

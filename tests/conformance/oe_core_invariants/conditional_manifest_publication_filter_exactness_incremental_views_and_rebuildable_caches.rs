@@ -44,6 +44,7 @@ fn lost_manifest_cas_rebases_instead_of_overwriting() {
             last_sequence: 2,
         },
         feature_metadata: None,
+        field_deletion_vectors: Vec::new(),
         file_seal: [0; 32],
         file_id: 7,
         file_type: oe::lifecycle::FileType::OeFile,

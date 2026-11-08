@@ -88,6 +88,7 @@ fn built_tail(tenant: u128) -> (u128, Vec<u8>, OeFileEntry) {
             last_sequence: 1,
         },
         feature_metadata: None,
+        field_deletion_vectors: Vec::new(),
         file_seal: built.file_seal,
         file_id: built.file_id,
         file_type: FileType::OeFile,

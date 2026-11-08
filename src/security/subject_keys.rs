@@ -44,6 +44,9 @@ const STATE_DESTROYED: u8 = 2;
 const EPOCHS_PER_CHECKOUT: u64 = 1 << 32;
 /// Size of one erasure log record: subject id (16) and erasure time (8).
 const ERASURE_RECORD_LEN: usize = 24;
+/// Size of one erasure log record in the versioned log: subject id (16), erasure time (8), a flag byte saying whether
+/// a jurisdiction-profile version was applied (1), and that version (8).
+const ERASURE_RECORD_V2_LEN: usize = 33;
 /// Size of one backlog record: a tag byte and two 128-bit ids.
 const BACKLOG_RECORD_LEN: usize = 33;
 const BACKLOG_PENDING: u8 = 1;
@@ -215,6 +218,10 @@ impl KeyRecord {
 pub struct SubjectErasure {
     /// Nanoseconds since the Unix epoch, read through the clock, when the erasure was recorded.
     pub erased_at_nanos: i64,
+    /// The version of the jurisdiction erasure profile the erasure applied, pinned so erasure-aware reprojection
+    /// reproduces the exact, auditable outcome. `None` for erasures recorded without one, including every record of
+    /// the original (unversioned) erasure log.
+    pub jurisdiction_profile_version: Option<u64>,
     pub subject: SubjectId,
 }
 
@@ -272,6 +279,12 @@ impl FileSubjectKeyStore {
         self.dir.join("erasures.log")
     }
 
+    /// The versioned erasure log every new erasure is appended to; the original `erasures.log` (records without a
+    /// jurisdiction-profile version) is still read, first, so stores written before it keep their erasures.
+    fn erasure_log_v2(&self) -> PathBuf {
+        self.dir.join("erasures.v2.log")
+    }
+
     fn read_record(&self, subject: SubjectId) -> Result<Option<KeyRecord>, StorageError> {
         match fs::read(self.key_path(subject)) {
             Ok(bytes) => KeyRecord::decode(&bytes).map(Some),
@@ -305,19 +318,29 @@ impl FileSubjectKeyStore {
     /// Every erasure recorded in this store, oldest first (one record per subject).
     pub fn erasures(&self) -> Result<Vec<SubjectErasure>, StorageError> {
         let mut seen = BTreeMap::new();
-        for record in read_records(&self.erasure_log(), ERASURE_RECORD_LEN)? {
+        let legacy = read_records(&self.erasure_log(), ERASURE_RECORD_LEN)?
+            .into_iter()
+            .map(|record| (record, None));
+        let versioned = read_records(&self.erasure_log_v2(), ERASURE_RECORD_V2_LEN)?
+            .into_iter()
+            .map(|record| {
+                let version = (record.get(24) == Some(&1)).then(|| u64_at(&record, 25));
+                (record, version)
+            });
+        for (record, version) in legacy.chain(versioned) {
             let subject = SubjectId::from_uuid(uuid::Uuid::from_u128(u128_at(&record, 0)));
             let erased_at_nanos = u64_at(&record, 16) as i64;
             let order = seen.len();
-            seen.entry(subject).or_insert((order, erased_at_nanos));
+            seen.entry(subject).or_insert((order, erased_at_nanos, version));
         }
         let mut erasures: Vec<(usize, SubjectErasure)> = seen
             .into_iter()
-            .map(|(subject, (order, erased_at_nanos))| {
+            .map(|(subject, (order, erased_at_nanos, jurisdiction_profile_version))| {
                 (
                     order,
                     SubjectErasure {
                         erased_at_nanos,
+                        jurisdiction_profile_version,
                         subject,
                     },
                 )
@@ -334,18 +357,34 @@ impl FileSubjectKeyStore {
     /// Erasing a subject that never had a key still records the erasure and bars a key from being created. Erasing a
     /// subject twice returns the first erasure's record.
     pub fn erase_subject(&self, subject: SubjectId, clock: &dyn Clock) -> Result<SubjectErasure, StorageError> {
+        self.erase_subject_under_profile(subject, None, clock)
+    }
+
+    /// Like [`erase_subject`](Self::erase_subject), pinning `jurisdiction_profile_version` (the version of the
+    /// jurisdiction erasure profile that decided the erasure) into the erasure log record.
+    pub fn erase_subject_under_profile(
+        &self,
+        subject: SubjectId,
+        jurisdiction_profile_version: Option<u64>,
+        clock: &dyn Clock,
+    ) -> Result<SubjectErasure, StorageError> {
         if let Some(earlier) = self.erasures()?.into_iter().find(|erasure| erasure.subject == subject) {
             self.destroy_key(subject)?;
             return Ok(earlier);
         }
         let erasure = SubjectErasure {
             erased_at_nanos: clock.now_nanos(),
+            jurisdiction_profile_version,
             subject,
         };
-        let mut record = [0u8; ERASURE_RECORD_LEN];
+        let mut record = [0u8; ERASURE_RECORD_V2_LEN];
         record[..16].copy_from_slice(&subject.uuid().as_u128().to_le_bytes());
-        record[16..].copy_from_slice(&(erasure.erased_at_nanos as u64).to_le_bytes());
-        append_synced(&self.erasure_log(), &record)?;
+        record[16..24].copy_from_slice(&(erasure.erased_at_nanos as u64).to_le_bytes());
+        if let Some(version) = jurisdiction_profile_version {
+            record[24] = 1;
+            record[25..].copy_from_slice(&version.to_le_bytes());
+        }
+        append_synced(&self.erasure_log_v2(), &record)?;
         self.destroy_key(subject)?;
         Ok(erasure)
     }

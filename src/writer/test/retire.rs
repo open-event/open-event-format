@@ -129,6 +129,7 @@ fn entry(file_id: u128, first_sequence: u64, last_sequence: u64, part_state: Par
             last_sequence,
         },
         feature_metadata: None,
+        field_deletion_vectors: Vec::new(),
         file_seal: [1; 32],
         file_id,
         file_type: FileType::OeFile,

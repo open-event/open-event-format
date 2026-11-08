@@ -5,9 +5,10 @@
 
 use crate::artifacts::batch::EncodedPayload;
 use crate::error::SubjectPayloadError;
+use crate::events::variant::VariantRef;
 use crate::events::variant::{KeyDictionary, VariantValue, encode_object_fields_into, encode_value};
 use crate::file::bytes::Writer;
-use crate::security::{SubjectKeyStore, seal_subject_payload};
+use crate::security::{FieldSubjects, SubjectKeyStore, seal_subject_fields, seal_subject_payload};
 use crate::writer::build::{BuildPayload, BuildRow, FieldName};
 use std::collections::BTreeSet;
 
@@ -50,17 +51,61 @@ pub fn seal_subject_rows(rows: &mut [BuildRow], keys: &dyn SubjectKeyStore) -> R
     Ok(())
 }
 
+/// Seals, in each row, the payload fields its [`FieldSubjects`] names under each field's subject's key from `keys`
+/// (per-field erasure for events that mention several subjects; see
+/// [`seal_subject_fields`](crate::security::seal_subject_fields)). `field_subjects(i, row)` gives row `i`'s map; a row
+/// with an empty map, no payload, or an external payload is left as it is. Only the named fields become opaque; the
+/// rest of the payload is still shredded, promoted and indexed. Read rows back with
+/// [`read_subject_fields`](crate::security::read_subject_fields).
+///
+/// Fails, leaving the failing row as it was, when a subject has been erased or the key store cannot answer.
+pub fn seal_subject_field_rows(
+    rows: &mut [BuildRow],
+    mut field_subjects: impl FnMut(usize, &BuildRow) -> FieldSubjects,
+    keys: &dyn SubjectKeyStore,
+) -> Result<(), SubjectPayloadError> {
+    for (index, row) in rows.iter_mut().enumerate() {
+        let fields = field_subjects(index, row);
+        if fields.is_empty() {
+            continue;
+        }
+        let value = match &row.payload {
+            BuildPayload::ExternalRef(_) | BuildPayload::None => continue,
+            BuildPayload::Object(fields) => object_value(fields),
+            BuildPayload::Whole(value) => value.clone(),
+            BuildPayload::Encoded(encoded) => VariantRef::new(&encoded.bytes)
+                .decode(&encoded.dictionary)
+                .map_err(SubjectPayloadError::Format)?,
+        };
+        let sealed = seal_subject_fields(row.envelope.event_id, &value, &fields, keys)?;
+        let VariantValue::Object(sealed) = sealed else {
+            unreachable!("seal_subject_fields keeps an object an object")
+        };
+        row.payload = BuildPayload::Object(
+            sealed
+                .into_iter()
+                .map(|(name, value)| (FieldName::from(name.as_str()), value))
+                .collect(),
+        );
+    }
+    Ok(())
+}
+
+fn object_value(fields: &[(FieldName, VariantValue)]) -> VariantValue {
+    VariantValue::Object(
+        fields
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.clone()))
+            .collect(),
+    )
+}
+
 /// Encodes the object made of `fields`, giving the same bytes and dictionary as encoding the equivalent
 /// [`VariantValue::Object`]. Fields already sorted and unique are encoded where they lie; otherwise they are normalized
 /// the way an object map would hold them (sorted by name, the last of a repeated name wins).
 fn encode_object(fields: &[(FieldName, VariantValue)]) -> Result<EncodedPayload, SubjectPayloadError> {
     if !fields.iter().zip(fields.iter().skip(1)).all(|(a, b)| *a.0 < *b.0) {
-        return encode(&VariantValue::Object(
-            fields
-                .iter()
-                .map(|(name, value)| (name.to_string(), value.clone()))
-                .collect(),
-        ));
+        return encode(&object_value(fields));
     }
     let mut keys = BTreeSet::new();
     let borrowed: Vec<(&str, &VariantValue)> = fields
