@@ -1,0 +1,335 @@
+
+[environment]
+alloc_counting = false
+arch = "x86_64"
+commit = "5d954815fa91"
+controls = []
+cpu = "Intel(R) Xeon(R) Processor @ 2.10GHz"
+hostname = "vm"
+kernel = "Linux 6.18.44-fc-v310"
+os = "linux"
+
+[[files]]
+bytes = 8192180
+format = "oe"
+
+[[operations]]
+baseline = "oe"
+operation = "CreateWrite"
+
+[[operations.results]]
+byte_ratio = 1.0
+format = "oe"
+speedup = 1.0
+
+[operations.results.measurement]
+bytes = 8192180
+matched_rows = 100000
+median_nanos = 106718786
+median_with_input_conversion_nanos = 117961966
+min_nanos = 99136018
+samples_nanos = [
+    99136018,
+    150045025,
+    106718786,
+]
+samples_with_input_conversion_nanos = [
+    110989710,
+    161536191,
+    117961966,
+]
+
+[[operations]]
+baseline = "oe"
+operation = "OpenMetadata"
+
+[[operations.results]]
+byte_ratio = 1.0
+format = "oe"
+speedup = 1.0
+
+[operations.results.measurement]
+bytes = 29839
+matched_rows = 100000
+median_nanos = 29818
+min_nanos = 23423
+samples_nanos = [
+    84741,
+    29818,
+    23423,
+]
+
+[[operations]]
+baseline = "oe"
+operation = "ReadAllColumns"
+
+[[operations.results]]
+byte_ratio = 1.0
+format = "oe"
+speedup = 1.0
+
+[operations.results.measurement]
+bytes = 5924951
+matched_rows = 100000
+median_nanos = 3713374
+min_nanos = 3697383
+samples_nanos = [
+    4104897,
+    3713374,
+    3697383,
+]
+
+[[operations]]
+baseline = "oe"
+operation = "ReadOneColumn"
+
+[[operations.results]]
+byte_ratio = 1.0
+format = "oe"
+speedup = 1.0
+
+[operations.results.measurement]
+bytes = 288694
+matched_rows = 100000
+median_nanos = 123962
+min_nanos = 121242
+samples_nanos = [
+    148619,
+    123962,
+    121242,
+]
+
+[[operations]]
+baseline = "oe"
+operation = "ReadTextColumn"
+
+[[operations.results]]
+byte_ratio = 1.0
+format = "oe"
+speedup = 1.0
+
+[operations.results.measurement]
+bytes = 450868
+matched_rows = 100000
+median_nanos = 2541738
+min_nanos = 2470556
+samples_nanos = [
+    2603325,
+    2470556,
+    2541738,
+]
+
+[[operations]]
+baseline = "oe"
+operation = "ReadPayloadField"
+
+[[operations.results]]
+byte_ratio = 1.0
+format = "oe"
+speedup = 1.0
+
+[operations.results.measurement]
+bytes = 37718
+matched_rows = 256
+median_nanos = 104498
+min_nanos = 103427
+samples_nanos = [
+    118482,
+    104498,
+    103427,
+]
+
+[[operations]]
+baseline = "oe"
+operation = "PointLookup"
+
+[[operations.results]]
+byte_ratio = 1.0
+format = "oe"
+speedup = 1.0
+
+[operations.results.measurement]
+bytes = 303220
+matched_rows = 1
+median_nanos = 15361
+min_nanos = 14765
+samples_nanos = [
+    25600,
+    15361,
+    14765,
+]
+
+[[operations]]
+baseline = "oe"
+operation = "RangeSearch"
+
+[[operations.results]]
+byte_ratio = 1.0
+format = "oe"
+speedup = 1.0
+
+[operations.results.measurement]
+bytes = 47130
+matched_rows = 10000
+median_nanos = 34795
+min_nanos = 34298
+samples_nanos = [
+    36068,
+    34795,
+    34298,
+]
+
+[[operations]]
+baseline = "oe"
+operation = "ValueSearch"
+
+[[operations.results]]
+byte_ratio = 1.0
+format = "oe"
+speedup = 1.0
+
+[operations.results.measurement]
+bytes = 25257
+matched_rows = 25229
+median_nanos = 145604
+min_nanos = 101787
+samples_nanos = [
+    145604,
+    147254,
+    101787,
+]
+
+[[operations]]
+baseline = "oe"
+operation = "FullTextSearch"
+
+[[operations.results]]
+byte_ratio = 1.0
+format = "oe"
+speedup = 1.0
+
+[operations.results.measurement]
+bytes = 463355
+matched_rows = 101
+median_nanos = 666796
+min_nanos = 639647
+samples_nanos = [
+    989063,
+    666796,
+    639647,
+]
+
+[[operations]]
+baseline = "oe"
+operation = "FullTextSearchRare"
+
+[[operations.results]]
+byte_ratio = 1.0
+format = "oe"
+speedup = 1.0
+
+[operations.results.measurement]
+bytes = 152945
+matched_rows = 4
+median_nanos = 313867
+min_nanos = 265584
+samples_nanos = [
+    381489,
+    313867,
+    265584,
+]
+
+[[operations]]
+baseline = "oe"
+operation = "FullTextSearchAbsent"
+
+[[operations.results]]
+byte_ratio = 0.0
+format = "oe"
+speedup = 1.0
+
+[operations.results.measurement]
+bytes = 0
+matched_rows = 0
+median_nanos = 4324
+min_nanos = 4214
+samples_nanos = [
+    6116,
+    4214,
+    4324,
+]
+
+[[operations]]
+baseline = "oe"
+operation = "UpdateRows"
+
+[[operations.results]]
+byte_ratio = 1.0
+format = "oe"
+speedup = 1.0
+
+[operations.results.measurement]
+bytes = 12614805
+matched_rows = 1000
+median_nanos = 74364370
+median_with_input_conversion_nanos = 87817820
+min_nanos = 66030341
+samples_nanos = [
+    74364370,
+    75830970,
+    66030341,
+]
+samples_with_input_conversion_nanos = [
+    87817820,
+    93318352,
+    81113140,
+]
+
+[[operations]]
+baseline = "oe"
+operation = "DeleteRows"
+
+[[operations.results]]
+byte_ratio = 1.0
+format = "oe"
+speedup = 1.0
+
+[operations.results.measurement]
+bytes = 16004
+matched_rows = 1000
+median_nanos = 555144
+min_nanos = 314147
+samples_nanos = [
+    981417,
+    555144,
+    314147,
+]
+
+[[operations]]
+baseline = "oe"
+operation = "DiffVersions"
+
+[[operations.results]]
+byte_ratio = 1.0
+format = "oe"
+speedup = 1.0
+
+[operations.results.measurement]
+bytes = 220329
+matched_rows = 1000
+median_nanos = 229393
+min_nanos = 226274
+samples_nanos = [
+    316942,
+    226274,
+    229393,
+]
+
+[spec]
+iterations = 3
+mutation_percent = 1
+range_percent = 10
+row_count = 100000
+rows_per_group = 8192
+seed = 6840139966144577537
+
