@@ -27,12 +27,13 @@ use constant::{
     ALP_CONVERT_MAGIC, ALP_EXACT_CONVERT_MAX_WIDTH, ALP_MAX_EXCEPTION_SAMPLE_DIVISOR, ALP_MAX_SCALED_MAGNITUDE,
     ALP_RD_CODE_MISS, ALP_RD_MAX_DICT_LEN, ALP_RD_MAX_RIGHT_WIDTH, ALP_RD_MIN_RIGHT_WIDTH, ALP_VECTOR_ESCAPE_SENTINEL,
     BYTE_STREAM_SPLIT_TILE, DECODE_OPTIMIZED_THRESHOLD_DEN, DECODE_OPTIMIZED_THRESHOLD_NUM,
-    DICTIONARY_FSST_MAX_VALUE_LEN, DICTIONARY_MAX_CARDINALITY_DIVISOR, DICTIONARY_TRIAL_MIN_REPEAT,
-    FASTLANES_SPARSE_MAX_VALUES, FSST_LOSSY_PHT_HASH_MULTIPLIER, FSST_LOSSY_PHT_HASH_SHIFT, FSST_MAX_AVERAGE_VALUE_LEN,
-    FSST_MAX_SYMBOL_COUNT, FSST_MIN_SAMPLE_COUNT, FSST_PER_FRAME_BAR_MIN_BLOCK_BYTES, FSST_TRAILING_MAX_RATIO_DEN,
-    FSST_TRAILING_MAX_RATIO_NUM, FSST_VALUE_KEYS_MAX_PLAINTEXT_DIVISOR, MAX_RLE_EXPANSION_VALUES, PREFIX_KEY_BYTES,
-    PREFIX_SUM_CHUNK, REPLAY_TRIP_DEN, REPLAY_TRIP_NUM, SIZE_OPTIMIZED_SAVINGS_DIVISOR, TRANSFORM_SAMPLE_RUNS,
-    TRANSFORM_SAMPLE_SIZE, ZSTD_LENGTH_PREFIX_BYTES,
+    DICTIONARY_FSST_MAX_VALUE_LEN, DICTIONARY_MAX_CARDINALITY_DIVISOR, DICTIONARY_TRIAL_MAX_DISTINCT_DEN,
+    DICTIONARY_TRIAL_MAX_DISTINCT_NUM, FASTLANES_SPARSE_MAX_VALUES, FSST_LOSSY_PHT_HASH_MULTIPLIER,
+    FSST_LOSSY_PHT_HASH_SHIFT, FSST_MAX_AVERAGE_VALUE_LEN, FSST_MAX_SYMBOL_COUNT, FSST_MIN_SAMPLE_COUNT,
+    FSST_PER_FRAME_BAR_MIN_BLOCK_BYTES, FSST_TRAILING_MAX_RATIO_DEN, FSST_TRAILING_MAX_RATIO_NUM,
+    FSST_VALUE_KEYS_MAX_PLAINTEXT_DIVISOR, MAX_RLE_EXPANSION_VALUES, PREFIX_KEY_BYTES, PREFIX_SUM_CHUNK,
+    REPLAY_TRIP_DEN, REPLAY_TRIP_NUM, SIZE_OPTIMIZED_SAVINGS_DIVISOR, TRANSFORM_SAMPLE_RUNS, TRANSFORM_SAMPLE_SIZE,
+    ZSTD_LENGTH_PREFIX_BYTES,
 };
 use multiversion::multiversion;
 use std::borrow::Cow;
@@ -180,6 +181,13 @@ pub enum Transform {
     ForBitpack = 1,
     /// FSST for high-cardinality short strings (random-access preserved through per-value offsets).
     FsstString = 9,
+    /// [`Transform::FsstString`] with the four-byte per-value offset table replaced by the values' compressed lengths,
+    /// FastLanes-bitpacked: the same null stream, symbol table, present count and code arena, minus most of the offset
+    /// table's bytes. A reader rebuilds the offset table from the lengths (one unpack and a prefix sum, no entropy
+    /// decode) and from there reads the block exactly as [`Transform::FsstString`], so every compressed-form kernel
+    /// still applies. Never stores per-value keys and never rides the seekable framing. A file holding one declares
+    /// the `PACKED_STRING_OFFSETS` required feature. See [`fsst_packed_as_classic`].
+    FsstPackedString = 15,
     PlainF64 = 5,
     PlainU128 = 4,
     PlainU64 = 0,
@@ -197,7 +205,11 @@ impl Transform {
     pub fn is_per_value_addressable(self) -> bool {
         matches!(
             self,
-            Transform::Alp | Transform::DictionaryString | Transform::FsstString | Transform::RawString
+            Transform::Alp
+                | Transform::DictionaryString
+                | Transform::FsstString
+                | Transform::FsstPackedString
+                | Transform::RawString
         )
     }
 
@@ -276,6 +288,12 @@ impl PipelineId {
         Self((self.0 & 0x00FF_FFFF) | ((side as u32) << 24))
     }
 
+    /// The same id with its transform stage replaced by `transform` — how a reader hands a block it rewrote into an
+    /// equivalent layout (see [`fsst_packed_as_classic`]) to the decoders of that layout.
+    pub fn with_transform(self, transform: Transform) -> Self {
+        Self((self.0 & !0xFF) | transform as u32)
+    }
+
     /// The inner encoding recorded for this block's side stream, or an error if the id is malformed.
     pub fn side_stream(self) -> Result<SideStream, FormatError> {
         Ok(match (self.0 >> 24) & 0xFF {
@@ -311,6 +329,7 @@ impl PipelineId {
             12 => Transform::ByteStreamSplit,
             13 => Transform::AlpRd,
             14 => Transform::Chimp,
+            15 => Transform::FsstPackedString,
             _ => {
                 return Err(FormatError::Structural {
                     rule: "unknown transform in pipeline id",
@@ -3765,11 +3784,14 @@ pub(crate) fn decode_string_block_views_shared_prepared(
     let transform = pipeline.transform()?;
     if !matches!(
         transform,
-        Transform::DictionaryString | Transform::FsstString | Transform::RawString
+        Transform::DictionaryString | Transform::FsstString | Transform::FsstPackedString | Transform::RawString
     ) {
         return Ok(None);
     }
     with_trailing_removed(pipeline.compression()?, bytes, |body| {
+        if let Some((classic, body)) = classic_fsst_view(pipeline, body)? {
+            return decode_string_block_views_with_body(classic, Transform::FsstString, &body, shared, prepared);
+        }
         decode_string_block_views_with_body(pipeline, transform, body, shared, prepared)
     })
 }
@@ -4085,10 +4107,11 @@ fn null_buffer(nulls: &NullStream) -> Option<NullBuffer> {
     }
 }
 
-/// Whether a block [`choose_string_transform`] sent to FSST repeats its values enough (at most one distinct value per
-/// [`DICTIONARY_TRIAL_MIN_REPEAT`] rows) for a dictionary trial encode to have a chance of being smaller.
+/// Whether a block [`choose_string_transform`] sent to FSST repeats its values enough (at most three distinct values per
+/// four present rows, see [`DICTIONARY_TRIAL_MAX_DISTINCT_NUM`]) for a dictionary trial encode to have a chance of
+/// being smaller.
 fn dictionary_trial_worthwhile(present: &[&str]) -> bool {
-    let limit = present.len() / DICTIONARY_TRIAL_MIN_REPEAT;
+    let limit = present.len() * DICTIONARY_TRIAL_MAX_DISTINCT_NUM / DICTIONARY_TRIAL_MAX_DISTINCT_DEN;
     let mut distinct = AHashSet::with_capacity(limit + 1);
     for value in present {
         if distinct.insert(*value) && distinct.len() > limit {
@@ -4571,7 +4594,7 @@ impl ReplayCapture {
         Some(Self {
             compression: pipeline.compression().ok()?,
             decoded_len,
-            fsst: fsst.filter(|_| transform == Transform::FsstString),
+            fsst: fsst.filter(|_| matches!(transform, Transform::FsstString | Transform::FsstPackedString)),
             raw_len: raw_value_bytes(data).max(1),
             transform,
         })
@@ -4587,7 +4610,7 @@ fn transform_matches_kind(transform: Transform, data: &ColumnData) -> bool {
         ),
         ColumnData::Strings(_) => matches!(
             transform,
-            Transform::DictionaryString | Transform::FsstString | Transform::RawString
+            Transform::DictionaryString | Transform::FsstString | Transform::FsstPackedString | Transform::RawString
         ),
         ColumnData::Decimal { .. } | ColumnData::F64(_) | ColumnData::U128(_) => false,
     }
@@ -4846,18 +4869,36 @@ fn encode_chosen_form(
             // runs both need the present rows, not the whole (null-carrying) column.
             let present = present_values(values);
             let mut transform = forced.unwrap_or_else(|| choose_string_transform(&present));
+            // The packed-lengths FSST layout is chosen after the classic one is written: an FSST block without
+            // per-value keys is rewritten with its offset table bitpacked as lengths whenever that is smaller. A
+            // conformance run forcing classic FSST keeps it.
+            let may_pack = forced != Some(Transform::FsstString) || replay_trailing.is_some();
+            if transform == Transform::FsstPackedString {
+                transform = Transform::FsstString;
+            }
             let mut encoded = match transform {
                 Transform::DictionaryString => encode_dictionary_string(values, &present, strategy, shared, &mut out)
                     .map(|side| (side, None, Vec::new())),
                 Transform::FsstString => encode_fsst_string(values, &present, replay_fsst, &mut out),
                 _ => encode_raw_string(values, &present, &mut out).map(|()| (SideStream::None, None, Vec::new())),
             };
+            if may_pack
+                && transform == Transform::FsstString
+                && matches!(encoded, Ok((SideStream::None, _, _)))
+                && let Some(packed) = fsst_classic_as_packed(out.bytes())
+                && packed.len() < out.len()
+            {
+                out = Writer::from_vec(packed);
+                transform = Transform::FsstPackedString;
+            }
             // A mid-cardinality block (too many distinct values in the sample for the dictionary rule, yet each value
             // repeating) is trial-encoded as a dictionary too, and the smaller form kept: equality filters then test
-            // one dictionary entry and compare bitpacked codes instead of every row's compressed bytes.
-            if forced.is_none()
-                && transform == Transform::FsstString
-                && !random_access
+            // one dictionary entry and compare bitpacked codes instead of every row's compressed bytes. The trial runs
+            // on random-access blocks too — a dictionary block's bitpacked codes are per-value addressable, so it keeps
+            // random access without a trailing stage — and on a block replaying an FSST capture, so a column whose
+            // head granule happened to sample as FSST still stores its repeating tail blocks as dictionaries.
+            if (forced.is_none() || replay_trailing.is_some())
+                && matches!(transform, Transform::FsstString | Transform::FsstPackedString)
                 && encoded.is_ok()
                 && dictionary_trial_worthwhile(&present)
             {
@@ -4897,7 +4938,7 @@ fn encode_chosen_form(
     } else if dictionary_by_trial
         || matches!(
             transform,
-            Transform::FsstString | Transform::DeltaBitpack | Transform::ForBitpack
+            Transform::FsstString | Transform::FsstPackedString | Transform::DeltaBitpack | Transform::ForBitpack
         )
     {
         // Kept only when it at least halves the block: see `FSST_TRAILING_MAX_RATIO_NUM`. These transforms are already
@@ -5291,6 +5332,98 @@ fn read_string_header<'a>(transform: Transform, reader: &mut Reader<'a>) -> Resu
         offsets_start: reader.position(),
         present_count,
     })
+}
+
+/// Byte length of the prefix every FSST layout shares — the null stream, the symbol table and the present count —
+/// with the present count it declares.
+fn fsst_shared_prefix(body: &[u8]) -> Result<(usize, usize), FormatError> {
+    let mut reader = Reader::new(body);
+    NullStream::read(&mut reader)?;
+    let symbols = reader.u16("fsst symbol count")? as usize;
+    reader.take(symbols.saturating_mul(9), "fsst symbol table")?;
+    let count = reader.u32("fsst present count")? as usize;
+    Ok((reader.position(), count))
+}
+
+/// Rewrites a [`Transform::FsstPackedString`] body into the equivalent [`Transform::FsstString`] body: the shared
+/// prefix is copied, the bitpacked lengths are prefix-summed into the u32 offset table, and the code arena follows.
+/// Every length, the total, and the arena's extent are checked, so a malformed body is refused rather than yielding
+/// a table that disagrees with its arena.
+pub(crate) fn fsst_packed_as_classic(body: &[u8]) -> Result<Vec<u8>, FormatError> {
+    let (prefix_len, count) = fsst_shared_prefix(body)?;
+    let mut reader = Reader::new(body);
+    reader.take(prefix_len, "fsst prefix")?;
+    let lens = bitunpack(&mut reader)?;
+    if lens.len() != count {
+        return Err(FormatError::Structural {
+            rule: "fsst packed length count disagrees with the present count",
+        });
+    }
+    let arena = reader.take(reader.remaining(), "fsst data")?;
+    let prefix = body.get(..prefix_len).ok_or(FormatError::Structural {
+        rule: "fsst prefix out of range",
+    })?;
+    let mut out = Writer::with_capacity(prefix_len + (count + 1) * 4 + arena.len());
+    out.put_slice(prefix);
+    out.put_u32(0);
+    let mut offset = 0u64;
+    for len in lens {
+        offset = offset.saturating_add(len);
+        let stored = u32::try_from(offset).map_err(|_| FormatError::Structural {
+            rule: "string arena offsets exceed the u32 range the format stores",
+        })?;
+        out.put_u32(stored);
+    }
+    if offset != arena.len() as u64 {
+        return Err(FormatError::Structural {
+            rule: "fsst packed lengths disagree with the arena",
+        });
+    }
+    out.put_slice(arena);
+    Ok(out.into_bytes())
+}
+
+/// The [`Transform::FsstPackedString`] form of a classic FSST body that stores no per-value keys, or `None` when the
+/// body does not parse (never the case for a body this encoder just wrote).
+fn fsst_classic_as_packed(body: &[u8]) -> Option<Vec<u8>> {
+    let (prefix_len, count) = fsst_shared_prefix(body).ok()?;
+    let table_len = count.checked_add(1)?.checked_mul(4)?;
+    let arena_start = prefix_len.checked_add(table_len)?;
+    let offsets = decode_offsets(body.get(prefix_len..arena_start)?);
+    let lens: Vec<u64> = offsets
+        .windows(2)
+        .map(|pair| match pair {
+            [start, end] => end.saturating_sub(*start) as u64,
+            _ => 0,
+        })
+        .collect();
+    let width = bits_needed(lens.iter().copied().max().unwrap_or(0));
+    let mut out = Writer::with_capacity(body.len());
+    out.put_slice(body.get(..prefix_len)?);
+    bitpack(&lens, width, &mut out);
+    out.put_slice(body.get(arena_start..)?);
+    Some(out.into_bytes())
+}
+
+/// The body and pipeline a decoder of the classic layouts reads for this block: a [`Transform::FsstPackedString`]
+/// body rewritten by [`fsst_packed_as_classic`] and relabelled [`Transform::FsstString`], or `None` for every other
+/// pipeline, which decodes as it stands.
+pub(crate) fn classic_fsst_view(
+    pipeline: PipelineId,
+    body: &[u8],
+) -> Result<Option<(PipelineId, Vec<u8>)>, FormatError> {
+    if pipeline.transform()? != Transform::FsstPackedString {
+        return Ok(None);
+    }
+    if pipeline.value_kind()? != ValueKind::String {
+        return Err(FormatError::Structural {
+            rule: "packed fsst transform on a non-string block",
+        });
+    }
+    Ok(Some((
+        pipeline.with_transform(Transform::FsstString),
+        fsst_packed_as_classic(body)?,
+    )))
 }
 
 /// Threads a decoded run of `count` present values back through the block's presence stream, for rows `[start, end)`
@@ -5750,6 +5883,11 @@ pub fn decode_block_range_shared(
             (ValueKind::String, Transform::FsstString) => {
                 Ok(ColumnData::Strings(decode_fsst_string_range(body, start, end)?))
             }
+            (ValueKind::String, Transform::FsstPackedString) => Ok(ColumnData::Strings(decode_fsst_string_range(
+                &fsst_packed_as_classic(body)?,
+                start,
+                end,
+            )?)),
             (ValueKind::String, Transform::RawString) => {
                 Ok(ColumnData::Strings(decode_raw_string_range(body, start, end)?))
             }
@@ -5817,6 +5955,9 @@ pub fn decode_block_shared_with_body(
     body: &[u8],
     shared: Option<&[String]>,
 ) -> Result<ColumnData, FormatError> {
+    if let Some((classic, body)) = classic_fsst_view(pipeline, body)? {
+        return decode_block_shared_with_body(classic, &body, shared);
+    }
     let mut reader = Reader::new(body);
     let transform = pipeline.transform()?;
     match pipeline.value_kind()? {

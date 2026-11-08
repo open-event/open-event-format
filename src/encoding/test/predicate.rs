@@ -190,7 +190,8 @@ fn dictionary_ranges_are_answered_from_sorted_codes() {
 #[test]
 fn high_cardinality_columns_encode_as_fsst() {
     let values = high_cardinality(128);
-    assert_eq!(transform_of(&values, true), Transform::FsstString);
+    // Short keyless values store the packed-lengths FSST layout.
+    assert_eq!(transform_of(&values, true), Transform::FsstPackedString);
 }
 
 #[test]
@@ -223,7 +224,7 @@ fn fsst_blocks_carry_per_value_keys_only_when_their_values_are_long_enough() {
     assert_eq!(long.pipeline.side_stream().unwrap(), SideStream::FsstValueKeys);
 
     let short = encode_block(&ColumnData::Strings(high_cardinality(128).into()), true);
-    assert_eq!(short.pipeline.transform().unwrap(), Transform::FsstString);
+    assert_eq!(short.pipeline.transform().unwrap(), Transform::FsstPackedString);
     assert_eq!(short.pipeline.side_stream().unwrap(), SideStream::None);
 }
 
@@ -1446,7 +1447,14 @@ fn a_framed_fsst_block_counts_substrings_frame_by_frame_like_the_whole_block_ker
     ];
     for (values, side, needles) in cases {
         let column: StringColumn = values.into();
-        let mut block = encode_block(&ColumnData::Strings(column.clone()), true);
+        // Forced to the classic layout: a keyless block would otherwise store packed lengths, which never frame.
+        let mut block = encode_block_forced_for_conformance(
+            &ColumnData::Strings(column.clone()),
+            true,
+            CascadeStrategy::DecodeOptimized,
+            Transform::FsstString,
+        )
+        .unwrap();
         assert_eq!(block.pipeline.transform().unwrap(), Transform::FsstString);
         if block.pipeline.compression().unwrap() == Compression::None {
             // Short identifiers' codes do not halve under Zstandard, so the writer stores such a block unframed; the
@@ -2203,6 +2211,7 @@ fn mid_cardinality_strings_win_the_dictionary_trial_and_filter_on_codes() {
     assert!(check(&values, &equals(&present), false));
     assert!(check(&values, &equals("!room999999:example.org"), false));
     assert!(check(&values, &equals(""), false));
-    // Random-access blocks keep their FSST layout: the trial runs only where no seekable framing is wanted.
-    assert_eq!(transform_of(&values, true), Transform::FsstString);
+    // Random-access blocks take the trial too: dictionary codes are per-value addressable.
+    assert_eq!(transform_of(&values, true), Transform::DictionaryString);
+    assert!(check(&values, &equals(&present), true));
 }

@@ -4525,6 +4525,12 @@ fn build_oe_file_sealed_in_order(
             .chain(piece.pages.iter().map(|page| page.1))
             .any(|pipeline| pipeline.transform() == Ok(Transform::Chimp))
     });
+    // Whether any block or page stores FSST with bitpacked value lengths.
+    let packed_string_offsets = pieces.iter().any(|piece| {
+        std::iter::once(piece.pipeline)
+            .chain(piece.pages.iter().map(|page| page.1))
+            .any(|pipeline| pipeline.transform() == Ok(Transform::FsstPackedString))
+    });
 
     // The promotion plan is the column-heat measurement: promoted columns are precisely the columns whose planner
     // metadata justifies the NDV pass. Once block encoding has released its scratch, build NDV sketches, exact-count
@@ -5287,6 +5293,9 @@ fn build_oe_file_sealed_in_order(
     }
     if xor_float_blocks {
         required_feature_flags |= required_features::XOR_FLOAT_BLOCKS;
+    }
+    if packed_string_offsets {
+        required_feature_flags |= required_features::PACKED_STRING_OFFSETS;
     }
     if !state_roots.is_empty() {
         required_feature_flags |= required_features::GRAPH_STATE_ROOTS;

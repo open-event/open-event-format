@@ -80,9 +80,14 @@ pub const DECODE_OPTIMIZED_THRESHOLD_NUM: usize = 3;
 /// distinct values are at most this fraction (1/4, 25%) of the sample; above that, FSST or raw wins.
 pub const DICTIONARY_MAX_CARDINALITY_DIVISOR: usize = 4;
 
-/// A block sent to FSST is also trial-encoded as a dictionary when each distinct value repeats at least this many
-/// times on average across the whole block; the smaller encoding is kept.
-pub const DICTIONARY_TRIAL_MIN_REPEAT: usize = 2;
+/// A block sent to FSST is also trial-encoded as a dictionary when its distinct values are at most
+/// `DICTIONARY_TRIAL_MAX_DISTINCT_NUM / DICTIONARY_TRIAL_MAX_DISTINCT_DEN` (3/4) of its present rows; the smaller
+/// encoding is kept. A dictionary drops FSST's four-byte per-row offset for a bitpacked code, so it can win even when
+/// values repeat only modestly.
+pub const DICTIONARY_TRIAL_MAX_DISTINCT_NUM: usize = 3;
+
+/// Denominator of [`DICTIONARY_TRIAL_MAX_DISTINCT_NUM`].
+pub const DICTIONARY_TRIAL_MAX_DISTINCT_DEN: usize = 4;
 
 /// fsst-rs's lossy perfect-hash multiplier (`fsst::lossy_pht::HASH_MULTIPLIER`), pinned with fsst-rs 0.5.11. Used by
 /// [`super::fsst_lossy_pht_slot`] to reproduce the slot a symbol lands in inside the crate's lossy hash table.

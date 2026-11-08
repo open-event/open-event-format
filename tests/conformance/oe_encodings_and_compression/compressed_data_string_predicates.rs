@@ -106,7 +106,10 @@ fn dictionary_equality_and_range_answered_from_codes() {
 fn fsst_equality_answered_from_compressed_bytes() {
     let values = high_cardinality(96);
     let encoded = encode_block(&ColumnData::Strings(values.clone()), true);
-    assert_eq!(encoded.pipeline.transform().unwrap(), Transform::FsstString);
+    assert!(matches!(
+        encoded.pipeline.transform().unwrap(),
+        Transform::FsstString | Transform::FsstPackedString
+    ));
 
     let predicates = [
         StringPredicate::Equals("id-00042".to_owned()),
@@ -128,7 +131,10 @@ fn fsst_range_falls_back_to_decode() {
     // Short values, so the block carries no per-value keys and nothing in it orders the rows.
     let values = high_cardinality(96);
     let encoded = encode_block(&ColumnData::Strings(values.clone()), true);
-    assert_eq!(encoded.pipeline.transform().unwrap(), Transform::FsstString);
+    assert!(matches!(
+        encoded.pipeline.transform().unwrap(),
+        Transform::FsstString | Transform::FsstPackedString
+    ));
 
     let predicate = StringPredicate::Range {
         lower: Some(bound("id-00010", true)),
@@ -151,7 +157,10 @@ fn fsst_range_falls_back_to_decode() {
 fn fsst_range_answered_from_per_value_prefix_keys() {
     let values = long_high_cardinality(128);
     let encoded = encode_block(&ColumnData::Strings(values.clone()), true);
-    assert_eq!(encoded.pipeline.transform().unwrap(), Transform::FsstString);
+    assert!(matches!(
+        encoded.pipeline.transform().unwrap(),
+        Transform::FsstString | Transform::FsstPackedString
+    ));
     assert_eq!(encoded.pipeline.side_stream().unwrap(), SideStream::FsstValueKeys);
 
     let predicates = [
