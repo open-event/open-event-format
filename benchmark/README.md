@@ -58,3 +58,9 @@ test writes; use a directory on the disk you want to test) and `--skip-ingest ye
   than on a physical drive, so use `--scratch` with a real device before drawing conclusions.
 - OE's journal pads each frame to an aligned size (4 KiB minimum), so one-event batches use far more disk than the
   other formats; the cost falls as batches grow.
+
+## Operations benchmark
+
+`operations/` holds a second, separate comparison of OE against Parquet and Vortex over one chat-shaped dataset:
+create, read, update, delete, search, and diff, with every answer checked across formats before timings are reported.
+See `operations/README.md`.

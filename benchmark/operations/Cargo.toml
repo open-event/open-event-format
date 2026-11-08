@@ -1,0 +1,46 @@
+[package]
+name = "oe-operations-benchmark"
+description = "Compares OE with Parquet and Vortex over one identical dataset: create, read, update, delete, search, and diff, measured the same way on every side."
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+publish = false
+build = "build.rs"
+
+[workspace]
+
+[[bin]]
+name = "oe-vs-parquet"
+path = "src/main.rs"
+
+[features]
+# Installs the counting allocator in `allocation`, so a run can report allocation and peak-memory totals. Off by
+# default so an ordinary timing run measures the default allocator.
+alloc-counting = []
+
+[dependencies]
+anyhow = "1"
+arrow-array = "59.2.0"
+arrow-schema = "59.2.0"
+bytes = "1"
+chrono = "0.4"
+libc = "0.2.186"
+memchr = "2"
+oe = { path = "../..", features = ["write"] }
+parquet = "59.0.0"
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+uuid = { version = "1", features = ["v4"] }
+vortex = "0.77.0"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.rust]
+unsafe_code = "deny"
+
+[profile.release]
+debug = false
+lto = "thin"
