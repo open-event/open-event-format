@@ -3743,6 +3743,21 @@ impl OeFile {
         ))
     }
 
+    /// One row's value in a dense 128-bit column block (the event id, say), read through the decoded-block cache;
+    /// `None` when the block is not 128-bit or the row lies past it.
+    pub(super) fn with_cached_u128_at(
+        &self,
+        column_id: u32,
+        granule_id: u32,
+        row: u64,
+    ) -> Result<Option<u128>, FormatError> {
+        let column = self.cached_column(column_id, granule_id)?;
+        let ColumnData::U128(values) = &column.data else {
+            return Ok(None);
+        };
+        Ok(usize::try_from(row).ok().and_then(|row| values.get(row).copied()))
+    }
+
     /// Sizes the decoded-block cache budget, replacing [`DECODED_CACHE_BUDGET_BYTES`]. A caller-supplied working-set
     /// bound, not an operator key; eviction only ever costs a re-decode, never a result.
     pub fn with_decoded_cache_budget(mut self, bytes: u64) -> Self {

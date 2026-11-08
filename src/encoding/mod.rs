@@ -26,13 +26,13 @@ use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, ScalarBuffer};
 use constant::{
     ALP_CONVERT_MAGIC, ALP_EXACT_CONVERT_MAX_WIDTH, ALP_MAX_EXCEPTION_SAMPLE_DIVISOR, ALP_MAX_SCALED_MAGNITUDE,
     ALP_RD_CODE_MISS, ALP_RD_MAX_DICT_LEN, ALP_RD_MAX_RIGHT_WIDTH, ALP_RD_MIN_RIGHT_WIDTH, ALP_VECTOR_ESCAPE_SENTINEL,
-    BYTE_STREAM_SPLIT_TILE, DECODE_OPTIMIZED_THRESHOLD_DEN, DECODE_OPTIMIZED_THRESHOLD_NUM, FSST_TRAILING_MAX_RATIO_DEN,
-    FSST_TRAILING_MAX_RATIO_NUM,
-    DICTIONARY_FSST_MAX_VALUE_LEN, DICTIONARY_MAX_CARDINALITY_DIVISOR, DICTIONARY_TRIAL_MIN_REPEAT, FASTLANES_SPARSE_MAX_VALUES,
-    FSST_LOSSY_PHT_HASH_MULTIPLIER, FSST_LOSSY_PHT_HASH_SHIFT, FSST_MAX_AVERAGE_VALUE_LEN, FSST_MAX_SYMBOL_COUNT,
-    FSST_MIN_SAMPLE_COUNT, FSST_PER_FRAME_BAR_MIN_BLOCK_BYTES, FSST_VALUE_KEYS_MAX_PLAINTEXT_DIVISOR,
-    MAX_RLE_EXPANSION_VALUES, PREFIX_KEY_BYTES, PREFIX_SUM_CHUNK, REPLAY_TRIP_DEN, REPLAY_TRIP_NUM,
-    SIZE_OPTIMIZED_SAVINGS_DIVISOR, TRANSFORM_SAMPLE_RUNS, TRANSFORM_SAMPLE_SIZE, ZSTD_LENGTH_PREFIX_BYTES,
+    BYTE_STREAM_SPLIT_TILE, DECODE_OPTIMIZED_THRESHOLD_DEN, DECODE_OPTIMIZED_THRESHOLD_NUM,
+    DICTIONARY_FSST_MAX_VALUE_LEN, DICTIONARY_MAX_CARDINALITY_DIVISOR, DICTIONARY_TRIAL_MIN_REPEAT,
+    FASTLANES_SPARSE_MAX_VALUES, FSST_LOSSY_PHT_HASH_MULTIPLIER, FSST_LOSSY_PHT_HASH_SHIFT, FSST_MAX_AVERAGE_VALUE_LEN,
+    FSST_MAX_SYMBOL_COUNT, FSST_MIN_SAMPLE_COUNT, FSST_PER_FRAME_BAR_MIN_BLOCK_BYTES, FSST_TRAILING_MAX_RATIO_DEN,
+    FSST_TRAILING_MAX_RATIO_NUM, FSST_VALUE_KEYS_MAX_PLAINTEXT_DIVISOR, MAX_RLE_EXPANSION_VALUES, PREFIX_KEY_BYTES,
+    PREFIX_SUM_CHUNK, REPLAY_TRIP_DEN, REPLAY_TRIP_NUM, SIZE_OPTIMIZED_SAVINGS_DIVISOR, TRANSFORM_SAMPLE_RUNS,
+    TRANSFORM_SAMPLE_SIZE, ZSTD_LENGTH_PREFIX_BYTES,
 };
 use multiversion::multiversion;
 use std::borrow::Cow;
@@ -40,13 +40,13 @@ use std::cell::RefCell;
 use zstd::{bulk::Compressor as ZstdCompressor, zstd_safe::compress_bound};
 
 use chimp::{decode_chimp, decode_chimp_range, encode_chimp};
-pub(crate) use presence::{PresenceRank, count_present_before, count_set_bits, present_position};
-use scratch::{with_arena_buffer, with_unpack_buffer};
-use sidecar::{PrefixKey, StringFingerprint};
 pub use lazy::{
     DictionaryCodes, decode_dictionary_codes, filter_block_by_selection, fsst_uncompressed_len, take_block_rows,
     take_block_rows_shared,
 };
+pub(crate) use presence::{PresenceRank, count_present_before, count_set_bits, present_position};
+use scratch::{with_arena_buffer, with_unpack_buffer};
+use sidecar::{PrefixKey, StringFingerprint};
 pub use string_column::StringColumn;
 
 mod chimp;
@@ -938,7 +938,12 @@ fn take_delta_bitpack<T: IntValue>(body: &[u8], rows: &[usize]) -> Result<Vec<T>
         let values = decode_delta_bitpack::<T>(&mut Reader::new(body))?;
         return rows
             .iter()
-            .map(|&row| values.get(row).copied().ok_or(FormatError::RefOutOfRange { what: "take row" }))
+            .map(|&row| {
+                values
+                    .get(row)
+                    .copied()
+                    .ok_or(FormatError::RefOutOfRange { what: "take row" })
+            })
             .collect();
     }
     if rows.last().is_some_and(|&row| row > stream.count) {
@@ -3325,11 +3330,15 @@ impl FsstNeedleEncoder {
                 escape: false,
                 len: 2,
             },
-            None => self.one_byte.get(usize::from(word as u8)).copied().unwrap_or(FsstShortCode {
-                code: fsst::ESCAPE_CODE,
-                escape: true,
-                len: 1,
-            }),
+            None => self
+                .one_byte
+                .get(usize::from(word as u8))
+                .copied()
+                .unwrap_or(FsstShortCode {
+                    code: fsst::ESCAPE_CODE,
+                    escape: true,
+                    len: 1,
+                }),
         }
     }
 
@@ -4886,7 +4895,10 @@ fn encode_chosen_form(
         // would have sampled.
         (Compression::None, body)
     } else if dictionary_by_trial
-        || matches!(transform, Transform::FsstString | Transform::DeltaBitpack | Transform::ForBitpack)
+        || matches!(
+            transform,
+            Transform::FsstString | Transform::DeltaBitpack | Transform::ForBitpack
+        )
     {
         // Kept only when it at least halves the block: see `FSST_TRAILING_MAX_RATIO_NUM`. These transforms are already
         // compact and answer filters straight from their bytes, which a trailing codec would force a reader to unpack.
@@ -5742,7 +5754,9 @@ pub fn decode_block_range_shared(
                 Ok(ColumnData::Strings(decode_raw_string_range(body, start, end)?))
             }
             // A run directory expands only the runs overlapping the range, not the whole block.
-            (kind @ (ValueKind::U64 | ValueKind::I64), Transform::Rle) => lazy::decode_rle_range(body, kind, start, end),
+            (kind @ (ValueKind::U64 | ValueKind::I64), Transform::Rle) => {
+                lazy::decode_rle_range(body, kind, start, end)
+            }
             _ => {
                 debug_assert!(
                     !transform.is_per_value_addressable(),

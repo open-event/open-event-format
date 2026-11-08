@@ -257,10 +257,31 @@ ordinal)` SHALL be persisted through an interface the embedding application
 backs with durable storage, and when an id is recorded from several files the
 newest generation SHALL win.
 
+The column SHALL store each id as its lowercase hex text, except that an id
+which only repeats the row's own event id SHALL be elided: when the id equals
+the event id's 16 raw big-endian bytes the row SHALL store the sentinel `r`,
+and when it equals the event id's 32-character lowercase hex text it SHALL
+store `h`. Stored hex is always of even length over `[0-9a-f]`, so neither
+sentinel is ambiguous. A file that stores at least one sentinel SHALL declare
+the required feature `external_id_event_id_elision` (bit 32), which is not part
+of the set every file declares, so a reader or rewriter that predates it
+refuses the file at open instead of failing on, or misreading, an elided row.
+Every reader of the column (point reads, whole-file id listings, index
+confirmation, and rewrites) SHALL expand a sentinel from the same row's
+`event_id`, and SHALL treat a sentinel in a file that does not declare the bit
+as a structural error. The footer index SHALL hash the original id bytes, never
+the sentinel.
+
 #### Scenario: Lookup hits and misses without a scan
 - **WHEN** a reader asks a file for the row of an external id, including one longer than 32 bytes
-- **THEN** a present id resolves to its row reading at most the one granule block that confirms it, and an absent
-  id resolves to nothing without reading any block
+- **THEN** a present id resolves to its row reading at most the one granule's external-id block that confirms it
+  (and that granule's event-id block when the id is elided), and an absent id resolves to nothing without reading
+  any block
+
+#### Scenario: External id repeating the event id is elided
+- **WHEN** a row's external id is its event id's raw 16 bytes or its lowercase hex text
+- **THEN** the row stores a one-byte sentinel, the file declares `external_id_event_id_elision`, the id reads back
+  and is found by lookup byte for byte, and a reader that predates the bit refuses the file at open
 
 #### Scenario: Duplicate id across files
 - **WHEN** the same external id is recorded from files of two generations, in either order

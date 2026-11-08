@@ -724,9 +724,7 @@ impl FsstTest {
     fn matches(&self, compressed: &[u8]) -> bool {
         match self {
             FsstTest::Equals(term) => compressed == term.as_slice(),
-            FsstTest::InSet(terms) => terms
-                .binary_search_by(|term| term.as_slice().cmp(compressed))
-                .is_ok(),
+            FsstTest::InSet(terms) => terms.binary_search_by(|term| term.as_slice().cmp(compressed)).is_ok(),
             FsstTest::NotEquals(term) => compressed != term.as_slice(),
         }
     }
@@ -779,7 +777,8 @@ fn filter_fsst(body: &[u8], predicate: &StringPredicate) -> Result<Vec<bool>, Fo
         for entry in entries.iter().skip(1) {
             let end = u32::from_le_bytes(*entry) as usize;
             monotone &= end >= start;
-            let hit = end.wrapping_sub(start) == want && data.get(start..end).is_some_and(|value| value == term.as_slice());
+            let hit =
+                end.wrapping_sub(start) == want && data.get(start..end).is_some_and(|value| value == term.as_slice());
             present.push(hit);
             start = end;
         }
