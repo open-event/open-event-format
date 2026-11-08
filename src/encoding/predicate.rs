@@ -681,15 +681,16 @@ impl FsstTest {
 fn filter_fsst(body: &[u8], predicate: &StringPredicate) -> Result<Vec<bool>, FormatError> {
     let mut reader = Reader::new(body);
     let nulls = super::NullStream::read(&mut reader)?;
-    let compressor = read_fsst_compressor(&mut reader)?;
+    // The needle encoder writes the codes the crate's compressor would, without building its lookup tables.
+    let encoder = super::FsstDecodeTable::read(&mut reader)?.needle_encoder();
     let test = match predicate {
-        StringPredicate::Equals(needle) => FsstTest::Equals(compressor.compress(needle.as_bytes())),
-        StringPredicate::NotEquals(needle) => FsstTest::NotEquals(compressor.compress(needle.as_bytes())),
+        StringPredicate::Equals(needle) => FsstTest::Equals(encoder.compress(needle.as_bytes())),
+        StringPredicate::NotEquals(needle) => FsstTest::NotEquals(encoder.compress(needle.as_bytes())),
         StringPredicate::InSet(needles) => {
             // Compressed once, then sorted and deduplicated so each row is a binary search over the terms.
             let mut terms: Vec<Vec<u8>> = needles
                 .iter()
-                .map(|needle| compressor.compress(needle.as_bytes()))
+                .map(|needle| encoder.compress(needle.as_bytes()))
                 .collect();
             terms.sort_unstable();
             terms.dedup();
@@ -707,19 +708,23 @@ fn filter_fsst(body: &[u8], predicate: &StringPredicate) -> Result<Vec<bool>, Fo
         }
     };
     let present_count = reader.u32("fsst present count")? as usize;
-    let offsets = super::read_offsets(&mut reader, present_count)?;
-    let data_len = offsets.last().copied().unwrap_or(0);
+    // The offset table is read in place, one `u32` per boundary, rather than copied into a `Vec<usize>` first.
+    let table = reader.take(present_count.saturating_add(1).saturating_mul(4), "string offset")?;
+    let (entries, _) = table.as_chunks::<4>();
+    let data_len = entries.last().map_or(0, |entry| u32::from_le_bytes(*entry) as usize);
     let data = reader.take(data_len, "fsst data")?;
-    let mut present = Vec::with_capacity(reader.capacity_hint(present_count, 1));
-    for pair in offsets.windows(2) {
-        let [start, end] = pair else { continue };
+    let mut present = Vec::with_capacity(present_count);
+    let mut start = entries.first().map_or(0, |entry| u32::from_le_bytes(*entry) as usize);
+    for entry in entries.iter().skip(1) {
+        let end = u32::from_le_bytes(*entry) as usize;
         if end < start {
             return Err(FormatError::Structural {
                 rule: "fsst offsets must be non-decreasing",
             });
         }
-        let compressed = slice(data, *start, end - start, "fsst value")?;
+        let compressed = slice(data, start, end - start, "fsst value")?;
         present.push(test.matches(compressed));
+        start = end;
     }
     weave_present(&nulls, present)
 }
