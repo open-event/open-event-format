@@ -1,7 +1,7 @@
 # OE task runner. `just` lists every recipe.
 #
 # Benchmarks come in three suites that share one target directory (`target/`):
-#   - micro:      Criterion kernel benches in `benches/` (encoding, vector)
+#   - micro:      Criterion kernel benches in `benchmark/micro/` (encoding, vector)
 #   - compare:    `benchmark/`, OE vs Parquet, Vortex and JSON (size, write, scans, lookups, ingest)
 #   - operations: `benchmark/operations/`, OE vs Parquet and Vortex per operation (create, read, update, delete, search, diff)
 # The two comparison harnesses are standalone crates (they pin different Vortex versions), so each keeps its own

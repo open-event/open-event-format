@@ -75,10 +75,12 @@ tempfile = "3"
 
 [[bench]]
 name = "encoding"
+path = "benchmark/micro/encoding.rs"
 harness = false
 
 [[bench]]
 name = "vector"
+path = "benchmark/micro/vector.rs"
 harness = false
 
 [lints.rust]
