@@ -95,6 +95,10 @@ impl PartialOrd for PartState {
 pub struct OeFileEntry {
     /// The contiguous journal range this file covers.
     pub coverage: SequenceRange,
+    /// Which entities the file holds (see [`crate::indexes::entity_summary`]), so a planner looking for one entity's
+    /// events skips files that cannot hold any. `None` on entries written before the summary existed.
+    #[serde(default)]
+    pub entity_summary: Option<crate::indexes::entity_summary::EntitySummary>,
     /// Day-scoped service rollup payload. Valid only on `GenerationPart` entries with `part_index == 0`; must be
     /// `None` on all other entries.
     pub feature_metadata: Option<Vec<u8>>,

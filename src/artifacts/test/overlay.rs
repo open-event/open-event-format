@@ -242,6 +242,7 @@ fn covering_manifest(segment: &LiveOverlaySegment) -> ManifestGeneration {
             file_id: 0,
             file_type: FileType::OeFile,
             footer_len: None,
+            entity_summary: None,
             graph_event_id_filter: None,
             graph_summary: None,
             optional_feature_flags: 0,

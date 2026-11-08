@@ -13,6 +13,7 @@ fn entry(file_id: u128, first_sequence: u64, size_bytes: u64, part_state: PartSt
         file_id,
         file_type: FileType::OeFile,
         footer_len: None,
+        entity_summary: None,
         graph_event_id_filter: None,
         graph_summary: None,
         optional_feature_flags: 0,

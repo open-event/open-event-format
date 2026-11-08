@@ -10,6 +10,7 @@
 //! See: oe-vector-columns/spec.md
 
 mod constant;
+mod deletes;
 mod error;
 mod kernel;
 mod model;
@@ -22,6 +23,7 @@ pub use constant::{
     DEFAULT_OVERSAMPLE, EMBEDDING_COLUMN_ID, EVENT_ID_COLUMN, GRANULE_ROWS, ROOM_ID_COLUMN, SENDER_COLUMN,
     TIMESTAMP_COLUMN,
 };
+pub use deletes::SegmentDeletes;
 pub use error::*;
 pub use kernel::{PreparedQuery, TopK, top_k};
 pub use model::*;

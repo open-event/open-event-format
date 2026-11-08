@@ -91,6 +91,7 @@ fn built_tail(tenant: u128) -> (u128, Vec<u8>, OeFileEntry) {
         file_id: built.file_id,
         file_type: FileType::OeFile,
         footer_len: Some(built.footer_len),
+        entity_summary: None,
         graph_event_id_filter: None,
         graph_summary: None,
         optional_feature_flags: built.footer.optional_feature_flags,

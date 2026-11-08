@@ -22,6 +22,7 @@ fn outdated_file_after_replacement() {
         file_id: 1,
         file_type: oe::lifecycle::FileType::OeFile,
         footer_len: None,
+        entity_summary: None,
         graph_event_id_filter: None,
         graph_summary: None,
         optional_feature_flags: 0,

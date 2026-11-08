@@ -22,6 +22,7 @@ fn entry_for(range: SequenceRange) -> OeFileEntry {
         file_id: FILE_A,
         file_type: FileType::OeFile,
         footer_len: None,
+        entity_summary: None,
         graph_event_id_filter: None,
         graph_summary: None,
         optional_feature_flags: 0,

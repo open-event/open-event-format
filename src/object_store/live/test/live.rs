@@ -19,6 +19,7 @@ fn entry(file_id: u128) -> OeFileEntry {
         file_id,
         file_type: FileType::OeFile,
         footer_len: Some(64),
+        entity_summary: None,
         graph_event_id_filter: None,
         graph_summary: None,
         optional_feature_flags: 0,
