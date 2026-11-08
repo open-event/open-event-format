@@ -277,10 +277,7 @@ pub fn take_block_rows_shared(
     let kind = pipeline.value_kind()?;
     with_trailing_removed(pipeline.compression()?, bytes, |body| match (kind, transform) {
         (ValueKind::String, Transform::FsstString) => Ok(ColumnData::Strings(take_fsst(body, rows)?)),
-        (ValueKind::String, Transform::FsstPackedString) => Ok(ColumnData::Strings(take_fsst(
-            &super::fsst_packed_as_classic(body)?,
-            rows,
-        )?)),
+        (ValueKind::String, Transform::FsstPackedString) => Ok(ColumnData::Strings(take_fsst_packed(body, rows)?)),
         (ValueKind::String, Transform::RawString) => Ok(ColumnData::Strings(take_raw(body, rows)?)),
         (ValueKind::String, Transform::DictionaryString) => Ok(ColumnData::Strings(take_dictionary(
             body,
@@ -361,6 +358,56 @@ fn take_fsst(body: &[u8], rows: &[usize]) -> Result<StringColumn, FormatError> {
             });
         }
         let compressed = slice(data, *start, end - start, "fsst value")?;
+        buffer.clear();
+        fsst_decompress_value(decode, compressed, &mut buffer)?;
+        let text = simdutf8::basic::from_utf8(&buffer).map_err(|_| FormatError::InvalidUtf8 { what: "fsst value" })?;
+        out.push(Some(text));
+    }
+    Ok(out)
+}
+
+/// [`take_fsst`] over a packed-lengths FSST body: the lengths are unpacked and prefix-summed in place of reading an
+/// offset table, and the code arena is read where it lies — no rewrite of the block into the classic layout, so a
+/// point lookup pays one unpack rather than a copy of the whole arena.
+fn take_fsst_packed(body: &[u8], rows: &[usize]) -> Result<StringColumn, FormatError> {
+    let mut reader = Reader::new(body);
+    let header = read_string_header(Transform::FsstString, &mut reader)?;
+    let lens = super::bitunpack(&mut reader)?;
+    if lens.len() != header.present_count {
+        return Err(FormatError::Structural {
+            rule: "fsst packed length count disagrees with the present count",
+        });
+    }
+    let mut starts = Vec::with_capacity(lens.len() + 1);
+    let mut offset = 0usize;
+    starts.push(0);
+    for len in &lens {
+        offset = usize::try_from(*len)
+            .ok()
+            .and_then(|len| offset.checked_add(len))
+            .ok_or(FormatError::Structural {
+                rule: "fsst packed lengths disagree with the arena",
+            })?;
+        starts.push(offset);
+    }
+    let data = reader.take(reader.remaining(), "fsst data")?;
+    if data.len() != offset {
+        return Err(FormatError::Structural {
+            rule: "fsst packed lengths disagree with the arena",
+        });
+    }
+    let decode = header.fsst()?;
+    let mut out = StringColumn::with_capacity(rows.len(), 0);
+    let mut buffer = Vec::new();
+    for &row in rows {
+        let Some(position) = present_position_of(&header.nulls, row)? else {
+            out.push(None);
+            continue;
+        };
+        let (Some(&start), Some(&end)) = (starts.get(position), starts.get(position + 1)) else {
+            return Err(FormatError::Truncated { what: "string offset" });
+        };
+        let compressed = slice(data, start, end - start, "fsst value")?;
         buffer.clear();
         fsst_decompress_value(decode, compressed, &mut buffer)?;
         let text = simdutf8::basic::from_utf8(&buffer).map_err(|_| FormatError::InvalidUtf8 { what: "fsst value" })?;

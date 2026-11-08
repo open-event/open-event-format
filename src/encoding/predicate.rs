@@ -472,7 +472,16 @@ pub fn filter_string_block_shared_with_body(
     if !string_block_has_fast_path(pipeline, predicate)? {
         return Ok(None);
     }
-    // A packed-lengths FSST block answers through the classic layout's kernels once its offset table is rebuilt.
+    // A packed-lengths FSST block answers equality-class filters straight from its lengths and arena, and everything
+    // else through the classic layout's kernels once its offset table is rebuilt.
+    if pipeline.transform()? == Transform::FsstPackedString
+        && matches!(
+            predicate,
+            StringPredicate::Equals(_) | StringPredicate::NotEquals(_) | StringPredicate::InSet(_)
+        )
+    {
+        return Ok(Some(filter_fsst_packed(body, predicate)?));
+    }
     if let Some((classic, body)) = super::classic_fsst_view(pipeline, body)? {
         return filter_string_block_shared_with_body(classic, &body, predicate, shared);
     }
@@ -743,9 +752,16 @@ impl FsstTest {
 fn filter_fsst(body: &[u8], predicate: &StringPredicate) -> Result<Vec<bool>, FormatError> {
     let mut reader = Reader::new(body);
     let nulls = super::NullStream::read(&mut reader)?;
+    let test = fsst_test(&super::FsstDecodeTable::read(&mut reader)?, predicate)?;
+    filter_fsst_classic(reader, &nulls, &test)
+}
+
+/// The equality-class test `predicate` becomes over an FSST block compressed with `table`: each needle compressed
+/// once into the block's code space.
+fn fsst_test(table: &super::FsstDecodeTable, predicate: &StringPredicate) -> Result<FsstTest, FormatError> {
     // The needle encoder writes the codes the crate's compressor would, without building its lookup tables.
-    let encoder = super::FsstDecodeTable::read(&mut reader)?.needle_encoder();
-    let test = match predicate {
+    let encoder = table.needle_encoder();
+    Ok(match predicate {
         StringPredicate::Equals(needle) => FsstTest::Equals(encoder.compress(needle.as_bytes())),
         StringPredicate::NotEquals(needle) => FsstTest::NotEquals(encoder.compress(needle.as_bytes())),
         StringPredicate::InSet(needles) => {
@@ -768,7 +784,56 @@ fn filter_fsst(body: &[u8], predicate: &StringPredicate) -> Result<Vec<bool>, Fo
                 rule: "FSST blocks cannot answer range predicates from compressed bytes",
             });
         }
-    };
+    })
+}
+
+/// The equality-class kernel over a packed-lengths FSST block ([`Transform::FsstPackedString`]): the lengths are
+/// unpacked and the arena walked where it lies, so a filter pays one unpack and no rewrite of the block. Rows are
+/// decided exactly as [`filter_fsst`] decides them, the common equality first by length and only then by bytes.
+fn filter_fsst_packed(body: &[u8], predicate: &StringPredicate) -> Result<Vec<bool>, FormatError> {
+    let mut reader = Reader::new(body);
+    let nulls = super::NullStream::read(&mut reader)?;
+    let test = fsst_test(&super::FsstDecodeTable::read(&mut reader)?, predicate)?;
+    let present_count = reader.u32("fsst present count")? as usize;
+    let lens = super::bitunpack(&mut reader)?;
+    if lens.len() != present_count {
+        return Err(FormatError::Structural {
+            rule: "fsst packed length count disagrees with the present count",
+        });
+    }
+    let data = reader.take(reader.remaining(), "fsst data")?;
+    let total = lens.iter().try_fold(0u64, |sum, len| sum.checked_add(*len));
+    if total != Some(data.len() as u64) {
+        return Err(FormatError::Structural {
+            rule: "fsst packed lengths disagree with the arena",
+        });
+    }
+    let mut present = Vec::with_capacity(present_count);
+    let mut start = 0usize;
+    if let FsstTest::Equals(term) = &test {
+        let want = term.len() as u64;
+        for len in lens {
+            let end = start + len as usize;
+            present.push(len == want && data.get(start..end).is_some_and(|value| value == term.as_slice()));
+            start = end;
+        }
+        return weave_present(&nulls, present);
+    }
+    for len in lens {
+        let end = start + len as usize;
+        let compressed = slice(data, start, end - start, "fsst value")?;
+        present.push(test.matches(compressed));
+        start = end;
+    }
+    weave_present(&nulls, present)
+}
+
+/// [`filter_fsst`]'s walk over the classic offset table, `reader` positioned at the present count.
+fn filter_fsst_classic(
+    mut reader: Reader<'_>,
+    nulls: &super::NullStream<'_>,
+    test: &FsstTest,
+) -> Result<Vec<bool>, FormatError> {
     let present_count = reader.u32("fsst present count")? as usize;
     // The offset table is read in place, one `u32` per boundary, rather than copied into a `Vec<usize>` first.
     let table = reader.take(present_count.saturating_add(1).saturating_mul(4), "string offset")?;
@@ -777,7 +842,7 @@ fn filter_fsst(body: &[u8], predicate: &StringPredicate) -> Result<Vec<bool>, Fo
     let data = reader.take(data_len, "fsst data")?;
     let mut present = Vec::with_capacity(present_count);
     let mut start = entries.first().map_or(0, |entry| u32::from_le_bytes(*entry) as usize);
-    if let FsstTest::Equals(term) = &test {
+    if let FsstTest::Equals(term) = test {
         // The common point lookup: a value can only equal the term when its compressed length does, so most rows are
         // decided from the offsets alone and only same-length values are compared byte for byte.
         let want = term.len();
@@ -795,7 +860,7 @@ fn filter_fsst(body: &[u8], predicate: &StringPredicate) -> Result<Vec<bool>, Fo
                 rule: "fsst offsets must be non-decreasing",
             });
         }
-        return weave_present(&nulls, present);
+        return weave_present(nulls, present);
     }
     for entry in entries.iter().skip(1) {
         let end = u32::from_le_bytes(*entry) as usize;
@@ -808,7 +873,7 @@ fn filter_fsst(body: &[u8], predicate: &StringPredicate) -> Result<Vec<bool>, Fo
         present.push(test.matches(compressed));
         start = end;
     }
-    weave_present(&nulls, present)
+    weave_present(nulls, present)
 }
 
 /// The per-value keys an FSST block stores after its arena when it records [`SideStream::FsstValueKeys`]: a run of

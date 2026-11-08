@@ -381,6 +381,8 @@ fn mutated_packed_fsst_block_never_panics() {
         let _ = super::encoding::decode_block_range(block.pipeline, &mutated, 3, 90);
         let _ = super::encoding::take_block_rows(block.pipeline, &mutated, &[0, 5, 399]);
         let _ = super::encoding::decode_string_block_views(block.pipeline, &mutated);
+        let equals = super::encoding::predicate::StringPredicate::Equals("@user37:example.org".to_owned());
+        let _ = super::encoding::predicate::filter_string_block(block.pipeline, &mutated, &equals);
     }
     for cut in 0..block.bytes.len() {
         assert!(decode_block(block.pipeline, &block.bytes[..cut]).is_err());
