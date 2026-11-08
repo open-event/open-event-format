@@ -8,262 +8,262 @@ Every format stores the same events. Query times are the median of 5 runs after 
 
 | Format | Size (MiB) | Bytes per event | Size vs JSON | Write (ms) | Write (events/s) | Open (ms) | Open + first lookup (ms) |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| oe | 0.47 | 49.5 | 20.2% | 37 | 273836 | 0.24 | 0.47 |
-| oe (lazy open) | 0.47 | 49.5 | 20.2% | 27 | 373090 | 0.11 | 0.29 |
-| parquet | 0.13 | 13.7 | 5.6% | 5 | 2029204 | 0.01 | 0.34 |
-| vortex | 0.16 | 16.6 | 6.8% | 32 | 311785 | 0.51 | 0.88 |
-| json | 2.34 | 245.1 | 100.0% | 12 | 833418 | 0.00 | 13.70 |
-| json+zstd | 0.22 | 23.4 | 9.5% | 16 | 634065 | 0.00 | 15.70 |
+| oe | 0.47 | 49.5 | 20.2% | 31 | 327194 | 0.20 | 0.29 |
+| oe (lazy open) | 0.47 | 49.5 | 20.2% | 27 | 371046 | 0.10 | 0.26 |
+| parquet | 0.13 | 13.7 | 5.6% | 4 | 2348736 | 0.01 | 0.29 |
+| vortex | 0.16 | 16.6 | 6.8% | 26 | 380013 | 0.46 | 0.74 |
+| json | 2.34 | 245.1 | 100.0% | 9 | 1061026 | 0.00 | 11.10 |
+| json+zstd | 0.22 | 23.4 | 9.5% | 16 | 618497 | 0.00 | 16.02 |
 
 | Query (median ms; entity_lookup is per lookup) | Rows matched | oe | oe (lazy open) | parquet | vortex | json | json+zstd |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| scan_all_columns | 10000 | 3.01 | 2.32 | 1.47 | 0.90 | 20.15 | 20.17 |
-| scan_one_number | 10000 | 0.02 | 0.02 | 0.19 | 0.03 | 13.04 | 14.81 |
-| scan_one_payload_number | 10000 | 0.12 | 0.09 | 0.18 | 0.12 | 13.10 | 15.03 |
-| scan_one_payload_text | 10000 | 0.10 | 0.07 | 0.09 | 0.06 | 13.66 | 15.58 |
-| filter_type_and_payload | 12 | 0.11 | 0.08 | 0.47 | 0.28 | 14.33 | 16.12 |
-| time_window_1pct | 100 | 0.03 | 0.02 | 0.28 | 0.11 | 13.31 | 15.23 |
-| entity_lookup | 820 | 0.16 | 0.10 | 0.32 | 0.15 | 13.63 | 15.81 |
+| scan_all_columns | 10000 | 2.13 | 1.81 | 1.17 | 0.79 | 14.77 | 20.32 |
+| scan_one_number | 10000 | 0.02 | 0.01 | 0.14 | 0.03 | 10.49 | 15.60 |
+| scan_one_payload_number | 10000 | 0.09 | 0.07 | 0.15 | 0.09 | 11.10 | 15.61 |
+| scan_one_payload_text | 10000 | 0.07 | 0.06 | 0.08 | 0.05 | 12.06 | 16.04 |
+| filter_type_and_payload | 12 | 0.08 | 0.07 | 0.38 | 0.25 | 14.80 | 16.68 |
+| time_window_1pct | 100 | 0.02 | 0.02 | 0.26 | 0.09 | 13.98 | 15.65 |
+| entity_lookup | 820 | 0.11 | 0.09 | 0.25 | 0.11 | 13.96 | 15.96 |
 
 Removing events (redaction). OE records a deletion vector; the other formats rewrite the whole file.
 
 | Case | Events removed | oe (ms) | oe (bytes written) | oe (lazy open) (ms) | oe (lazy open) (bytes written) | parquet (ms) | parquet (bytes written) | vortex (ms) | vortex (bytes written) | json (ms) | json (bytes written) | json+zstd (ms) | json+zstd (bytes written) |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| redact_1_event | 1 | 0.00 | 9 | 0.00 | 9 | 9.73 | 134711 | 38.03 | 165968 | 33.29 | 2450649 | 50.43 | 233602 |
-| redact_1pct_of_events | 100 | 0.05 | 405 | 0.03 | 405 | 9.95 | 133804 | 36.79 | 165504 | 33.45 | 2426385 | 45.86 | 231239 |
+| redact_1_event | 1 | 0.00 | 9 | 0.00 | 9 | 7.98 | 134711 | 30.01 | 165968 | 34.33 | 2450649 | 40.25 | 233602 |
+| redact_1pct_of_events | 100 | 0.03 | 405 | 0.02 | 405 | 8.06 | 133804 | 29.90 | 165504 | 34.37 | 2426385 | 40.93 | 231239 |
 
 ## telemetry events: 100000 rows
 
 | Format | Size (MiB) | Bytes per event | Size vs JSON | Write (ms) | Write (events/s) | Open (ms) | Open + first lookup (ms) |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| oe | 5.29 | 55.4 | 22.6% | 351 | 284991 | 1.49 | 3.12 |
-| oe (lazy open) | 5.29 | 55.4 | 22.6% | 301 | 332669 | 0.81 | 3.93 |
-| parquet | 1.11 | 11.6 | 4.7% | 45 | 2219683 | 0.04 | 2.83 |
-| vortex | 1.76 | 18.5 | 7.5% | 141 | 707161 | 0.62 | 1.94 |
-| json | 23.36 | 245.0 | 100.0% | 159 | 627091 | 0.00 | 144.53 |
-| json+zstd | 2.36 | 24.7 | 10.1% | 195 | 512927 | 0.00 | 181.22 |
+| oe | 5.50 | 57.7 | 23.6% | 365 | 274166 | 1.58 | 2.39 |
+| oe (lazy open) | 5.50 | 57.7 | 23.6% | 333 | 300471 | 0.95 | 2.15 |
+| parquet | 1.11 | 11.6 | 4.7% | 43 | 2314452 | 0.03 | 2.87 |
+| vortex | 1.76 | 18.5 | 7.5% | 110 | 907307 | 0.50 | 1.38 |
+| json | 23.36 | 245.0 | 100.0% | 138 | 723116 | 0.00 | 157.55 |
+| json+zstd | 2.36 | 24.7 | 10.1% | 181 | 552799 | 0.00 | 152.59 |
 
 | Query (median ms; entity_lookup is per lookup) | Rows matched | oe | oe (lazy open) | parquet | vortex | json | json+zstd |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| scan_all_columns | 100000 | 18.03 | 22.67 | 10.88 | 6.16 | 206.89 | 220.91 |
-| scan_one_number | 100000 | 0.16 | 0.17 | 1.69 | 0.17 | 145.75 | 146.97 |
-| scan_one_payload_number | 100000 | 0.70 | 0.90 | 1.12 | 0.71 | 137.04 | 182.10 |
-| scan_one_payload_text | 100000 | 0.54 | 0.71 | 0.84 | 0.44 | 144.42 | 181.20 |
-| filter_type_and_payload | 143 | 0.65 | 0.82 | 3.42 | 0.27 | 143.24 | 163.55 |
-| time_window_1pct | 1000 | 0.04 | 0.06 | 2.12 | 0.10 | 141.69 | 180.65 |
-| entity_lookup | 834 | 1.68 | 2.14 | 2.75 | 0.85 | 146.04 | 180.71 |
+| scan_all_columns | 100000 | 28.95 | 20.52 | 11.92 | 6.12 | 215.49 | 221.12 |
+| scan_one_number | 100000 | 0.21 | 0.15 | 1.61 | 0.17 | 139.80 | 165.50 |
+| scan_one_payload_number | 100000 | 0.91 | 0.79 | 1.08 | 0.73 | 141.00 | 136.94 |
+| scan_one_payload_text | 100000 | 0.71 | 0.63 | 0.76 | 0.49 | 148.05 | 165.87 |
+| filter_type_and_payload | 143 | 0.84 | 0.77 | 3.46 | 0.28 | 156.54 | 147.56 |
+| time_window_1pct | 1000 | 0.05 | 0.04 | 2.77 | 0.11 | 149.21 | 137.89 |
+| entity_lookup | 834 | 0.61 | 0.54 | 2.67 | 0.87 | 136.53 | 142.22 |
 
 Removing events (redaction). OE records a deletion vector; the other formats rewrite the whole file.
 
 | Case | Events removed | oe (ms) | oe (bytes written) | oe (lazy open) (ms) | oe (lazy open) (bytes written) | parquet (ms) | parquet (bytes written) | vortex (ms) | vortex (bytes written) | json (ms) | json (bytes written) | json+zstd (ms) | json+zstd (bytes written) |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| redact_1_event | 1 | 0.00 | 9 | 0.00 | 9 | 96.16 | 1162107 | 147.67 | 1846136 | 398.36 | 24497827 | 472.43 | 2470339 |
-| redact_1pct_of_events | 1000 | 0.78 | 4005 | 1.16 | 4005 | 94.95 | 1129279 | 180.10 | 1834576 | 353.62 | 24253096 | 483.58 | 2446064 |
+| redact_1_event | 1 | 0.00 | 9 | 0.00 | 9 | 92.35 | 1162107 | 158.97 | 1846136 | 359.53 | 24497827 | 451.14 | 2470339 |
+| redact_1pct_of_events | 1000 | 1.00 | 4005 | 1.04 | 4005 | 82.84 | 1129279 | 163.54 | 1834576 | 314.67 | 24253096 | 424.38 | 2446064 |
 
 ## telemetry events: 1000000 rows
 
 | Format | Size (MiB) | Bytes per event | Size vs JSON | Write (ms) | Write (events/s) | Open (ms) | Open + first lookup (ms) |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| oe | 56.69 | 59.4 | 24.3% | 3578 | 279470 | 9.25 | 14.88 |
-| oe (lazy open) | 56.69 | 59.4 | 24.3% | 3267 | 306064 | 6.20 | 20.91 |
-| parquet | 11.73 | 12.3 | 5.0% | 461 | 2167874 | 0.09 | 28.96 |
-| vortex | 18.63 | 19.5 | 8.0% | 1174 | 851854 | 0.84 | 7.83 |
-| json | 233.58 | 244.9 | 100.0% | 1096 | 912388 | 6.45 | 1473.23 |
-| json+zstd | 24.21 | 25.4 | 10.4% | 1719 | 581833 | 0.00 | 1673.31 |
+| oe | 58.80 | 61.7 | 25.2% | 3069 | 325821 | 9.42 | 12.38 |
+| oe (lazy open) | 58.80 | 61.7 | 25.2% | 3248 | 307875 | 7.12 | 17.39 |
+| parquet | 11.73 | 12.3 | 5.0% | 485 | 2063456 | 0.12 | 33.77 |
+| vortex | 18.63 | 19.5 | 8.0% | 1052 | 950758 | 0.68 | 6.70 |
+| json | 233.58 | 244.9 | 100.0% | 1225 | 816377 | 6.96 | 1380.69 |
+| json+zstd | 24.21 | 25.4 | 10.4% | 1845 | 542024 | 0.00 | 1688.55 |
 
 | Query (median ms; entity_lookup is per lookup) | Rows matched | oe | oe (lazy open) | parquet | vortex | json | json+zstd |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| scan_all_columns | 1000000 | 199.88 | 249.61 | 103.27 | 60.16 | 2217.44 | 2385.55 |
-| scan_one_number | 1000000 | 1.88 | 1.96 | 16.27 | 1.67 | 1298.61 | 1682.83 |
-| scan_one_payload_number | 1000000 | 9.22 | 9.18 | 10.80 | 8.58 | 1367.95 | 1652.61 |
-| scan_one_payload_text | 1000000 | 7.11 | 7.38 | 7.94 | 4.62 | 1292.84 | 1635.53 |
-| filter_type_and_payload | 1237 | 9.31 | 8.99 | 33.84 | 2.21 | 1426.72 | 1893.80 |
-| time_window_1pct | 10000 | 0.12 | 0.12 | 2.79 | 0.53 | 1173.56 | 1711.95 |
-| entity_lookup | 837 | 6.63 | 7.20 | 28.87 | 5.99 | 1403.30 | 1772.11 |
+| scan_all_columns | 1000000 | 206.15 | 218.78 | 89.97 | 78.33 | 2214.04 | 2449.45 |
+| scan_one_number | 1000000 | 1.98 | 1.91 | 12.83 | 1.76 | 1387.43 | 1620.56 |
+| scan_one_payload_number | 1000000 | 9.41 | 9.48 | 8.59 | 8.67 | 1410.60 | 1539.12 |
+| scan_one_payload_text | 1000000 | 7.15 | 7.37 | 6.10 | 4.45 | 1446.77 | 1698.81 |
+| filter_type_and_payload | 1237 | 9.02 | 9.74 | 26.85 | 2.29 | 1477.55 | 1732.54 |
+| time_window_1pct | 10000 | 0.12 | 0.12 | 2.17 | 0.49 | 1426.11 | 1773.31 |
+| entity_lookup | 837 | 2.62 | 2.93 | 29.41 | 6.11 | 1359.29 | 1767.58 |
 
 Removing events (redaction). OE records a deletion vector; the other formats rewrite the whole file.
 
 | Case | Events removed | oe (ms) | oe (bytes written) | oe (lazy open) (ms) | oe (lazy open) (bytes written) | parquet (ms) | parquet (bytes written) | vortex (ms) | vortex (bytes written) | json (ms) | json (bytes written) | json+zstd (ms) | json+zstd (bytes written) |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| redact_1_event | 1 | 0.00 | 9 | 0.00 | 9 | 944.35 | 12309274 | 1607.22 | 19543608 | 3715.38 | 244921417 | 4480.87 | 25386110 |
-| redact_1pct_of_events | 10000 | 13.96 | 160005 | 14.00 | 160005 | 841.79 | 12020757 | 1590.45 | 19543040 | 3795.18 | 242472519 | 4675.23 | 25138782 |
+| redact_1_event | 1 | 0.00 | 9 | 0.00 | 9 | 950.22 | 12309274 | 1569.27 | 19543608 | 3663.05 | 244921417 | 4995.76 | 25386110 |
+| redact_1pct_of_events | 10000 | 14.09 | 160005 | 13.97 | 160005 | 1027.79 | 12020757 | 1634.10 | 19543040 | 3732.50 | 242472519 | 5048.27 | 25138782 |
 
 ## messages events: 10000 rows
 
 | Format | Size (MiB) | Bytes per event | Size vs JSON | Write (ms) | Write (events/s) | Open (ms) | Open + first lookup (ms) |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| oe | 0.82 | 85.5 | 26.2% | 39 | 258452 | 0.34 | 0.56 |
-| oe (lazy open) | 0.82 | 85.5 | 26.2% | 38 | 264099 | 0.11 | 0.41 |
-| parquet | 0.43 | 45.5 | 13.9% | 9 | 1130007 | 0.01 | 0.36 |
-| vortex | 0.45 | 47.0 | 14.4% | 37 | 269826 | 0.50 | 0.81 |
-| json | 3.12 | 326.9 | 100.0% | 11 | 880458 | 0.00 | 14.55 |
-| json+zstd | 0.57 | 59.9 | 18.3% | 19 | 519118 | 0.00 | 16.70 |
+| oe | 0.82 | 86.1 | 26.3% | 53 | 190219 | 0.40 | 0.51 |
+| oe (lazy open) | 0.82 | 86.1 | 26.3% | 47 | 214034 | 0.14 | 0.28 |
+| parquet | 0.43 | 45.5 | 13.9% | 15 | 671297 | 0.02 | 0.41 |
+| vortex | 0.45 | 47.0 | 14.4% | 50 | 200799 | 0.66 | 1.05 |
+| json | 3.12 | 326.9 | 100.0% | 12 | 813658 | 0.00 | 16.38 |
+| json+zstd | 0.57 | 59.9 | 18.3% | 20 | 490848 | 0.00 | 15.38 |
 
 | Query (median ms; entity_lookup is per lookup) | Rows matched | oe | oe (lazy open) | parquet | vortex | json | json+zstd |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| scan_all_columns | 10000 | 3.93 | 3.19 | 2.20 | 0.87 | 20.91 | 33.11 |
-| scan_one_number | 10000 | 0.02 | 0.01 | 0.13 | 0.02 | 13.95 | 20.93 |
-| scan_one_payload_number | 10000 | 0.01 | 0.01 | 0.14 | 0.02 | 14.24 | 13.78 |
-| scan_one_payload_text | 10000 | 1.53 | 1.23 | 0.98 | 0.22 | 15.04 | 14.29 |
-| filter_type_and_payload | 265 | 0.08 | 0.06 | 0.44 | 0.18 | 15.20 | 18.87 |
-| time_window_1pct | 100 | 0.01 | 0.01 | 0.27 | 0.12 | 14.32 | 17.83 |
-| entity_lookup | 1751 | 0.12 | 0.10 | 0.26 | 0.11 | 12.00 | 17.95 |
+| scan_all_columns | 10000 | 6.45 | 4.09 | 3.12 | 1.21 | 20.02 | 21.52 |
+| scan_one_number | 10000 | 0.03 | 0.02 | 0.17 | 0.04 | 13.43 | 14.93 |
+| scan_one_payload_number | 10000 | 0.02 | 0.01 | 0.22 | 0.04 | 13.93 | 16.86 |
+| scan_one_payload_text | 10000 | 2.68 | 1.67 | 1.36 | 0.35 | 15.44 | 18.12 |
+| filter_type_and_payload | 265 | 0.14 | 0.08 | 0.62 | 0.41 | 18.57 | 17.84 |
+| time_window_1pct | 100 | 0.03 | 0.01 | 0.38 | 0.22 | 17.61 | 16.66 |
+| entity_lookup | 1751 | 0.11 | 0.07 | 0.34 | 0.13 | 15.27 | 18.65 |
 
 Removing events (redaction). OE records a deletion vector; the other formats rewrite the whole file.
 
 | Case | Events removed | oe (ms) | oe (bytes written) | oe (lazy open) (ms) | oe (lazy open) (bytes written) | parquet (ms) | parquet (bytes written) | vortex (ms) | vortex (bytes written) | json (ms) | json (bytes written) | json+zstd (ms) | json+zstd (bytes written) |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| redact_1_event | 1 | 0.00 | 9 | 0.00 | 9 | 14.18 | 452866 | 48.90 | 473520 | 30.17 | 3268410 | 53.62 | 598999 |
-| redact_1pct_of_events | 100 | 0.02 | 405 | 0.01 | 405 | 14.73 | 448727 | 48.66 | 466192 | 30.01 | 3235234 | 53.44 | 592934 |
+| redact_1_event | 1 | 0.00 | 9 | 0.00 | 9 | 17.94 | 452866 | 57.12 | 473520 | 39.20 | 3268410 | 55.97 | 598999 |
+| redact_1pct_of_events | 100 | 0.04 | 405 | 0.02 | 405 | 18.77 | 448727 | 51.94 | 466192 | 30.88 | 3235234 | 55.97 | 592934 |
 
 ## messages events: 100000 rows
 
 | Format | Size (MiB) | Bytes per event | Size vs JSON | Write (ms) | Write (events/s) | Open (ms) | Open + first lookup (ms) |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| oe | 8.70 | 91.2 | 27.9% | 389 | 257146 | 1.55 | 3.42 |
-| oe (lazy open) | 8.70 | 91.2 | 27.9% | 368 | 271657 | 0.71 | 3.95 |
-| parquet | 4.10 | 43.0 | 13.2% | 86 | 1167409 | 0.04 | 2.28 |
-| vortex | 4.64 | 48.6 | 14.9% | 189 | 528741 | 0.55 | 1.34 |
-| json | 31.13 | 326.4 | 100.0% | 129 | 775803 | 0.00 | 128.15 |
-| json+zstd | 5.83 | 61.1 | 18.7% | 274 | 365281 | 0.00 | 159.38 |
+| oe | 8.95 | 93.8 | 28.7% | 409 | 244546 | 1.47 | 3.00 |
+| oe (lazy open) | 8.95 | 93.8 | 28.7% | 402 | 248992 | 0.91 | 2.37 |
+| parquet | 4.10 | 43.0 | 13.2% | 115 | 869416 | 0.09 | 3.19 |
+| vortex | 4.64 | 48.6 | 14.9% | 226 | 441937 | 0.64 | 1.79 |
+| json | 31.13 | 326.4 | 100.0% | 122 | 817066 | 0.00 | 145.65 |
+| json+zstd | 5.83 | 61.1 | 18.7% | 272 | 367444 | 0.00 | 199.00 |
 
 | Query (median ms; entity_lookup is per lookup) | Rows matched | oe | oe (lazy open) | parquet | vortex | json | json+zstd |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| scan_all_columns | 100000 | 41.18 | 32.09 | 24.76 | 9.68 | 228.94 | 291.60 |
-| scan_one_number | 100000 | 0.17 | 0.14 | 1.29 | 0.30 | 154.56 | 223.92 |
-| scan_one_payload_number | 100000 | 0.13 | 0.10 | 1.11 | 0.34 | 148.07 | 199.76 |
-| scan_one_payload_text | 100000 | 12.24 | 12.38 | 8.85 | 2.93 | 166.07 | 208.59 |
-| filter_type_and_payload | 2655 | 0.63 | 0.63 | 3.55 | 0.44 | 182.04 | 197.73 |
-| time_window_1pct | 1000 | 0.01 | 0.01 | 2.42 | 0.12 | 161.47 | 206.98 |
-| entity_lookup | 1203 | 1.63 | 1.59 | 2.20 | 0.79 | 140.98 | 195.59 |
+| scan_all_columns | 100000 | 42.48 | 32.71 | 24.69 | 10.37 | 237.21 | 273.34 |
+| scan_one_number | 100000 | 0.18 | 0.13 | 1.34 | 0.19 | 136.23 | 178.66 |
+| scan_one_payload_number | 100000 | 0.13 | 0.10 | 1.12 | 0.17 | 143.98 | 193.19 |
+| scan_one_payload_text | 100000 | 15.79 | 15.87 | 10.23 | 2.88 | 143.65 | 211.48 |
+| filter_type_and_payload | 2655 | 0.81 | 0.81 | 4.70 | 0.56 | 166.36 | 171.23 |
+| time_window_1pct | 1000 | 0.01 | 0.01 | 3.17 | 0.12 | 159.22 | 201.82 |
+| entity_lookup | 1203 | 0.62 | 0.60 | 2.90 | 1.00 | 157.14 | 198.27 |
 
 Removing events (redaction). OE records a deletion vector; the other formats rewrite the whole file.
 
 | Case | Events removed | oe (ms) | oe (bytes written) | oe (lazy open) (ms) | oe (lazy open) (bytes written) | parquet (ms) | parquet (bytes written) | vortex (ms) | vortex (bytes written) | json (ms) | json (bytes written) | json+zstd (ms) | json+zstd (bytes written) |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| redact_1_event | 1 | 0.00 | 9 | 0.00 | 9 | 146.02 | 4300907 | 215.99 | 4860768 | 332.59 | 32636819 | 525.64 | 6111549 |
-| redact_1pct_of_events | 1000 | 1.04 | 4005 | 0.99 | 4005 | 149.48 | 4232767 | 247.45 | 4816112 | 360.34 | 32309495 | 487.76 | 6051823 |
+| redact_1_event | 1 | 0.00 | 9 | 0.00 | 9 | 194.21 | 4300907 | 279.68 | 4860768 | 400.92 | 32636819 | 543.99 | 6111549 |
+| redact_1pct_of_events | 1000 | 1.25 | 4005 | 1.18 | 4005 | 179.56 | 4232767 | 271.90 | 4816112 | 423.41 | 32309495 | 640.10 | 6051823 |
 
 ## messages events: 1000000 rows
 
 | Format | Size (MiB) | Bytes per event | Size vs JSON | Write (ms) | Write (events/s) | Open (ms) | Open + first lookup (ms) |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| oe | 90.67 | 95.1 | 29.1% | 4500 | 222234 | 14.17 | 14.77 |
-| oe (lazy open) | 90.67 | 95.1 | 29.1% | 4611 | 216885 | 9.12 | 26.89 |
-| parquet | 41.65 | 43.7 | 13.4% | 1226 | 815690 | 0.14 | 29.72 |
-| vortex | 47.32 | 49.6 | 15.2% | 1823 | 548421 | 0.66 | 8.37 |
-| json | 311.21 | 326.3 | 100.0% | 1383 | 722929 | 7.42 | 1533.28 |
-| json+zstd | 58.99 | 61.9 | 19.0% | 2801 | 357063 | 0.00 | 1982.15 |
+| oe | 92.89 | 97.4 | 29.8% | 4338 | 230495 | 13.97 | 13.87 |
+| oe (lazy open) | 92.89 | 97.4 | 29.8% | 4258 | 234867 | 11.69 | 21.73 |
+| parquet | 41.65 | 43.7 | 13.4% | 1048 | 954332 | 0.12 | 24.81 |
+| vortex | 47.32 | 49.6 | 15.2% | 1841 | 543227 | 0.72 | 8.46 |
+| json | 311.21 | 326.3 | 100.0% | 1218 | 821161 | 6.47 | 1376.23 |
+| json+zstd | 58.99 | 61.9 | 19.0% | 2673 | 374161 | 0.00 | 2104.91 |
 
 | Query (median ms; entity_lookup is per lookup) | Rows matched | oe | oe (lazy open) | parquet | vortex | json | json+zstd |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| scan_all_columns | 1000000 | 432.80 | 449.04 | 239.33 | 103.89 | 2636.23 | 3299.44 |
-| scan_one_number | 1000000 | 1.57 | 1.88 | 15.55 | 1.81 | 1412.32 | 1927.14 |
-| scan_one_payload_number | 1000000 | 1.22 | 1.50 | 13.71 | 1.63 | 1497.75 | 1997.46 |
-| scan_one_payload_text | 1000000 | 150.72 | 172.95 | 104.67 | 29.06 | 1653.06 | 2234.01 |
-| filter_type_and_payload | 26269 | 8.21 | 14.63 | 37.26 | 3.58 | 1642.10 | 1924.47 |
-| time_window_1pct | 10000 | 0.04 | 0.04 | 3.23 | 0.40 | 1598.66 | 1838.19 |
-| entity_lookup | 5411 | 6.01 | 5.90 | 29.91 | 7.22 | 1496.41 | 2009.99 |
+| scan_all_columns | 1000000 | 431.50 | 338.88 | 235.61 | 108.31 | 2853.24 | 3290.83 |
+| scan_one_number | 1000000 | 1.89 | 1.90 | 13.16 | 1.85 | 1414.45 | 1981.21 |
+| scan_one_payload_number | 1000000 | 1.55 | 1.41 | 11.56 | 1.67 | 1528.73 | 1688.67 |
+| scan_one_payload_text | 1000000 | 157.63 | 156.86 | 107.08 | 29.00 | 1673.17 | 2113.40 |
+| filter_type_and_payload | 26269 | 6.58 | 8.25 | 37.80 | 3.41 | 1539.44 | 1937.11 |
+| time_window_1pct | 10000 | 0.03 | 0.04 | 3.26 | 0.44 | 1601.73 | 2069.07 |
+| entity_lookup | 5411 | 1.76 | 2.33 | 24.03 | 7.34 | 1514.46 | 2005.79 |
 
 Removing events (redaction). OE records a deletion vector; the other formats rewrite the whole file.
 
 | Case | Events removed | oe (ms) | oe (bytes written) | oe (lazy open) (ms) | oe (lazy open) (bytes written) | parquet (ms) | parquet (bytes written) | vortex (ms) | vortex (bytes written) | json (ms) | json (bytes written) | json+zstd (ms) | json+zstd (bytes written) |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| redact_1_event | 1 | 0.00 | 9 | 0.00 | 9 | 1820.69 | 43671434 | 2241.54 | 49602912 | 4744.15 | 326324891 | 6448.84 | 61854744 |
-| redact_1pct_of_events | 10000 | 12.68 | 160005 | 19.67 | 160005 | 1852.85 | 43058471 | 2388.79 | 49314872 | 4754.84 | 323067360 | 6319.51 | 61243459 |
+| redact_1_event | 1 | 0.00 | 9 | 0.00 | 9 | 1746.69 | 43671434 | 2368.89 | 49602912 | 4558.92 | 326324891 | 6220.66 | 61854744 |
+| redact_1pct_of_events | 10000 | 13.93 | 160005 | 14.18 | 160005 | 1932.93 | 43058471 | 2396.40 | 49314872 | 4686.28 | 323067360 | 6272.62 | 61243459 |
 
 ## chat events: 10000 rows
 
 | Format | Size (MiB) | Bytes per event | Size vs JSON | Write (ms) | Write (events/s) | Open (ms) | Open + first lookup (ms) |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| oe | 0.76 | 80.0 | 23.0% | 40 | 247592 | 0.22 | 0.50 |
-| oe (lazy open) | 0.76 | 80.0 | 23.0% | 39 | 253232 | 0.10 | 0.53 |
-| parquet | 0.36 | 37.3 | 10.7% | 11 | 940425 | 0.01 | 0.48 |
-| vortex | 0.42 | 43.6 | 12.5% | 53 | 190351 | 0.53 | 0.82 |
-| json | 3.32 | 348.4 | 100.0% | 11 | 889395 | 0.00 | 22.79 |
-| json+zstd | 0.49 | 51.1 | 14.7% | 19 | 534097 | 0.00 | 15.62 |
+| oe | 0.79 | 82.8 | 23.8% | 38 | 260101 | 0.23 | 0.41 |
+| oe (lazy open) | 0.79 | 82.8 | 23.8% | 42 | 237075 | 0.10 | 0.29 |
+| parquet | 0.36 | 37.3 | 10.7% | 9 | 1159826 | 0.01 | 0.42 |
+| vortex | 0.42 | 43.6 | 12.5% | 41 | 243963 | 0.47 | 0.80 |
+| json | 3.32 | 348.4 | 100.0% | 12 | 812339 | 0.00 | 13.48 |
+| json+zstd | 0.49 | 51.1 | 14.7% | 20 | 511036 | 0.00 | 16.52 |
 
 | Query (median ms; entity_lookup is per lookup) | Rows matched | oe | oe (lazy open) | parquet | vortex | json | json+zstd |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| scan_all_columns | 10000 | 4.04 | 4.12 | 2.58 | 0.99 | 21.24 | 20.76 |
-| scan_one_number | 10000 | 0.07 | 0.07 | 0.17 | 0.03 | 14.41 | 18.01 |
-| scan_one_payload_number | 10000 | 0.01 | 0.01 | 0.07 | 0.03 | 14.33 | 25.65 |
-| scan_one_payload_text | 10000 | 1.44 | 1.44 | 1.10 | 0.23 | 15.34 | 14.80 |
-| filter_type_and_payload | 266 | 0.13 | 0.13 | 0.38 | 0.19 | 15.11 | 14.65 |
-| time_window_1pct | 100 | 0.04 | 0.04 | 0.23 | 0.09 | 14.54 | 14.34 |
-| entity_lookup | 36977 | 0.21 | 0.20 | 0.35 | 0.14 | 16.60 | 14.48 |
-| latest_50_in_room | 29391 | 0.27 | 0.28 | 0.54 | 0.23 | 15.80 | 14.83 |
-| thread_replies | 21 | 0.10 | 0.10 | 0.36 | 0.18 | 14.90 | 14.33 |
-| event_by_id | 20 | 0.03 | 0.03 | 0.56 | 0.16 | 16.14 | 15.07 |
+| scan_all_columns | 10000 | 4.94 | 3.13 | 2.25 | 0.93 | 17.57 | 21.39 |
+| scan_one_number | 10000 | 0.03 | 0.02 | 0.13 | 0.03 | 11.96 | 15.69 |
+| scan_one_payload_number | 10000 | 0.01 | 0.01 | 0.05 | 0.03 | 11.87 | 15.30 |
+| scan_one_payload_text | 10000 | 1.46 | 1.17 | 0.86 | 0.33 | 12.62 | 16.59 |
+| filter_type_and_payload | 266 | 0.07 | 0.06 | 0.31 | 0.17 | 13.49 | 15.47 |
+| time_window_1pct | 100 | 0.02 | 0.01 | 0.19 | 0.09 | 12.37 | 14.74 |
+| entity_lookup | 36977 | 0.08 | 0.06 | 0.27 | 0.16 | 13.20 | 16.01 |
+| latest_50_in_room | 29391 | 0.09 | 0.06 | 0.45 | 0.23 | 13.66 | 17.27 |
+| thread_replies | 21 | 0.08 | 0.07 | 0.29 | 0.17 | 12.11 | 16.73 |
+| event_by_id | 20 | 0.01 | 0.01 | 0.44 | 0.17 | 12.51 | 18.99 |
 
 Removing events (redaction). OE records a deletion vector; the other formats rewrite the whole file.
 
 | Case | Events removed | oe (ms) | oe (bytes written) | oe (lazy open) (ms) | oe (lazy open) (bytes written) | parquet (ms) | parquet (bytes written) | vortex (ms) | vortex (bytes written) | json (ms) | json (bytes written) | json+zstd (ms) | json+zstd (bytes written) |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| redact_1_event | 1 | 0.00 | 9 | 0.00 | 9 | 17.71 | 370690 | 47.94 | 433524 | 39.41 | 3483690 | 54.46 | 511242 |
-| redact_1pct_of_events | 100 | 0.05 | 405 | 0.02 | 405 | 17.71 | 367096 | 46.52 | 434356 | 33.79 | 3450121 | 54.26 | 506512 |
+| redact_1_event | 1 | 0.00 | 9 | 0.00 | 9 | 16.60 | 370690 | 48.09 | 433524 | 32.39 | 3483690 | 46.53 | 511242 |
+| redact_1pct_of_events | 100 | 0.02 | 405 | 0.01 | 405 | 16.77 | 367096 | 49.03 | 434356 | 34.06 | 3450121 | 48.57 | 506512 |
 
 ## chat events: 100000 rows
 
 | Format | Size (MiB) | Bytes per event | Size vs JSON | Write (ms) | Write (events/s) | Open (ms) | Open + first lookup (ms) |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| oe | 7.83 | 82.1 | 23.5% | 408 | 245233 | 2.01 | 5.14 |
-| oe (lazy open) | 7.83 | 82.1 | 23.5% | 361 | 276752 | 1.11 | 5.86 |
-| parquet | 3.41 | 35.8 | 10.2% | 99 | 1008994 | 0.05 | 3.02 |
-| vortex | 4.18 | 43.9 | 12.5% | 241 | 415463 | 0.62 | 1.07 |
-| json | 33.34 | 349.5 | 100.0% | 148 | 675822 | 0.00 | 159.19 |
-| json+zstd | 5.10 | 53.5 | 15.3% | 279 | 358625 | 0.00 | 201.17 |
+| oe | 8.13 | 85.3 | 24.4% | 403 | 247902 | 1.90 | 2.74 |
+| oe (lazy open) | 8.13 | 85.3 | 24.4% | 422 | 236751 | 1.16 | 5.68 |
+| parquet | 3.41 | 35.8 | 10.2% | 104 | 959731 | 0.07 | 3.17 |
+| vortex | 4.18 | 43.9 | 12.5% | 260 | 384347 | 0.65 | 1.09 |
+| json | 33.34 | 349.5 | 100.0% | 122 | 819959 | 0.00 | 154.80 |
+| json+zstd | 5.10 | 53.5 | 15.3% | 236 | 422927 | 0.00 | 173.95 |
 
 | Query (median ms; entity_lookup is per lookup) | Rows matched | oe | oe (lazy open) | parquet | vortex | json | json+zstd |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| scan_all_columns | 100000 | 41.62 | 38.91 | 23.46 | 9.29 | 204.05 | 290.99 |
-| scan_one_number | 100000 | 0.73 | 0.71 | 1.30 | 0.22 | 160.27 | 192.80 |
-| scan_one_payload_number | 100000 | 0.13 | 0.13 | 0.30 | 0.15 | 160.90 | 193.37 |
-| scan_one_payload_text | 100000 | 14.64 | 14.39 | 8.49 | 2.70 | 167.14 | 169.75 |
-| filter_type_and_payload | 2904 | 1.25 | 1.25 | 2.99 | 0.38 | 164.16 | 167.53 |
-| time_window_1pct | 1000 | 0.04 | 0.04 | 1.74 | 0.12 | 150.61 | 203.33 |
-| entity_lookup | 81077 | 2.05 | 2.04 | 2.53 | 0.32 | 158.99 | 200.82 |
-| latest_50_in_room | 64860 | 2.74 | 2.60 | 3.70 | 0.51 | 136.27 | 210.59 |
-| thread_replies | 23 | 0.12 | 0.12 | 2.84 | 0.49 | 166.10 | 204.54 |
-| event_by_id | 20 | 0.24 | 0.24 | 3.62 | 0.33 | 169.00 | 201.25 |
+| scan_all_columns | 100000 | 40.87 | 53.29 | 25.65 | 10.39 | 215.99 | 293.54 |
+| scan_one_number | 100000 | 0.16 | 0.26 | 1.62 | 0.18 | 134.56 | 196.56 |
+| scan_one_payload_number | 100000 | 0.12 | 0.20 | 0.41 | 0.20 | 130.80 | 164.52 |
+| scan_one_payload_text | 100000 | 11.90 | 14.50 | 10.36 | 2.94 | 156.04 | 172.94 |
+| filter_type_and_payload | 2904 | 0.54 | 0.63 | 3.60 | 0.66 | 138.68 | 170.00 |
+| time_window_1pct | 1000 | 0.01 | 0.02 | 2.09 | 0.20 | 157.31 | 166.80 |
+| entity_lookup | 81077 | 1.07 | 1.04 | 2.93 | 0.40 | 140.56 | 204.61 |
+| latest_50_in_room | 64860 | 1.13 | 1.03 | 4.47 | 0.63 | 152.52 | 213.43 |
+| thread_replies | 23 | 0.11 | 0.10 | 3.52 | 0.59 | 159.10 | 201.75 |
+| event_by_id | 20 | 0.26 | 0.22 | 4.40 | 0.33 | 162.52 | 206.14 |
 
 Removing events (redaction). OE records a deletion vector; the other formats rewrite the whole file.
 
 | Case | Events removed | oe (ms) | oe (bytes written) | oe (lazy open) (ms) | oe (lazy open) (bytes written) | parquet (ms) | parquet (bytes written) | vortex (ms) | vortex (bytes written) | json (ms) | json (bytes written) | json+zstd (ms) | json+zstd (bytes written) |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| redact_1_event | 1 | 0.00 | 9 | 0.00 | 9 | 149.52 | 3580849 | 300.30 | 4381044 | 436.56 | 34954335 | 570.64 | 5350605 |
-| redact_1pct_of_events | 1000 | 0.93 | 4005 | 0.88 | 4005 | 178.90 | 3521126 | 297.50 | 4330708 | 440.05 | 34607634 | 531.80 | 5298958 |
+| redact_1_event | 1 | 0.00 | 9 | 0.00 | 9 | 190.23 | 3580849 | 316.44 | 4381044 | 375.49 | 34954335 | 572.80 | 5350605 |
+| redact_1pct_of_events | 1000 | 0.85 | 4005 | 0.74 | 4005 | 169.20 | 3521126 | 317.18 | 4330708 | 368.16 | 34607634 | 601.94 | 5298958 |
 
 ## chat events: 1000000 rows
 
 | Format | Size (MiB) | Bytes per event | Size vs JSON | Write (ms) | Write (events/s) | Open (ms) | Open + first lookup (ms) |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| oe | 84.93 | 89.1 | 25.4% | 4394 | 227563 | 13.43 | 17.78 |
-| oe (lazy open) | 84.93 | 89.1 | 25.4% | 4517 | 221375 | 7.78 | 26.31 |
-| parquet | 35.96 | 37.7 | 10.8% | 1189 | 841186 | 0.15 | 29.69 |
-| vortex | 45.86 | 48.1 | 13.7% | 2131 | 469246 | 0.78 | 2.41 |
-| json | 334.22 | 350.5 | 100.0% | 1552 | 644263 | 8.66 | 1599.10 |
-| json+zstd | 52.90 | 55.5 | 15.8% | 2703 | 369934 | 0.00 | 2137.66 |
+| oe | 91.03 | 95.5 | 27.2% | 4246 | 235520 | 14.91 | 13.32 |
+| oe (lazy open) | 91.03 | 95.5 | 27.2% | 4223 | 236821 | 9.95 | 20.92 |
+| parquet | 35.96 | 37.7 | 10.8% | 1188 | 841758 | 0.16 | 29.74 |
+| vortex | 45.86 | 48.1 | 13.7% | 2180 | 458741 | 0.92 | 3.51 |
+| json | 334.22 | 350.5 | 100.0% | 1405 | 711594 | 6.70 | 1552.58 |
+| json+zstd | 52.90 | 55.5 | 15.8% | 2677 | 373572 | 0.00 | 2002.26 |
 
 | Query (median ms; entity_lookup is per lookup) | Rows matched | oe | oe (lazy open) | parquet | vortex | json | json+zstd |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| scan_all_columns | 1000000 | 474.60 | 479.42 | 238.12 | 94.86 | 2624.23 | 3028.81 |
-| scan_one_number | 1000000 | 5.93 | 7.56 | 12.87 | 1.59 | 1525.75 | 2038.83 |
-| scan_one_payload_number | 1000000 | 1.09 | 1.40 | 3.16 | 1.32 | 1626.35 | 2021.81 |
-| scan_one_payload_text | 1000000 | 114.91 | 144.80 | 87.91 | 22.94 | 1529.03 | 1991.96 |
-| filter_type_and_payload | 30248 | 10.54 | 12.29 | 36.71 | 2.48 | 1626.77 | 1915.38 |
-| time_window_1pct | 10000 | 0.10 | 0.11 | 2.97 | 0.41 | 1684.31 | 1939.91 |
-| entity_lookup | 200587 | 31.11 | 31.95 | 24.70 | 1.55 | 1576.80 | 2046.84 |
-| latest_50_in_room | 160250 | 36.41 | 36.24 | 45.48 | 2.09 | 1668.65 | 2116.98 |
-| thread_replies | 22 | 0.36 | 0.39 | 18.18 | 2.69 | 1598.66 | 1971.11 |
-| event_by_id | 20 | 0.28 | 0.29 | 6.19 | 0.61 | 1642.52 | 2094.17 |
+| scan_all_columns | 1000000 | 397.34 | 367.51 | 222.84 | 106.73 | 2748.93 | 3193.52 |
+| scan_one_number | 1000000 | 1.68 | 1.98 | 16.58 | 2.06 | 1547.53 | 1952.85 |
+| scan_one_payload_number | 1000000 | 1.14 | 1.32 | 4.07 | 1.61 | 1559.81 | 1953.41 |
+| scan_one_payload_text | 1000000 | 118.46 | 144.65 | 113.14 | 28.92 | 1616.25 | 2059.61 |
+| filter_type_and_payload | 30248 | 5.00 | 6.45 | 35.51 | 3.07 | 1452.72 | 2085.79 |
+| time_window_1pct | 10000 | 0.04 | 0.05 | 2.78 | 0.56 | 1599.35 | 1935.49 |
+| entity_lookup | 200587 | 5.79 | 7.31 | 30.43 | 2.00 | 1552.57 | 1934.89 |
+| latest_50_in_room | 160250 | 6.00 | 7.50 | 47.17 | 2.56 | 1669.15 | 2139.66 |
+| thread_replies | 22 | 0.28 | 0.34 | 17.65 | 4.01 | 1596.23 | 2035.62 |
+| event_by_id | 20 | 0.19 | 0.25 | 5.18 | 1.15 | 1591.77 | 2089.92 |
 
 Removing events (redaction). OE records a deletion vector; the other formats rewrite the whole file.
 
 | Case | Events removed | oe (ms) | oe (bytes written) | oe (lazy open) (ms) | oe (lazy open) (bytes written) | parquet (ms) | parquet (bytes written) | vortex (ms) | vortex (bytes written) | json (ms) | json (bytes written) | json+zstd (ms) | json+zstd (bytes written) |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| redact_1_event | 1 | 0.00 | 9 | 0.00 | 9 | 2020.54 | 37698174 | 2639.85 | 48035456 | 4965.75 | 350453613 | 6375.02 | 55469073 |
-| redact_1pct_of_events | 10000 | 15.24 | 160005 | 12.69 | 160005 | 2016.47 | 37167023 | 2731.93 | 47241092 | 4797.65 | 346953322 | 6401.09 | 54925975 |
+| redact_1_event | 1 | 0.00 | 9 | 0.00 | 9 | 2007.53 | 37698174 | 2861.48 | 48035456 | 4972.02 | 350453613 | 6499.48 | 55469073 |
+| redact_1pct_of_events | 10000 | 12.87 | 160005 | 14.55 | 160005 | 2145.08 | 37167023 | 2916.68 | 47241092 | 4772.44 | 346953322 | 6579.66 | 54925975 |
 
 ## Durable ingest
 
@@ -271,16 +271,16 @@ Each batch is acknowledged only after the file is synced to disk (300 batches pe
 
 | Batch size | Format | Events/s | Ack p50 (ms) | Ack p99 (ms) | Bytes on disk |
 |---:|---|---:|---:|---:|---:|
-| 1 | oej journal | 3554 | 0.264 | 0.485 | 1228800 |
-| 1 | json (append) | 5814 | 0.154 | 0.371 | 104659 |
-| 1 | parquet (file per batch) | 1084 | 0.879 | 1.648 | 1094080 |
-| 1 | vortex (file per batch) | 567 | 1.713 | 2.684 | 3131136 |
-| 16 | oej journal | 42423 | 0.331 | 0.934 | 2457600 |
-| 16 | json (append) | 51693 | 0.291 | 0.620 | 1664629 |
-| 16 | parquet (file per batch) | 16567 | 0.930 | 1.440 | 1373373 |
-| 16 | vortex (file per batch) | 1155 | 13.865 | 21.079 | 4804864 |
-| 128 | oej journal | 263552 | 0.464 | 0.844 | 19660800 |
-| 128 | json (append) | 244529 | 0.499 | 0.930 | 13400243 |
-| 128 | parquet (file per batch) | 109628 | 1.148 | 1.575 | 2851044 |
-| 128 | vortex (file per batch) | 6549 | 19.761 | 23.900 | 7595608 |
+| 1 | oej journal | 5284 | 0.171 | 0.414 | 1228800 |
+| 1 | json (append) | 6136 | 0.140 | 0.395 | 104659 |
+| 1 | parquet (file per batch) | 1122 | 0.849 | 1.437 | 1094080 |
+| 1 | vortex (file per batch) | 533 | 1.746 | 2.901 | 3131136 |
+| 16 | oej journal | 52730 | 0.267 | 0.837 | 2457600 |
+| 16 | json (append) | 74309 | 0.200 | 0.440 | 1664629 |
+| 16 | parquet (file per batch) | 19840 | 0.791 | 1.172 | 1373373 |
+| 16 | vortex (file per batch) | 1241 | 12.344 | 20.608 | 4804864 |
+| 128 | oej journal | 172879 | 0.702 | 1.322 | 19660800 |
+| 128 | json (append) | 174796 | 0.694 | 1.417 | 13400243 |
+| 128 | parquet (file per batch) | 95335 | 1.337 | 1.843 | 2851044 |
+| 128 | vortex (file per batch) | 6756 | 19.271 | 25.828 | 7595608 |
 
