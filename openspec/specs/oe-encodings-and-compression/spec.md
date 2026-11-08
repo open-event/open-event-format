@@ -67,6 +67,24 @@ String columns SHALL use dictionary encoding for low-cardinality, FSST for high-
 - **WHEN** a query needs a single granule of an FSST-encoded `event_id` column
 - **THEN** the reader decodes only that granule via marks/mini-block offsets
 
+### Requirement: FSST blocks may store bitpacked value lengths
+An FSST string block that stores no per-value keys SHALL be rewritten by the writer into the packed-lengths layout (pipeline transform 15) whenever that layout is smaller: the same null stream, symbol table and present count, then each present value's compressed length in a FastLanes bitpacked stream (count, bit width, packed words) in place of the four-byte offset table, then the same code arena. The lengths SHALL sum to exactly the arena's length and their count SHALL equal the present count; a block that disagrees SHALL be refused as structurally invalid. A reader SHALL rebuild the classic offset table from the lengths (an unpack and prefix sum, no entropy decode) and SHALL then answer every decode, range decode, row take, Arrow view decode and compressed-form string predicate exactly as it would for the equivalent transform-9 block. The packed layout SHALL NOT carry per-value keys and SHALL NOT ride the seekable Zstandard framing. A file that stores at least one packed-lengths block SHALL declare the required feature `packed_string_offsets` (bit 33), which is not part of the set every file declares, so a reader or rewriter that predates the transform refuses the file at open. A conformance run that forces transform 9 SHALL get the classic layout.
+
+#### Scenario: Short high-cardinality strings drop the offset table
+- **WHEN** a block of mostly distinct short strings is encoded as FSST without per-value keys
+- **THEN** it is stored as transform 15, smaller than the transform-9 form, and every read path returns the same values and predicate masks as the transform-9 form
+
+#### Scenario: An old reader refuses the file
+- **WHEN** a reader that does not know required feature bit 33 opens a file holding a packed-lengths FSST block
+- **THEN** it refuses the file at open instead of failing part-way through a query
+
+### Requirement: Dictionary trial covers random-access and replayed string blocks
+A string block that selection sends to FSST SHALL also be trial-encoded as a dictionary whenever its distinct values are at most three quarters of its present rows, and the smaller form SHALL be kept. The trial SHALL run on random-access (shredded and free-text) blocks too, since a dictionary block's bitpacked codes are per-value addressable, and on blocks replaying an FSST capture, so a column whose segment head sampled as FSST still stores its repeating blocks as dictionaries.
+
+#### Scenario: Repeating shredded strings become a dictionary
+- **WHEN** a shredded payload string column holds a few hundred distinct values across a granule's rows
+- **THEN** its block is stored as a dictionary block with bitpacked codes and answers equality and range filters from the codes
+
 ### Requirement: Index, bitmap, and payload compression families
 Bitmaps SHALL use Roaring native compression, Ribbon filters their compact representation, and split-block Bloom filters their split-block representation with outer compression only when range reads still work. `variant_shredded_field_blocks` SHALL use adaptive encoding that preserves random access in compressed form (whole-block heavyweight compression forbidden on shredded scan-path columns); `variant_residual_blocks` SHALL be uncompressed in hot granules with page-level Zstd-3 allowed for cold/rewritten granules (optionally with trained ZDICT dictionaries keyed by internal `(tenant_id, event_type_id)`, rebuilt at rewrite when the ratio regresses); `variant_dictionary_blocks` SHALL use dictionary+FSST supporting key→field_id binary search without full-block decode; text token indexes and footer metadata SHALL use Zstd level 1 or a better adaptive choice.
 

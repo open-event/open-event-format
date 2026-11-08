@@ -472,6 +472,10 @@ pub fn filter_string_block_shared_with_body(
     if !string_block_has_fast_path(pipeline, predicate)? {
         return Ok(None);
     }
+    // A packed-lengths FSST block answers through the classic layout's kernels once its offset table is rebuilt.
+    if let Some((classic, body)) = super::classic_fsst_view(pipeline, body)? {
+        return filter_string_block_shared_with_body(classic, &body, predicate, shared);
+    }
     let transform = pipeline.transform()?;
     let side = pipeline.side_stream()?;
     if matches!(transform, Transform::DictionaryString) && side == SideStream::FileScopeDictionary {
@@ -504,8 +508,12 @@ fn string_block_has_fast_path(pipeline: PipelineId, predicate: &StringPredicate)
     if matches!(predicate, StringPredicate::Contains(_)) {
         return Ok(matches!(
             transform,
-            Transform::DictionaryString | Transform::FsstString | Transform::RawString
+            Transform::DictionaryString | Transform::FsstString | Transform::FsstPackedString | Transform::RawString
         ));
+    }
+    // A packed-lengths FSST block never stores per-value keys, so like a keyless classic block it has no range kernel.
+    if matches!(transform, Transform::FsstPackedString) && matches!(predicate, StringPredicate::Range { .. }) {
+        return Ok(false);
     }
     // A range filter on FSST is decidable only from the block's per-value prefix keys: the codes themselves are not
     // order-preserving, so a block that stores no keys has nothing in it that orders the values.
@@ -724,9 +732,7 @@ impl FsstTest {
     fn matches(&self, compressed: &[u8]) -> bool {
         match self {
             FsstTest::Equals(term) => compressed == term.as_slice(),
-            FsstTest::InSet(terms) => terms
-                .binary_search_by(|term| term.as_slice().cmp(compressed))
-                .is_ok(),
+            FsstTest::InSet(terms) => terms.binary_search_by(|term| term.as_slice().cmp(compressed)).is_ok(),
             FsstTest::NotEquals(term) => compressed != term.as_slice(),
         }
     }
@@ -779,7 +785,8 @@ fn filter_fsst(body: &[u8], predicate: &StringPredicate) -> Result<Vec<bool>, Fo
         for entry in entries.iter().skip(1) {
             let end = u32::from_le_bytes(*entry) as usize;
             monotone &= end >= start;
-            let hit = end.wrapping_sub(start) == want && data.get(start..end).is_some_and(|value| value == term.as_slice());
+            let hit =
+                end.wrapping_sub(start) == want && data.get(start..end).is_some_and(|value| value == term.as_slice());
             present.push(hit);
             start = end;
         }

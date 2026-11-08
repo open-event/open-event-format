@@ -190,6 +190,14 @@ pub(super) fn dictionary_codes_from_body<'a>(
 /// without decoding a single value (a trailing stage, if any, is still inflated). Returns `Ok(None)` for any other
 /// pipeline.
 pub fn fsst_uncompressed_len(pipeline: PipelineId, bytes: &[u8]) -> Result<Option<usize>, FormatError> {
+    if pipeline.value_kind()? == ValueKind::String && pipeline.transform()? == Transform::FsstPackedString {
+        return with_trailing_removed(pipeline.compression()?, bytes, |body| {
+            fsst_uncompressed_len(
+                PipelineId::new(Transform::FsstString, super::Compression::None, ValueKind::String),
+                &super::fsst_packed_as_classic(body)?,
+            )
+        });
+    }
     if pipeline.value_kind()? != ValueKind::String || pipeline.transform()? != Transform::FsstString {
         return Ok(None);
     }
@@ -269,6 +277,10 @@ pub fn take_block_rows_shared(
     let kind = pipeline.value_kind()?;
     with_trailing_removed(pipeline.compression()?, bytes, |body| match (kind, transform) {
         (ValueKind::String, Transform::FsstString) => Ok(ColumnData::Strings(take_fsst(body, rows)?)),
+        (ValueKind::String, Transform::FsstPackedString) => Ok(ColumnData::Strings(take_fsst(
+            &super::fsst_packed_as_classic(body)?,
+            rows,
+        )?)),
         (ValueKind::String, Transform::RawString) => Ok(ColumnData::Strings(take_raw(body, rows)?)),
         (ValueKind::String, Transform::DictionaryString) => Ok(ColumnData::Strings(take_dictionary(
             body,

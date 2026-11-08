@@ -578,16 +578,33 @@ pub mod required_features {
     /// vectors it must not.
     pub const VECTOR_COLUMNS: u64 = 1 << 31;
 
+    /// At least one string block stores FSST with bitpacked value lengths (pipeline transform 15) in place of the
+    /// four-byte offset table. Required and refusing on purpose: a reader that predates the transform would refuse
+    /// each such block only when it came to decode it, after it had already answered from the file's other columns,
+    /// and a rewriter that predates it would copy the blocks into a file that no longer declares them — the same
+    /// reasoning as [`XOR_FLOAT_BLOCKS`].
+    pub const PACKED_STRING_OFFSETS: u64 = 1 << 33;
+
+    /// Bit 32 is assigned to the external-id event-id elision feature on another line of development; this reader
+    /// does not implement it, so it stays out of [`KNOWN`] here and a file declaring it is refused.
+    const RESERVED_BIT_32: u64 = 1 << 32;
+
     /// Every required feature this reader implements.
-    pub const KNOWN: u64 = (1 << 32) - 1;
+    pub const KNOWN: u64 = ((1 << 34) - 1) & !RESERVED_BIT_32;
 
     /// The full required set every v1 file declares, `COLUMNAR_MARKS` included — the writer emits the columnar,
     /// per-stripe marks form. Excludes `FOOTER_ENCRYPTED` (opt-in per build, set only when the caller requests footer
     /// encryption), the graph bits (set only on a graph file that carries their blocks), `AUDIT_HASH_CHAIN` (set
     /// only on an audit file), `XOR_FLOAT_BLOCKS` (set only on a file that stores a Chimp block) and `VECTOR_COLUMNS` (set
-    /// only on a file with vector columns); declaring a bit
-    /// before it applies would misrepresent the file.
-    pub const ALL: u64 = KNOWN & !FOOTER_ENCRYPTED & !GRAPH & !AUDIT_HASH_CHAIN & !XOR_FLOAT_BLOCKS & !VECTOR_COLUMNS;
+    /// only on a file with vector columns) and `PACKED_STRING_OFFSETS` (set only on a file that stores a packed-lengths FSST
+    /// block); declaring a bit before it applies would misrepresent the file.
+    pub const ALL: u64 = KNOWN
+        & !FOOTER_ENCRYPTED
+        & !GRAPH
+        & !AUDIT_HASH_CHAIN
+        & !XOR_FLOAT_BLOCKS
+        & !VECTOR_COLUMNS
+        & !PACKED_STRING_OFFSETS;
 }
 
 /// Optional feature flags: unknown optional features are ignored; known ones are validated and used.
