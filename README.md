@@ -2,7 +2,7 @@
   <h1>Open Event Format</h1>
   <h3>A columnar file format and append-only journal built for event streams.<br/>Written once, queried fast, instant deletes.</h3>
   <p>
-    0.04 ms 1% time windows, 0.19 ms event-by-id lookups, and 9-byte redactions over 1,000,000 chat events
+    0.04 ms 1% time windows, 0.19 ms event-by-id lookups, and instant redactions over 1,000,000 chat events
   </p>
   <p>
     <a href="#getting-started">Quickstart</a> •
@@ -113,10 +113,6 @@ Read openspec/specs in open-event/open-event-format, then help me store my event
 - **Arrow-friendly**: Column data maps onto Arrow arrays for the query engine that embeds OE.
 - **Hardened**: `unsafe` is denied outside one documented FSST call site, `unwrap`/`panic`/indexing are denied by Clippy, and every file structure has a fuzz target.
 
-## Scope
-
-OE is the storage core. Reading files back as a query (planning, columnar Arrow execution, and a SQL frontend) belongs to the query engine of the application that embeds OE. Durable homes for keys, objects and jobs (a keystore, an object store, a work queue) also belong to that application and plug in through OE's interfaces.
-
 ## FAQ
 
 <details>
@@ -160,22 +156,6 @@ No. OE provides the file format, indexes and predicate evaluation on encoded blo
 In [`openspec/specs`](./openspec/specs), one directory per `oe-*` capability, with proposed changes under [`openspec/changes`](./openspec/changes). [`conformance/capability-map.toml`](./conformance/capability-map.toml) maps each capability to its module and tests.
 
 </details>
-
-## Projects in This Repository
-
-| Project | Description |
-|---------|-------------|
-| [`oe` crate](./src) | The OE format, OEJ journal, encodings, layout, indexes, integrity and write path |
-| ↳ [Encoding](./src/encoding) | Column encodings and compression |
-| ↳ [Layout](./src/layout) | File layout, footer, readers and scans |
-| ↳ [Indexes](./src/indexes) | Query metadata and skip indexes |
-| ↳ [Writer](./src/writer) | Build, publish, compaction, rewrite and erasure (`write` feature) |
-| ↳ [Security](./src/security) | Encryption, sealing and shredding |
-| [Specification](./openspec) | Capability specs and change proposals |
-| [Conformance](./conformance) | Capability map and conformance ledger |
-| [Conformance tests](./tests/conformance) | One suite per capability |
-| [Benchmarks](./benchmark) | OE versus Parquet, Vortex and JSON |
-| [Fuzz](./fuzz) | Fuzz targets for every on-disk structure |
 
 ## Community
 
