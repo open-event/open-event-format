@@ -18,7 +18,7 @@
 OE is a file format for events. Events first land in **OEJ**, an append-only journal that is the durable record, then get packed into **OE** files: immutable, self-describing column files for analytical queries. Everything is checksummed end to end, so corruption is always caught and never served.
 
 - **Built for events, not generic tables**: Every file carries a full event envelope (ids, streams, tenants, sequence numbers, timestamps, relationships) next to a schemaless variant payload, with vector columns for embeddings stored alongside events.
-- **Durable journal**: OEJ writes append-only frames, each acknowledged only after sync. 172,879 events/s at 128-event batches with a 1.322 ms p99 ack.
+- **Durable journal**: OEJ writes append-only frames, each acknowledged only after sync. 173k events/s @ 1.322 ms p99.
 - **Columnar files**: Stripes, granules and projections with per-column encodings chosen per block. Column data maps onto Arrow arrays for the query engine that embeds OE.
 - **Point lookups without a database**: Time-window and entity-hash granule filters, an external-id index, thread (root reference) lookups, IN-list pruning and boolean (AND/OR) filter planning on encoded blocks answer "latest 50 in this room" or "this event by id" without scanning.
 - **Redaction without rewrites**: Removing an event records a deletion vector of a few bytes instead of rewriting the file. Corrections and splice rewrites reuse untouched granules.
