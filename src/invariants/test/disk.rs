@@ -217,3 +217,136 @@ fn published_set_prunes_old_generations_keeping_n() {
     );
     assert_eq!(PUBLISHED_GENERATIONS_KEPT, 8);
 }
+
+fn real_frame(sequence: u64, payload_len: usize) -> Vec<u8> {
+    use crate::artifacts::frame::{FrameBuildInput, build_frame};
+    use crate::typed_id::TypedIdTestExt;
+    let input = FrameBuildInput {
+        committed_at_physical: 1,
+        created_at_physical: 1,
+        dictionary_generation_hint: 0,
+        durable_batch_id: sequence,
+        epoch: 1,
+        event_count: 1,
+        first_sequence: sequence,
+        flags: 0,
+        last_sequence: sequence,
+        schema_generation: 0,
+        tenant_id: crate::events::TenantId::new_test_id(1),
+        writer_id: 1,
+        writer_local_batch_id: sequence,
+    };
+    build_frame(&input, &vec![0xAB; payload_len]).unwrap()
+}
+
+#[test]
+fn preallocated_journal_tracks_its_logical_end_across_reopen_and_trims_when_sealed() {
+    let dir = tempfile::tempdir().unwrap();
+    let shard = ShardId(5);
+    let first = real_frame(1, 100);
+    let second = real_frame(2, 5_000);
+    let logical = (first.len() + second.len()) as u64;
+    let path = {
+        let mut journal = FileJournalStorage::open(dir.path())
+            .unwrap()
+            .with_preallocation(1 << 20);
+        journal.append(shard, &first).unwrap();
+        assert_eq!(journal.append(shard, &second).unwrap(), first.len() as u64);
+        journal.sync(shard).unwrap();
+        let path = journal.shard_path(shard);
+        let physical = std::fs::metadata(&path).unwrap().len();
+        // Where the filesystem supports it, the file was grown by a whole chunk.
+        assert!(physical == 1 << 20 || physical == logical, "physical {physical}");
+        assert_eq!(journal.extent(shard).unwrap(), logical);
+        // Simulate a crash: leak the storage so Drop does not cut the tail.
+        std::mem::forget(journal);
+        path
+    };
+    // Make the preallocated tail exist even where fallocate is unsupported.
+    OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(1 << 20)
+        .unwrap();
+
+    // A reader that never opened the shard for appending finds the logical end by scanning headers.
+    let mut journal = FileJournalStorage::open(dir.path())
+        .unwrap()
+        .with_preallocation(1 << 20);
+    assert_eq!(journal.extent(shard).unwrap(), logical);
+    assert_eq!(journal.read(shard, 0, first.len() as u32).unwrap(), first);
+    assert_eq!(journal.read(shard, logical, 1), Err(StorageError::OutOfBounds));
+    // Opening for append resumes at the logical end, not the file length.
+    let third = real_frame(3, 10);
+    assert_eq!(journal.append(shard, &third).unwrap(), logical);
+    let logical = logical + third.len() as u64;
+    journal.trim(shard).unwrap();
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), logical);
+    drop(journal);
+    let journal = FileJournalStorage::open(dir.path()).unwrap();
+    assert_eq!(journal.extent(shard).unwrap(), logical);
+}
+
+#[test]
+fn dropping_a_preallocated_journal_cuts_the_tail_and_the_default_does_not_preallocate() {
+    let dir = tempfile::tempdir().unwrap();
+    let frame = real_frame(1, 10);
+    {
+        let mut journal = FileJournalStorage::open(dir.path()).unwrap();
+        journal.append(ShardId(0), &frame).unwrap();
+        assert_eq!(
+            std::fs::metadata(journal.shard_path(ShardId(0))).unwrap().len(),
+            frame.len() as u64
+        );
+    }
+    let path = {
+        let mut journal = FileJournalStorage::open(dir.path())
+            .unwrap()
+            .with_preallocation(64 * 1024);
+        journal.append(ShardId(1), &frame).unwrap();
+        journal.shard_path(ShardId(1))
+    };
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), frame.len() as u64);
+}
+
+#[test]
+fn a_zeroed_tail_after_garbage_is_not_hidden_from_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = {
+        let mut journal = FileJournalStorage::open(dir.path()).unwrap();
+        journal.append(ShardId(0), &real_frame(1, 10)).unwrap();
+        journal.append(ShardId(0), &frame(0x55, 1)).unwrap();
+        journal.append(ShardId(0), &frame(0, 1)).unwrap();
+        journal.shard_path(ShardId(0))
+    };
+    let len = std::fs::metadata(&path).unwrap().len();
+    let journal = FileJournalStorage::open(dir.path()).unwrap();
+    assert_eq!(journal.extent(ShardId(0)).unwrap(), len);
+}
+
+#[test]
+fn read_handles_are_cached_bounded_and_revalidated_by_length() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut journal = FileJournalStorage::open(dir.path()).unwrap();
+        for id in 0..20 {
+            journal.append(ShardId(id), &frame(id as u8 + 1, 1)).unwrap();
+        }
+    }
+    let journal = FileJournalStorage::open(dir.path()).unwrap();
+    for id in 0..20 {
+        assert_eq!(journal.read(ShardId(id), 0, 1).unwrap(), vec![id as u8 + 1]);
+    }
+    assert_eq!(journal.cached_readers(), JOURNAL_READ_HANDLES);
+    // Another writer grows a cached shard: the cached handle sees the new length.
+    assert_eq!(journal.extent(ShardId(19)).unwrap(), BLOCK as u64);
+    {
+        let mut writer = FileJournalStorage::open(dir.path()).unwrap();
+        writer.append(ShardId(19), &frame(0x77, 1)).unwrap();
+    }
+    assert_eq!(journal.extent(ShardId(19)).unwrap(), 2 * BLOCK as u64);
+    assert_eq!(journal.read(ShardId(19), BLOCK as u64, 1).unwrap(), vec![0x77]);
+    assert_eq!(journal.read(ShardId(99), 0, 1), Err(StorageError::UnknownShard));
+    assert_eq!(journal.extent(ShardId(99)).unwrap(), 0);
+}

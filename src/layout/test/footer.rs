@@ -20,6 +20,7 @@ fn minimal_footer() -> Footer {
         dictionaries: FileDictionaries::default(),
         embedding_row_offsets: Vec::new(),
         entity_hash_filters: Vec::new(),
+        entity_summary: None,
         escape_hatches: Vec::new(),
         exact_counts: ExactCounts {
             row_count: 1,
@@ -1610,4 +1611,26 @@ fn footer_decode_rejects_granule_row_counts_that_disagree_with_the_file() {
     let mut undercount = built.footer.clone();
     undercount.exact_counts.row_count += 1;
     assert!(decode_footer(&encode_footer(&undercount)).is_err());
+}
+
+#[test]
+fn entity_summary_section_round_trips_and_requires_its_optional_feature() {
+    use crate::indexes::entity_summary::{EntityKey, EntitySummary};
+    for summary in [
+        EntitySummary::from_keys([EntityKey::new(1, 2), EntityKey::new(3, 4)]),
+        EntitySummary::from_keys((0..1_000).map(|i| EntityKey::new(i, i * 7))),
+    ] {
+        let mut footer = minimal_footer();
+        footer.entity_summary = Some(summary.clone());
+        footer.optional_feature_flags |= crate::layout::optional_features::ENTITY_SUMMARY;
+        let decoded = decode_footer(&encode_footer(&footer)).unwrap();
+        assert_eq!(decoded.entity_summary, Some(summary.clone()));
+
+        // A section without the declaring flag is refused.
+        footer.optional_feature_flags &= !crate::layout::optional_features::ENTITY_SUMMARY;
+        assert!(decode_footer(&encode_footer(&footer)).is_err());
+    }
+    // A footer without the section (an older file) reads as no summary.
+    let decoded = decode_footer(&encode_footer(&minimal_footer())).unwrap();
+    assert_eq!(decoded.entity_summary, None);
 }

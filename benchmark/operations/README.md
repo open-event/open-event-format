@@ -13,7 +13,7 @@ The generated rows are chat traffic: messages, edits, reactions and joins in roo
 conversations, each carrying a message kind, the sending client, a character count, a reaction count (absent on some
 rows) and the message text.
 
-Run it from this directory:
+Run it with `just bench-ops` from the repository root (see the `Justfile`), or from `benchmark/` (the crate root, one level up):
 
 ```sh
 cargo run --release --bin oe-vs-parquet -- /tmp/oe-vs-parquet
@@ -152,9 +152,9 @@ read bytes:
 
 ```sh
 target/release/oe-vs-parquet /tmp/oe-gate --format oe --iterations 3 \
-  --memory-baseline read-baseline.toml --max-memory-regression-percent 0
+  --memory-baseline operations/read-baseline.toml --max-memory-regression-percent 0
 target/release/oe-vs-parquet /tmp/oe-gate --format oe --iterations 3 --toml \
-  | grep -v '^resident_high_water_bytes' > read-baseline.toml
+  | grep -v '^resident_high_water_bytes' > operations/read-baseline.toml
 ```
 
 Any other report can be used the same way:

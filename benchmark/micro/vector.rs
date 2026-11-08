@@ -2,7 +2,7 @@
 //! scan, each over the whole segment and with a filter to one of ten rooms. Blocks are decrypted inside the timed loop,
 //! as a real search would.
 //!
-//! Run: `cargo bench --bench vector`.
+//! Run: `just bench-micro vector` or `cargo bench --bench vector`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 

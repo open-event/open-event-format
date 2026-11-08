@@ -20,6 +20,7 @@ fn entry() -> OeFileEntry {
         deletion_vector: None,
         entity_summary: None,
         feature_metadata: None,
+        field_deletion_vectors: Vec::new(),
         file_seal: [0; 32],
         file_id: FILE_ID,
         file_type: FileType::OeFile,
@@ -124,6 +125,7 @@ fn manifest_deletes_serves_saved_vectors_and_corrections_to_a_scan() {
     let deletes = ManifestDeletes {
         corrections: &resolver,
         manifest: &manifest,
+        objects: None,
     };
     let tenant = TenantId::new_test_id(7);
     assert!(deletes.deletion_vector(tenant, FILE_ID).unwrap().unwrap().is_deleted(2));
@@ -145,5 +147,76 @@ fn manifest_deletes_serves_saved_vectors_and_corrections_to_a_scan() {
             .unwrap()
             .correction_sequence,
         50
+    );
+}
+
+#[test]
+fn a_large_vector_is_stored_as_a_verified_external_object_and_loads_through_the_store() {
+    use crate::object_store::sim::SimObjectStore;
+    let objects = SimObjectStore::new();
+    let mut manifest = ManifestGeneration {
+        files: vec![entry()],
+        ..ManifestGeneration::default()
+    };
+    // Small vectors stay inline under the real limit.
+    manifest
+        .publish_deletions_in(FILE_ID, &vector(&[1]), None, &objects)
+        .unwrap();
+    assert!(!manifest.files[0].deletion_vector.as_ref().unwrap().is_external());
+    assert!(objects.keys().is_empty());
+
+    let big: Vec<u64> = (0..200_000).step_by(3).collect();
+    assert_eq!(
+        manifest
+            .publish_deletions_in(FILE_ID, &vector(&big), None, &objects)
+            .unwrap(),
+        Some(2)
+    );
+    let stored = manifest.files[0].deletion_vector.clone().unwrap();
+    assert!(stored.is_external());
+    assert!(stored.encoded.is_empty());
+    let key = deletion_vector_object_key(TenantId::new_test_id(7), FILE_ID, 2);
+    assert_eq!(manifest.files[0].deletion_vector_object_key(), Some(key.as_str()));
+    assert_eq!(deletion_vector_object_keys(&manifest), vec![key.clone()]);
+    assert_eq!(stored.to_ref().encoding, DeletionVectorEncoding::NativeBlock);
+    // The inline-only API refuses rather than answering wrong; the store-aware one loads.
+    assert!(manifest.files[0].load_deletion_vector().is_err());
+    let loaded = manifest.files[0].load_deletion_vector_from(&objects).unwrap().unwrap();
+    assert!(loaded.is_deleted(1) && loaded.is_deleted(3) && !loaded.is_deleted(4));
+    // The ref round-trips through the manifest's serde form.
+    let round: OeFileEntry = serde_json::from_str(&serde_json::to_string(&manifest.files[0]).unwrap()).unwrap();
+    assert_eq!(round.deletion_vector, Some(stored.clone()));
+
+    // A further generation merges an external prior.
+    manifest
+        .publish_deletions_in(FILE_ID, &vector(&[4]), None, &objects)
+        .unwrap();
+    let loaded = manifest.files[0].load_deletion_vector_from(&objects).unwrap().unwrap();
+    assert!(loaded.is_deleted(4) && loaded.is_deleted(1));
+    assert!(objects.object(&key).is_some(), "the earlier object is immutable");
+
+    // Tampered or missing objects refuse.
+    let mut bytes = objects.object(&key).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 1;
+    objects.delete(&key).unwrap();
+    objects.put_if_absent(&key, &bytes).unwrap();
+    assert!(stored.load_with(FILE_ID, Some(&objects)).is_err());
+    objects.delete(&key).unwrap();
+    assert!(stored.load_with(FILE_ID, Some(&objects)).is_err());
+    assert!(stored.load_with(FILE_ID, None).is_err());
+}
+
+#[test]
+fn a_retried_external_publish_reuses_its_own_object_but_refuses_foreign_bytes() {
+    use crate::object_store::sim::SimObjectStore;
+    let objects = SimObjectStore::new();
+    let first =
+        StoredDeletionVector::next_generation_with_limit(&entry(), &vector(&[5]), None, Some(&objects), 0).unwrap();
+    let again =
+        StoredDeletionVector::next_generation_with_limit(&entry(), &vector(&[5]), None, Some(&objects), 0).unwrap();
+    assert_eq!(first, again);
+    assert!(
+        StoredDeletionVector::next_generation_with_limit(&entry(), &vector(&[6]), None, Some(&objects), 0).is_err()
     );
 }

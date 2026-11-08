@@ -18,6 +18,7 @@ fn file_entry(state: PartState) -> OeFileEntry {
             last_sequence: 100,
         },
         feature_metadata: None,
+        field_deletion_vectors: Vec::new(),
         file_seal: [0u8; 32],
         file_id: 1,
         file_type: oe::lifecycle::FileType::OeFile,

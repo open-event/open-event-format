@@ -4,10 +4,10 @@ Compares OE with Parquet, Vortex and JSON on the same events, including the thin
 store (latest messages in a room, threads, lookup by event id, redaction, durable ingest). Results are in
 `results/results.md` (tables) and `results/results.json` (raw numbers).
 
-Run it from this directory:
+Run it with `just bench-compare` from the repository root (see the `Justfile`), or from this directory:
 
 ```bash
-cargo run --release -- --sizes 10000,100000,1000000 --reps 5 --write-reps 3 --out results
+cargo run --release --bin oe-benchmark -- --sizes 10000,100000,1000000 --reps 5 --write-reps 3 --out results
 ```
 
 Other options: `--profiles chat,telemetry,messages`, `--formats oe,parquet`, `--scratch <dir>` (where the durable-ingest
@@ -61,6 +61,6 @@ test writes; use a directory on the disk you want to test) and `--skip-ingest ye
 
 ## Operations benchmark
 
-`operations/` holds a second, separate comparison of OE against Parquet and Vortex over one chat-shaped dataset:
+`operations/` (the `oe-vs-parquet` binary of this crate) holds a second comparison of OE against Parquet and Vortex over one chat-shaped dataset:
 create, read, update, delete, search, and diff, with every answer checked across formats before timings are reported.
 See `operations/README.md`.

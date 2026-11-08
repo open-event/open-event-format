@@ -86,6 +86,7 @@ pub(crate) fn build_config() -> OeBuildConfig {
         targets: LayoutTargets::default(),
         tenant_id: tenant(),
         time_series_bucket_nanos: None,
+        delivery_lineage: false,
     }
 }
 
@@ -109,6 +110,7 @@ pub(crate) fn active_entry(built: &BuiltOe, first: u64, last: u64) -> OeFileEntr
             last_sequence: last,
         },
         feature_metadata: None,
+        field_deletion_vectors: Vec::new(),
         file_seal: built.file_seal,
         file_id: built.file_id,
         file_type: FileType::OeFile,
@@ -281,11 +283,19 @@ fn compaction_drops_rows_removed_by_saved_deletion_vectors() {
     let (head_id, mut head) = published.head().unwrap();
     head.generation = head_id + 1;
     head.footer_mirror = None;
-    assert!(head.publish_deletions(first.file_id, &{
-        let mut vector = crate::deletes::DeletionVector::new();
-        vector.mark_deleted(1);
-        vector
-    }, None).unwrap().is_some());
+    assert!(
+        head.publish_deletions(
+            first.file_id,
+            &{
+                let mut vector = crate::deletes::DeletionVector::new();
+                vector.mark_deleted(1);
+                vector
+            },
+            None
+        )
+        .unwrap()
+        .is_some()
+    );
     published.put_generation(head).unwrap();
     published.advance_head(head_id, head_id + 1).unwrap();
 
@@ -305,4 +315,531 @@ fn compaction_drops_rows_removed_by_saved_deletion_vectors() {
     .unwrap();
     let merged = OeFile::open(output.file_bytes.clone(), Some(&output.entry.file_seal)).unwrap();
     assert_eq!(read_event_rows(&merged).unwrap(), rows_of([1, 3, 4, 5]));
+}
+
+// --- Every column kind the builder writes from a row reads back and rebuilds identically -----------------------------
+
+use crate::events::provenance::{SignatureScheme, SignedEventProvenance};
+use crate::events::relationships::{EventRelationships, RelationshipKind, RelationshipRef};
+
+/// Row `i` carrying every optional column family: provenance on even rows, relationships of every kind on rows
+/// divisible by three (declared in the order the file stores them), and delivery lineage on all but every fourth row.
+pub(crate) fn rich_row(i: u64) -> OeRow {
+    let mut row = rows_of([i]).remove(0);
+    if i.is_multiple_of(2) {
+        row.event.provenance = Some(SignedEventProvenance {
+            author_pubkey: [i as u8; 32],
+            claimed_at: TimestampValue::from_physical_nanos(5_000 + i as i64),
+            protocol_event_id: [0xA0 ^ i as u8; 32],
+            protocol_kind: 1 + i as u32,
+            scheme: if i.is_multiple_of(4) {
+                SignatureScheme::Ed25519
+            } else {
+                SignatureScheme::Bip340SchnorrSecp256k1
+            },
+            signature: [0x5A ^ i as u8; 64],
+        });
+    }
+    if i.is_multiple_of(3) {
+        let refs = RelationshipKind::ALL
+            .into_iter()
+            .flat_map(|kind| {
+                let repeat = if matches!(kind, RelationshipKind::Parent | RelationshipKind::Root) {
+                    1
+                } else {
+                    2
+                };
+                (0..repeat).map(move |n| RelationshipRef::to_event(kind, 0x1000 + u128::from(i) * 10 + n))
+            })
+            .collect();
+        row.event.relationships = Some(EventRelationships::new(refs).unwrap());
+    }
+    if !i.is_multiple_of(4) {
+        row.event.connector_delivery_hash_high = 0xFEED_0000 + i;
+        row.event.connector_delivery_hash_low = u64::MAX - i;
+        row.event.source_schema = (i % 2 == 1).then(|| format!("protobuf:sha256:{i:04x}"));
+        row.event.source_delivery = Some(format!("delivery-{i}"));
+    } else {
+        row.event.connector_delivery_hash_low = 0;
+        row.event.connector_delivery_hash_high = 0;
+    }
+    row
+}
+
+fn lineage_config() -> OeBuildConfig {
+    OeBuildConfig {
+        delivery_lineage: true,
+        targets: LayoutTargets {
+            index_granularity: 3,
+            ..LayoutTargets::default()
+        },
+        ..build_config()
+    }
+}
+
+fn open_built(built: &BuiltOe) -> OeFile {
+    OeFile::open(built.bytes.clone(), Some(&built.file_seal)).unwrap()
+}
+
+#[test]
+fn every_event_column_kind_round_trips_through_read_event_rows_and_a_rebuild() {
+    let rows: Vec<OeRow> = (1..=13).map(rich_row).collect();
+    let built = build_oe_file(rows.clone(), &lineage_config()).unwrap();
+    assert!(built.footer.granules.len() > 1, "rows span several granules");
+    assert_ne!(
+        built.footer.optional_feature_flags & crate::layout::optional_features::DELIVERY_LINEAGE,
+        0
+    );
+    let read = read_event_rows(&open_built(&built)).unwrap();
+    assert_eq!(read, rows);
+
+    let rebuilt = build_oe_file(read, &lineage_config()).unwrap();
+    assert_eq!(read_event_rows(&open_built(&rebuilt)).unwrap(), rows);
+    assert_eq!(rebuilt.footer.columns, built.footer.columns);
+}
+
+#[test]
+fn delivery_lineage_is_stored_only_when_the_build_opts_in() {
+    let rows: Vec<OeRow> = (1..=5).map(rich_row).collect();
+    let built = build_oe_file(rows.clone(), &build_config()).unwrap();
+    assert_eq!(
+        built.footer.optional_feature_flags & crate::layout::optional_features::DELIVERY_LINEAGE,
+        0
+    );
+    assert!(
+        !built
+            .footer
+            .columns
+            .iter()
+            .any(|column| { crate::writer::source_form::is_lineage_column(column.column_id) })
+    );
+    let read = read_event_rows(&open_built(&built)).unwrap();
+    for (read, original) in read.iter().zip(&rows) {
+        assert_eq!(read.event.connector_delivery_hash_low, 0);
+        assert_eq!(read.event.source_delivery, None);
+        assert_eq!(read.event.provenance, original.event.provenance);
+        assert_eq!(read.event.relationships, original.event.relationships);
+    }
+}
+
+#[test]
+fn source_form_round_trips_through_read_build_rows_and_is_refused_as_event_rows() {
+    use crate::writer::build::{BuildInput, BuildRow};
+    let mut rows: Vec<BuildRow> = OeRow::into_build_rows((1..=7).map(rich_row).collect());
+    for (index, row) in rows.iter_mut().enumerate() {
+        if index % 2 == 0 {
+            row.external_id = Some(format!("${index}:example.org").into_bytes());
+        }
+        if index % 3 == 0 {
+            row.raw_payload = Some(format!("{{\"n\":{index}}}").into_bytes());
+        }
+    }
+    let built = build_oe_file(rows.clone(), &lineage_config()).unwrap();
+    let file = open_built(&built);
+    let read = read_build_rows(&file).unwrap();
+    assert_eq!(read, rows);
+    assert!(matches!(read_event_rows(&file), Err(FormatError::Structural { .. })));
+
+    let rebuilt = build_oe_file(read, &lineage_config()).unwrap();
+    assert_eq!(read_build_rows(&open_built(&rebuilt)).unwrap(), rows);
+    assert_eq!(rebuilt.footer.external_ids, built.footer.external_ids);
+}
+
+#[test]
+fn compaction_carries_provenance_relationships_and_lineage_over() {
+    let objects = SimObjectStore::new();
+    let mut published = SimulatedPublishedSet::new();
+    let first = build_oe_file((1..=4).map(rich_row).collect::<Vec<_>>(), &lineage_config()).unwrap();
+    let second = build_oe_file((5..=9).map(rich_row).collect::<Vec<_>>(), &lineage_config()).unwrap();
+    publish_built(&first, 1, 4, &mut published, &objects);
+    publish_built(&second, 5, 9, &mut published, &objects);
+    let job = CompactionJob {
+        expected_output_bytes: 0,
+        file_ids: vec![first.file_id, second.file_id],
+    };
+    let output = execute_compaction(
+        &mut OePublisher::default(),
+        &job,
+        &lineage_config(),
+        &mut published,
+        &objects,
+        &mut NoopPeerNotices::default(),
+        &FixedClock::at(START_NANOS),
+    )
+    .unwrap();
+    let merged = OeFile::open(output.file_bytes, Some(&output.entry.file_seal)).unwrap();
+    assert_eq!(
+        read_event_rows(&merged).unwrap(),
+        (1..=9).map(rich_row).collect::<Vec<_>>()
+    );
+}
+
+// --- Field-level deletion vectors and external deletion vectors -------------------------------------------------------
+
+fn body_redaction(ordinals: &[u64]) -> crate::deletes::FieldDeletionVector {
+    let mut vector = crate::deletes::FieldDeletionVector::new(vec!["body".to_owned()]);
+    ordinals.iter().for_each(|&ordinal| vector.mark_affected(ordinal));
+    vector
+}
+
+#[test]
+fn read_build_rows_redacted_nulls_redacted_fields_and_drops_the_raw_payload() {
+    use crate::field_deletion_store::FieldRedactions;
+    use crate::writer::build::{BuildInput, BuildRow};
+    let mut rows: Vec<BuildRow> = OeRow::into_build_rows((1..=3).map(rich_row).collect());
+    for (index, row) in rows.iter_mut().enumerate() {
+        row.raw_payload = Some(format!("{{\"n\":{index}}}").into_bytes());
+    }
+    let file = open_built(&build_oe_file(rows, &lineage_config()).unwrap());
+    let redactions = FieldRedactions {
+        vectors: vec![body_redaction(&[1])],
+    };
+    let plain = read_build_rows(&file).unwrap();
+    let read = read_build_rows_redacted(&file, &redactions).unwrap();
+    assert_eq!(read[0], plain[0]);
+    assert_eq!(read[2], plain[2]);
+    assert!(read[1].raw_payload.is_none() && plain[1].raw_payload.is_some());
+    assert_eq!(file.raw_payload_redacted(1, &redactions).unwrap(), None);
+    assert!(file.raw_payload_redacted(0, &redactions).unwrap().is_some());
+    let PayloadRead::Value(VariantValue::Object(fields)) = file.payload_redacted(1, &redactions).unwrap() else {
+        panic!("an object payload");
+    };
+    if let Some(body) = fields.get("body") {
+        assert_eq!(body, &VariantValue::Null);
+    }
+    assert_ne!(file.payload_redacted(0, &redactions).unwrap(), PayloadRead::None);
+}
+
+#[test]
+fn compaction_applies_field_redactions_and_external_deletion_vectors() {
+    let objects = SimObjectStore::new();
+    let mut published = SimulatedPublishedSet::new();
+    let clock = FixedClock::at(START_NANOS);
+    let first = build_oe_file(rows_of(1..=3), &build_config()).unwrap();
+    let second = build_oe_file(rows_of(4..=5), &build_config()).unwrap();
+    publish_built(&first, 1, 3, &mut published, &objects);
+    publish_built(&second, 4, 5, &mut published, &objects);
+
+    // Delete sequence 2 through a deletion vector stored as an external object, and redact `body` of sequence 3 and 4.
+    let (head_id, mut head) = published.head().unwrap();
+    head.generation = head_id + 1;
+    head.footer_mirror = None;
+    let mut deleted = crate::deletes::DeletionVector::new();
+    deleted.mark_deleted(1);
+    head.publish_deletions_with_limit(first.file_id, &deleted, None, &objects, 0)
+        .unwrap();
+    assert!(head.files[0].deletion_vector.as_ref().unwrap().is_external());
+    head.publish_field_deletions(first.file_id, &body_redaction(&[2]))
+        .unwrap();
+    head.publish_field_deletions(second.file_id, &body_redaction(&[0]))
+        .unwrap();
+    published.put_generation(head.clone()).unwrap();
+    published.advance_head(head_id, head_id + 1).unwrap();
+
+    // Before compaction, an entity scan through the manifest hides the redacted field.
+    let resolver = crate::corrections::CorrectionResolver::new([]);
+    let manifest_deletes = crate::deletion_store::ManifestDeletes {
+        corrections: &resolver,
+        manifest: &head,
+        objects: Some(&objects),
+    };
+    let first_file = open_built(&first);
+    let scan = |low: u64, file: &OeFile, deletes: &dyn crate::layout::entity_scan::DeletesAndCorrections| {
+        crate::layout::entity_scan::EntityScan {
+            direction: crate::layout::footer::SortDirection::Ascending,
+            entity_id_hash_high: 1,
+            entity_id_hash_low: low,
+            limit: None,
+            sequence_range: crate::events::SequencePoint { epoch: 0, sequence: 0 }..=crate::events::SequencePoint {
+                epoch: u64::MAX,
+                sequence: u64::MAX,
+            },
+            tenant_id: tenant(),
+        }
+        .run(&[file], &crate::artifacts::overlay::LiveOverlayStore::new(), deletes)
+        .unwrap()
+    };
+    let redacted = scan(3, &first_file, &manifest_deletes);
+    assert_eq!(redacted.len(), 1);
+    let PayloadRead::Value(VariantValue::Object(fields)) = &redacted[0].payload else {
+        panic!("an object payload");
+    };
+    assert_eq!(fields.get("body"), Some(&VariantValue::Null));
+    assert_eq!(fields.get("n"), Some(&VariantValue::Int(3)));
+    assert!(
+        scan(2, &first_file, &manifest_deletes).is_empty(),
+        "the external deletion vector drops the row"
+    );
+    let untouched = scan(1, &first_file, &manifest_deletes);
+    assert_eq!(untouched[0].payload, PayloadRead::Value(payload_of(1)));
+
+    let job = CompactionJob {
+        expected_output_bytes: (first.bytes.len() + second.bytes.len()) as u64,
+        file_ids: vec![first.file_id, second.file_id],
+    };
+    let output = execute_compaction(
+        &mut OePublisher::default(),
+        &job,
+        &build_config(),
+        &mut published,
+        &objects,
+        &mut NoopPeerNotices::default(),
+        &clock,
+    )
+    .unwrap();
+    assert!(output.entry.deletion_vector.is_none());
+    assert!(output.entry.field_deletion_vectors.is_empty());
+    let merged = OeFile::open(output.file_bytes.clone(), Some(&output.entry.file_seal)).unwrap();
+    let rows = read_event_rows(&merged).unwrap();
+    assert_eq!(
+        rows.iter().map(|row| row.sequence).collect::<Vec<_>>(),
+        vec![1, 3, 4, 5]
+    );
+    for row in &rows {
+        let PayloadInput::Variant(VariantValue::Object(fields)) = &row.event.payload else {
+            panic!("an object payload");
+        };
+        let expected_body = if matches!(row.sequence, 3 | 4) {
+            VariantValue::Null
+        } else {
+            VariantValue::String(format!("message {}", row.sequence))
+        };
+        assert_eq!(fields.get("body"), Some(&expected_body), "sequence {}", row.sequence);
+    }
+}
+
+// --- A graph compaction with a deleted row renumbers the subject ------------------------------------------------------
+
+use crate::layout::graph::{EdgeKind, GraphInput, RowEdges};
+use crate::writer::build::BuildInput;
+
+const GRAPH_SUBJECT: &[u8] = b"!room:example.org";
+
+fn graph_id(old_sn: u64) -> Vec<u8> {
+    format!("${old_sn}:example.org").into_bytes()
+}
+
+/// One subject's graph events `first..end` (journal sequences `first + 1..=end`): each follows the one before (`prev`)
+/// and is authorised by event 0 (`auth`), declared as relationships and as edges, with `graph_id(sn)` as external id.
+fn graph_file(first: u64, end: u64) -> BuiltOe {
+    let mut rows = OeRow::into_build_rows(rows_of(first + 1..=end));
+    let mut graph = GraphInput {
+        first_sn: first,
+        subject: GRAPH_SUBJECT.to_vec(),
+        ..GraphInput::default()
+    };
+    for (sn, row) in (first..).zip(&mut rows) {
+        row.external_id = Some(graph_id(sn));
+        let mut refs = Vec::new();
+        let mut edges = RowEdges::default();
+        if sn > 0 {
+            refs.push(RelationshipRef::to_subject_sequence(RelationshipKind::Auth, 0));
+            refs.push(RelationshipRef::to_subject_sequence(RelationshipKind::Prev, sn - 1));
+            edges.auth.push(0);
+            edges.prev.push(sn - 1);
+        }
+        row.relationships = (!refs.is_empty()).then(|| EventRelationships::new(refs).unwrap());
+        graph.rows.push(edges);
+    }
+    let config = OeBuildConfig {
+        graph: Some(graph),
+        profile: Profile::Graph,
+        ..build_config()
+    };
+    build_oe_file(rows, &config).unwrap()
+}
+
+fn delete_rows(published: &mut SimulatedPublishedSet, file_id: u128, ordinals: &[u64]) {
+    let (head_id, mut head) = published.head().unwrap();
+    head.generation = head_id + 1;
+    head.footer_mirror = None;
+    let mut vector = crate::deletes::DeletionVector::new();
+    for &ordinal in ordinals {
+        vector.mark_deleted(ordinal);
+    }
+    assert!(head.publish_deletions(file_id, &vector, None).unwrap().is_some());
+    published.put_generation(head).unwrap();
+    published.advance_head(head_id, head_id + 1).unwrap();
+}
+
+fn compact(published: &mut SimulatedPublishedSet, objects: &SimObjectStore, file_ids: Vec<u128>) -> Published {
+    execute_compaction(
+        &mut OePublisher::default(),
+        &CompactionJob {
+            expected_output_bytes: 0,
+            file_ids,
+        },
+        &build_config(),
+        published,
+        objects,
+        &mut NoopPeerNotices::default(),
+        &FixedClock::at(START_NANOS),
+    )
+    .unwrap()
+}
+
+/// The subject's `Active` graph files in the head, in SN order, opened against their recorded seals.
+fn active_graph_files(published: &SimulatedPublishedSet, objects: &SimObjectStore) -> Vec<(OeFileEntry, OeFile)> {
+    let (_, head) = published.head().unwrap();
+    let mut entries: Vec<OeFileEntry> = head
+        .files
+        .iter()
+        .filter(|entry| entry.part_state == PartState::Active && entry.graph_summary.is_some())
+        .cloned()
+        .collect();
+    entries.sort_by_key(|entry| entry.graph_summary.as_ref().unwrap().min_event_sn);
+    entries
+        .into_iter()
+        .map(|entry| {
+            let stored = objects.get(&oe_object_key(tenant(), entry.file_id)).unwrap().unwrap();
+            let file = OeFile::open(stored.bytes, Some(&entry.file_seal)).unwrap();
+            (entry, file)
+        })
+        .collect()
+}
+
+/// Finds `sn` across `files` and returns `(parents, children)` of `kind`, children gathered from every file.
+fn edges_of(files: &[(OeFileEntry, OeFile)], sn: u64, kind: EdgeKind) -> (Vec<u64>, Vec<u64>) {
+    let (_, file) = files
+        .iter()
+        .find(|(entry, _)| {
+            let summary = entry.graph_summary.as_ref().unwrap();
+            (summary.min_event_sn..=summary.max_event_sn).contains(&sn)
+        })
+        .unwrap();
+    let edges = file.granule_edges(file.graph_granule_of(sn).unwrap()).unwrap();
+    (edges.parents(sn, kind).to_vec(), edges.children(sn, kind))
+}
+
+/// Checks the renumbered prev/auth chain over new SNs `0..count` held by `files`, whose surviving events had the old
+/// SNs `old_of[new]`.
+fn assert_chain(files: &[(OeFileEntry, OeFile)], old_of: &[u64]) {
+    let count = old_of.len() as u64;
+    for (new, &old) in (0..count).zip(old_of) {
+        let holder = files
+            .iter()
+            .find(|(entry, _)| {
+                let summary = entry.graph_summary.as_ref().unwrap();
+                (summary.min_event_sn..=summary.max_event_sn).contains(&new)
+            })
+            .unwrap();
+        // External ids still find their (renumbered) event, in the file that holds it.
+        assert_eq!(
+            holder.1.graph_sn_of(&graph_id(old)).unwrap(),
+            Some(new),
+            "id of old {old}"
+        );
+        let (prev, prev_children) = edges_of(files, new, EdgeKind::Prev);
+        let expected_prev: Vec<u64> = new.checked_sub(1).into_iter().collect();
+        assert_eq!(prev, expected_prev, "prev of {new}");
+        let expected_children: Vec<u64> = (new + 1 < count).then_some(new + 1).into_iter().collect();
+        assert_eq!(prev_children, expected_children, "prev children of {new}");
+        let (auth, auth_children) = edges_of(files, new, EdgeKind::Auth);
+        assert_eq!(auth, if new == 0 { vec![] } else { vec![0] }, "auth of {new}");
+        if new == 0 {
+            assert_eq!(auth_children, (1..count).collect::<Vec<_>>());
+        }
+        // The row's declared relationships follow the renumbering.
+        let row_ordinal = holder.1.graph_row_of(new).unwrap();
+        let row = read_build_rows(&holder.1).unwrap().remove(row_ordinal as usize);
+        let refs: Vec<RelationshipRef> = row.relationships.map(|r| r.refs().to_vec()).unwrap_or_default();
+        let mut expected = Vec::new();
+        if new > 0 {
+            expected.push(RelationshipRef::to_subject_sequence(RelationshipKind::Auth, 0));
+            expected.push(RelationshipRef::to_subject_sequence(RelationshipKind::Prev, new - 1));
+        }
+        assert_eq!(refs, expected, "relationships of {new}");
+    }
+}
+
+#[test]
+fn graph_compaction_with_a_deleted_mid_chain_event_renumbers_the_merged_range_and_later_files() {
+    let objects = SimObjectStore::new();
+    let mut published = SimulatedPublishedSet::new();
+    let (a, b, c) = (graph_file(0, 4), graph_file(4, 9), graph_file(9, 12));
+    publish_built(&a, 1, 4, &mut published, &objects);
+    publish_built(&b, 5, 9, &mut published, &objects);
+    publish_built(&c, 10, 12, &mut published, &objects);
+    // Delete event 5 (row 1 of the second file), in the middle of the chain.
+    delete_rows(&mut published, b.file_id, &[1]);
+
+    let output = compact(&mut published, &objects, vec![a.file_id, b.file_id]);
+    let summary = output.entry.graph_summary.clone().unwrap();
+    assert_eq!((summary.min_event_sn, summary.max_event_sn), (0, 7));
+    assert!(output.entry.deletion_vector.is_none());
+
+    // Every rewritten input is retired in the same generation, and the later file was rewritten.
+    let (_, head) = published.head().unwrap();
+    for id in [a.file_id, b.file_id, c.file_id] {
+        let entry = head.files.iter().find(|entry| entry.file_id == id).unwrap();
+        assert_eq!(entry.part_state, PartState::Outdated);
+        assert!(
+            head.retirements
+                .iter()
+                .any(|r| r.file_id == id && r.generation == output.generation)
+        );
+    }
+    let files = active_graph_files(&published, &objects);
+    assert_eq!(files.len(), 2);
+    let later = files[1].0.graph_summary.clone().unwrap();
+    assert_eq!((later.min_event_sn, later.max_event_sn), (8, 10));
+    assert_eq!(files[1].0.coverage.first_sequence, 10);
+    // The deleted event is gone; old 6 now follows old 4 directly (re-parented to its nearest surviving ancestor).
+    assert_eq!(files[0].1.graph_sn_of(&graph_id(5)).unwrap(), None);
+    assert_chain(&files, &[0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 11]);
+}
+
+#[test]
+fn graph_renumbering_rewrites_an_earlier_file_whose_inbound_edges_name_renumbered_children() {
+    let objects = SimObjectStore::new();
+    let mut published = SimulatedPublishedSet::new();
+    let (a, b, c) = (graph_file(0, 4), graph_file(4, 9), graph_file(9, 12));
+    publish_built(&a, 1, 4, &mut published, &objects);
+    publish_built(&b, 5, 9, &mut published, &objects);
+    publish_built(&c, 10, 12, &mut published, &objects);
+    // A clean merge first: the merged file records the third file's children as inbound edges.
+    let ab = compact(&mut published, &objects, vec![a.file_id, b.file_id]);
+    // Then delete the third file's first event (old 9) and compact that file alone.
+    delete_rows(&mut published, c.file_id, &[0]);
+    let output = compact(&mut published, &objects, vec![c.file_id]);
+    let summary = output.entry.graph_summary.clone().unwrap();
+    assert_eq!((summary.min_event_sn, summary.max_event_sn), (9, 10));
+
+    let (_, head) = published.head().unwrap();
+    let ab_entry = head
+        .files
+        .iter()
+        .find(|entry| entry.file_id == ab.entry.file_id)
+        .unwrap();
+    assert_eq!(
+        ab_entry.part_state,
+        PartState::Outdated,
+        "the earlier file was rewritten"
+    );
+    let files = active_graph_files(&published, &objects);
+    assert_eq!(files.len(), 2);
+    assert_chain(&files, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11]);
+}
+
+#[test]
+fn graph_renumbering_refuses_an_output_with_no_surviving_event() {
+    let objects = SimObjectStore::new();
+    let mut published = SimulatedPublishedSet::new();
+    let (a, b) = (graph_file(0, 4), graph_file(4, 6));
+    publish_built(&a, 1, 4, &mut published, &objects);
+    publish_built(&b, 5, 6, &mut published, &objects);
+    delete_rows(&mut published, b.file_id, &[0, 1]);
+    let result = execute_compaction(
+        &mut OePublisher::default(),
+        &CompactionJob {
+            expected_output_bytes: 0,
+            file_ids: vec![b.file_id],
+        },
+        &build_config(),
+        &mut published,
+        &objects,
+        &mut NoopPeerNotices::default(),
+        &FixedClock::at(START_NANOS),
+    );
+    assert!(matches!(result, Err(PublishFailure::Format(_))), "{result:?}");
 }

@@ -644,8 +644,18 @@ pub mod optional_features {
     /// range and returns the identical answer.
     pub const TIME_SERIES_ROLLUPS: u64 = 1 << 13;
 
+    /// The file keeps its events' connector delivery lineage (source schema, source delivery, connector delivery hash)
+    /// in internal source-form columns, so a compaction carries it over. Informational: a reader that ignores the bit
+    /// reads every other column unchanged.
+    pub const DELIVERY_LINEAGE: u64 = 1 << 14;
+
+    /// The footer carries the file's entity summary ([`crate::indexes::entity_summary::EntitySummary`]), the same
+    /// one its manifest entry carries, so a reader holding only the file can recover it. Droppable: a reader that does
+    /// not declare it simply has no summary from the file.
+    pub const ENTITY_SUMMARY: u64 = 1 << 15;
+
     /// Optional features this reader knows how to validate and use.
-    pub const KNOWN: u64 = (1 << 14) - 1;
+    pub const KNOWN: u64 = (1 << 16) - 1;
 }
 
 /// The decoded fixed file header. A coarse rejection accelerator, not the authoritative aggregate source.

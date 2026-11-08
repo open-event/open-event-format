@@ -44,6 +44,7 @@ fn minimal_footer(mark: ColumnMark) -> Footer {
         dictionaries: Default::default(),
         embedding_row_offsets: Vec::new(),
         entity_hash_filters: Vec::new(),
+        entity_summary: None,
         escape_hatches: Vec::new(),
         exact_counts: ExactCounts {
             row_count: 1,
@@ -553,6 +554,7 @@ fn freetext_point_lookup_matches_whole_granule_decode_and_falls_back_identically
         },
         tenant_id: TenantId::new_test_id(3),
         time_series_bucket_nanos: None,
+        delivery_lineage: false,
     };
     let built = build_oe_file(rows.clone(), &config).unwrap();
     assert_ne!(
@@ -625,6 +627,7 @@ fn payload_path_and_payload_agree_on_a_freetext_declared_field() {
         },
         tenant_id: TenantId::new_test_id(3),
         time_series_bucket_nanos: None,
+        delivery_lineage: false,
     };
     let built = build_oe_file(rows.clone(), &config).unwrap();
     let file = OeFile::open(built.bytes, Some(&built.file_seal)).unwrap();
@@ -677,6 +680,7 @@ fn freetext_config() -> OeBuildConfig {
         },
         tenant_id: TenantId::new_test_id(3),
         time_series_bucket_nanos: None,
+        delivery_lineage: false,
     }
 }
 
@@ -934,6 +938,7 @@ fn cold_scan_never_initializes_the_search_cache_a_point_lookup_pays_for() {
         },
         tenant_id: TenantId::new_test_id(3),
         time_series_bucket_nanos: None,
+        delivery_lineage: false,
     };
     let built = build_oe_file(rows.clone(), &config).unwrap();
     // "amount" is present in every row with a consistent kind, so statistics-driven shredding picks it up
@@ -987,6 +992,7 @@ fn small_stripe_config(stripe_target_bytes: usize) -> OeBuildConfig {
         },
         tenant_id: TenantId::new_test_id(3),
         time_series_bucket_nanos: None,
+        delivery_lineage: false,
     }
 }
 
@@ -2179,6 +2185,7 @@ fn relationship_lookups_filter_threads_and_resolve_references() {
         },
         tenant_id: TenantId::new_test_id(3),
         time_series_bucket_nanos: None,
+        delivery_lineage: false,
     };
     let built = build_oe_file(rows, &config).unwrap();
     let file = OeFile::open(built.bytes, Some(&built.file_seal)).unwrap();
@@ -2267,6 +2274,7 @@ fn link_lookups_match_whole_references_only() {
         },
         tenant_id: TenantId::new_test_id(3),
         time_series_bucket_nanos: None,
+        delivery_lineage: false,
     };
     let built = build_oe_file(rows, &config).unwrap();
     let file = OeFile::open(built.bytes, Some(&built.file_seal)).unwrap();

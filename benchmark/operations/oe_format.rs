@@ -1447,6 +1447,7 @@ fn build_config(spec: &BenchmarkSpec, tenant_id: TenantId, lifecycle: BuildLifec
     OeBuildConfig {
         analytical_columns: Vec::new(),
         audit: None,
+        delivery_lineage: false,
         created_at_physical: OCCURRED_AT_ORIGIN_NANOS,
         footer_dek: None,
         footer_encryption: FooterEncryption::Plaintext,
@@ -1498,6 +1499,7 @@ fn oe_row(row: &BenchmarkRow, tenant_id: TenantId, strings: &mut RowStrings) -> 
         fields.push((strings.reactions.clone(), VariantValue::Int(reactions)));
     }
     BuildRow {
+        delivery: None,
         envelope: BuildEnvelope {
             account_id: None,
             account_id_hash_low: 0,

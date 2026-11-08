@@ -238,6 +238,7 @@ fn covering_manifest(segment: &LiveOverlaySegment) -> ManifestGeneration {
         files: vec![OeFileEntry {
             coverage: segment.range(),
             feature_metadata: None,
+            field_deletion_vectors: Vec::new(),
             file_seal: [0u8; 32],
             file_id: 0,
             file_type: FileType::OeFile,
@@ -258,6 +259,7 @@ fn covering_manifest(segment: &LiveOverlaySegment) -> ManifestGeneration {
         footer_mirror: None,
         generation: 1,
         index_artifacts: Vec::new(),
+        vector_segments: Vec::new(),
         retirements: Vec::new(),
     }
 }

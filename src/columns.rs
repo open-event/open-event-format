@@ -78,6 +78,14 @@ pub mod column_ids {
     pub const RAW_PAYLOAD: u32 = SOURCE_FORM_BASE;
     /// Stored as the id's lowercase hex, so any byte string up to 255 bytes fits a text column.
     pub const EXTERNAL_ID: u32 = SOURCE_FORM_BASE + 1;
+    /// The connector's source-format lineage (`protobuf:sha256:...`, say), kept only by a build that opts into
+    /// delivery lineage.
+    pub const SOURCE_SCHEMA: u32 = SOURCE_FORM_BASE + 2;
+    /// The connector's delivery identity string, kept only by a build that opts into delivery lineage.
+    pub const SOURCE_DELIVERY: u32 = SOURCE_FORM_BASE + 3;
+    /// The connector delivery hash as 32 lowercase hex digits (high half first), kept only by a build that opts into
+    /// delivery lineage and only for rows whose hash is not zero.
+    pub const CONNECTOR_DELIVERY_HASH: u32 = SOURCE_FORM_BASE + 4;
 }
 
 /// One column's static description.
@@ -389,6 +397,27 @@ pub const SOURCE_FORM_COLUMNS: &[ColumnSpec] = &[
         kind: ColumnKind::String,
         nullable: true,
         internal_only: false,
+    },
+    ColumnSpec {
+        column_id: column_ids::SOURCE_SCHEMA,
+        name: "source_schema",
+        kind: ColumnKind::String,
+        nullable: true,
+        internal_only: true,
+    },
+    ColumnSpec {
+        column_id: column_ids::SOURCE_DELIVERY,
+        name: "source_delivery",
+        kind: ColumnKind::String,
+        nullable: true,
+        internal_only: true,
+    },
+    ColumnSpec {
+        column_id: column_ids::CONNECTOR_DELIVERY_HASH,
+        name: "connector_delivery_hash",
+        kind: ColumnKind::String,
+        nullable: true,
+        internal_only: true,
     },
 ];
 

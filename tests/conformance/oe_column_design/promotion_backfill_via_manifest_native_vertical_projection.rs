@@ -23,6 +23,7 @@ fn historical_backfill_without_payload_rewrite() {
     let base_entry = OeFileEntry {
         coverage,
         feature_metadata: None,
+        field_deletion_vectors: Vec::new(),
         file_seal: base.file_seal,
         file_id: base.file_id,
         file_type: FileType::OeFile,
@@ -46,6 +47,7 @@ fn historical_backfill_without_payload_rewrite() {
     let sidecar_entry = OeFileEntry {
         coverage,
         feature_metadata: None,
+        field_deletion_vectors: Vec::new(),
         file_seal: [0xab; 32],
         file_id: base.file_id + 1,
         file_type: FileType::DerivedColumns,
@@ -102,6 +104,7 @@ fn compaction_folds_the_sidecar() {
     let base_entry = OeFileEntry {
         coverage,
         feature_metadata: None,
+        field_deletion_vectors: Vec::new(),
         file_seal: [0x11; 32],
         file_id: 101,
         file_type: FileType::OeFile,
@@ -122,6 +125,7 @@ fn compaction_folds_the_sidecar() {
     let sidecar_entry = OeFileEntry {
         coverage,
         feature_metadata: None,
+        field_deletion_vectors: Vec::new(),
         file_seal: [0x22; 32],
         file_id: 102,
         file_type: FileType::DerivedColumns,
@@ -157,6 +161,7 @@ fn compaction_folds_the_sidecar() {
     let consolidated = OeFileEntry {
         coverage,
         feature_metadata: None,
+        field_deletion_vectors: Vec::new(),
         file_seal: [0x33; 32],
         file_id: 103,
         file_type: FileType::OeFile,

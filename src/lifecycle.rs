@@ -106,6 +106,11 @@ pub struct OeFileEntry {
     /// Day-scoped service rollup payload. Valid only on `GenerationPart` entries with `part_index == 0`; must be
     /// `None` on all other entries.
     pub feature_metadata: Option<Vec<u8>>,
+    /// The file's saved field-level deletion vectors, current generation of each, so a query hides an erased
+    /// subject's fields of a multi-subject event while the row survives (see [`crate::field_deletion_store`]). Empty
+    /// when no field was ever redacted, and on entries written before they existed.
+    #[serde(default)]
+    pub field_deletion_vectors: Vec<crate::field_deletion_store::StoredFieldDeletionVector>,
     /// Authoritative domain-separated segment seal. Stripe payloads enter through their authenticated BLAKE3 roots,
     /// so publication does not hash the same large bytes again.
     pub file_seal: [u8; 32],
@@ -456,6 +461,11 @@ pub struct ManifestGeneration {
     /// When each `Outdated` or `DeleteOnDestroy` file entered that state, so the sweeper can tell how long it has
     /// waited. One record per retired file; it leaves with the file.
     pub retirements: Vec<Retirement>,
+    /// The vector segments riding this generation and the current generation of each one's deletes (see
+    /// [`crate::vector::publish_segment_deletes`]), so a search loads a segment's deletes from the manifest instead of
+    /// from wherever its caller kept them. Empty on manifests written before it existed.
+    #[serde(default)]
+    pub vector_segments: Vec<crate::vector::VectorSegmentEntry>,
 }
 
 /// When, and in which generation, a retired file entered its current state (`Outdated` or `DeleteOnDestroy`).

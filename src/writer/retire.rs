@@ -185,31 +185,7 @@ fn publish_in_place_of(
         &built,
         MIN_MULTIPART_PART_BYTES,
     )?;
-    let output = OeFileEntry {
-        coverage,
-        feature_metadata: None,
-        file_seal: built.file_seal,
-        file_id: built.file_id,
-        file_type: FileType::OeFile,
-        footer_len: Some(built.footer_len),
-        entity_summary: Some(built.entity_summary.clone()),
-        graph_event_id_filter: built
-            .footer
-            .graph
-            .as_ref()
-            .and_then(|graph| graph.event_ids.as_ref())
-            .map(|index| index.filter.clone()),
-        graph_summary: GraphFileSummary::of(&built.footer),
-        deletion_vector: None,
-        optional_feature_flags: built.footer.optional_feature_flags,
-        part_index: 0,
-        part_state: PartState::Active,
-        profile: built.footer.profile,
-        required_feature_flags: built.footer.required_feature_flags,
-        size_bytes: built.bytes.len() as u64,
-        tenant_id: config.tenant_id,
-        tree_len: built.tree_len,
-    };
+    let output = output_entry(&built, config, coverage);
 
     let mut head_id = 0;
     for _ in 0..=MAX_REBASE_ATTEMPTS {
@@ -262,6 +238,144 @@ fn publish_in_place_of(
     Err(PublishFailure::Publish(PublishError::CasLost {
         current_generation: head_id,
     }))
+}
+
+/// The `Active` catalogue entry for `built`, an uploaded compaction output covering `coverage`.
+fn output_entry(built: &BuiltOe, config: &OeBuildConfig, coverage: SequenceRange) -> OeFileEntry {
+    OeFileEntry {
+        coverage,
+        feature_metadata: None,
+        field_deletion_vectors: Vec::new(),
+        file_seal: built.file_seal,
+        file_id: built.file_id,
+        file_type: FileType::OeFile,
+        footer_len: Some(built.footer_len),
+        entity_summary: Some(built.entity_summary.clone()),
+        graph_event_id_filter: built
+            .footer
+            .graph
+            .as_ref()
+            .and_then(|graph| graph.event_ids.as_ref())
+            .map(|index| index.filter.clone()),
+        graph_summary: GraphFileSummary::of(&built.footer),
+        deletion_vector: None,
+        optional_feature_flags: built.footer.optional_feature_flags,
+        part_index: 0,
+        part_state: PartState::Active,
+        profile: built.footer.profile,
+        required_feature_flags: built.footer.required_feature_flags,
+        size_bytes: built.bytes.len() as u64,
+        tenant_id: config.tenant_id,
+        tree_len: built.tree_len,
+    }
+}
+
+/// One output of a graph rewrite: a file built from the rows of `inputs`, published in their place.
+pub struct GraphRewriteOutput {
+    pub built: BuiltOe,
+    /// The `Active` files the output replaces; their coverage must join into one contiguous range.
+    pub inputs: Vec<u128>,
+}
+
+impl OePublisher {
+    /// Publishes every output of one graph rewrite in a single new generation: each output becomes `Active` and every
+    /// one of its inputs `Outdated`, so readers never see a mix of renumbered and old files of a subject.
+    ///
+    /// Each output passes the checks [`publish_compaction`](Self::publish_compaction) makes of a single output: its
+    /// inputs are `Active` files of `config`'s tenant whose coverage joins into one range, it covers that range, and it
+    /// holds every row of its inputs except the ones their deletion vectors remove. Every output is uploaded before the
+    /// generation is written; a lost race rebases and retries, and a refused publication leaves the uploaded objects
+    /// unreferenced. Returns each output's publication, in order.
+    pub fn publish_graph_rewrite(
+        &mut self,
+        outputs: Vec<GraphRewriteOutput>,
+        config: &OeBuildConfig,
+        published: &mut dyn PublishedSet,
+        objects: &dyn ObjectStore,
+        notices: &mut dyn PeerNotices,
+        clock: &dyn Clock,
+    ) -> Result<Vec<Published>, PublishFailure> {
+        if outputs.is_empty() {
+            return Err(PublishFailure::Verification(
+                "a graph rewrite needs at least one output",
+            ));
+        }
+        let (_, head) = published.head().map_err(PublishFailure::Publish)?;
+        let mut staged = Vec::with_capacity(outputs.len());
+        for output in outputs {
+            if output.built.footer.profile != Profile::Graph {
+                return Err(PublishFailure::Verification(
+                    "a graph rewrite publishes graph files only",
+                ));
+            }
+            let coverage = merged_coverage(&head, &output.inputs, config.tenant_id)?;
+            self.verify_staged(&output.built, config, &coverage)?;
+            verify_rows_preserved(&output.built, &head, &output.inputs, config.tenant_id, objects)?;
+            staged.push((output, coverage));
+        }
+        let mut entries = Vec::with_capacity(staged.len());
+        for (output, coverage) in &staged {
+            upload_oe(
+                objects,
+                &oe_object_key(config.tenant_id, output.built.file_id),
+                &output.built,
+                MIN_MULTIPART_PART_BYTES,
+            )?;
+            entries.push(output_entry(&output.built, config, *coverage));
+        }
+        let finish = |generation: u64, staged: Vec<(GraphRewriteOutput, SequenceRange)>, entries: Vec<OeFileEntry>| {
+            staged
+                .into_iter()
+                .zip(entries)
+                .map(|((output, _), entry)| Published {
+                    entry,
+                    file_bytes: output.built.bytes,
+                    generation,
+                })
+                .collect()
+        };
+        let mut head_id = 0;
+        for _ in 0..=MAX_REBASE_ATTEMPTS {
+            let (current_id, head) = published.head().map_err(PublishFailure::Publish)?;
+            head_id = current_id;
+            if entries.iter().all(|entry| head.files.contains(entry)) {
+                return Ok(finish(head_id, staged, entries));
+            }
+            let next_id = head_id + 1;
+            let now = clock.now_nanos();
+            let mut next = ManifestGeneration {
+                footer_mirror: None,
+                generation: next_id,
+                ..head
+            };
+            for input in staged.iter().flat_map(|(output, _)| &output.inputs) {
+                let entry = next
+                    .files
+                    .iter_mut()
+                    .find(|entry| entry.file_id == *input && entry.part_state == PartState::Active)
+                    .ok_or(PublishFailure::Verification(
+                        "a compaction input is no longer an active file",
+                    ))?;
+                debug_assert!(entry.part_state.can_transition_to(PartState::Outdated));
+                entry.part_state = PartState::Outdated;
+                next.retirements.push(Retirement {
+                    file_id: *input,
+                    generation: next_id,
+                    since_nanos: now,
+                });
+            }
+            next.files.extend(entries.iter().cloned());
+            if commit(published, head_id, next)? {
+                for entry in &entries {
+                    notices.oe_published(entry);
+                }
+                return Ok(finish(next_id, staged, entries));
+            }
+        }
+        Err(PublishFailure::Publish(PublishError::CasLost {
+            current_generation: head_id,
+        }))
+    }
 }
 
 /// Retires inbox files every recipient has acknowledged in full: publishes one generation in which each file named in

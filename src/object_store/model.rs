@@ -78,6 +78,10 @@ pub(crate) struct GenerationDelta {
     pub(crate) retirements: Vec<Retirement>,
     /// Entries that are new since the checkpoint or whose contents (such as their state) changed since it.
     pub(crate) upserted_files: Vec<OeFileEntry>,
+    /// The generation's vector segment catalogue, stored whole (one small entry per segment). Absent on deltas written
+    /// before the catalogue existed, which carried none.
+    #[serde(default)]
+    pub(crate) vector_segments: Vec<crate::vector::VectorSegmentEntry>,
 }
 
 impl GenerationDelta {
@@ -98,6 +102,7 @@ impl GenerationDelta {
             removed_file_ids,
             retirements: next.retirements.clone(),
             upserted_files,
+            vector_segments: next.vector_segments.clone(),
         }
     }
 
@@ -116,6 +121,7 @@ impl GenerationDelta {
                 |artifact| artifact.object_key.clone(),
             ),
             retirements: self.retirements,
+            vector_segments: self.vector_segments,
         }
     }
 }

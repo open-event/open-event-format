@@ -158,6 +158,7 @@ fn config(index_granularity: usize, granule_bytes: usize, stripe_target_bytes: u
         },
         tenant_id: TenantId::new_test_id(TENANT),
         time_series_bucket_nanos: None,
+        delivery_lineage: false,
     }
 }
 
@@ -218,6 +219,7 @@ fn entry(built: &BuiltOe) -> OeFileEntry {
             last_sequence: built.footer.exact_counts.row_count,
         },
         feature_metadata: None,
+        field_deletion_vectors: Vec::new(),
         file_seal: built.file_seal,
         file_id: built.file_id,
         file_type: FileType::OeFile,

@@ -18,6 +18,7 @@ use crate::deletes::{CorrectionMetadata, CorrectionType, DeletionVector};
 use crate::error::{EntityScanError, FormatError};
 use crate::events::variant::VariantValue;
 use crate::events::{EventEnvelope, EventId, SequencePoint, TenantId};
+use crate::field_deletion_store::FieldRedactions;
 use arrow_array::UInt64Array;
 use hashbrown::HashMap;
 use std::ops::RangeInclusive;
@@ -35,6 +36,17 @@ pub trait DeletesAndCorrections {
     /// scan reads the mark on a replaced row as its supersession and still serves the replacement. A mark on a row
     /// whose payload would be served, including an amended original, always drops the event.
     fn deletion_vector(&self, tenant_id: TenantId, file_id: u128) -> Result<Option<DeletionVector>, EntityScanError>;
+
+    /// The field-level redactions of the stored file `file_id`, in its own row ordinals, or `None` when no field of
+    /// it is redacted. A scan serves an affected row with its redacted fields read as `Null`, and withholds a payload
+    /// it cannot redact in place. Defaults to none, for a store that records no field-level deletes.
+    fn field_redactions(
+        &self,
+        _tenant_id: TenantId,
+        _file_id: u128,
+    ) -> Result<Option<FieldRedactions>, EntityScanError> {
+        Ok(None)
+    }
 
     /// True when the event at `point` was written as a correction of another event. A scan serves it in place of the
     /// event it corrects, never a second time at its own place.
@@ -138,9 +150,14 @@ impl EntityScan {
             .iter()
             .map(|file| deletes.deletion_vector(self.tenant_id, file.header().file_id))
             .collect::<Result<Vec<_>, _>>()?;
+        let redactions = files
+            .iter()
+            .map(|file| deletes.field_redactions(self.tenant_id, file.header().file_id))
+            .collect::<Result<Vec<_>, _>>()?;
         let mut reader = EventReader {
             envelopes: HashMap::new(),
             files: &files,
+            redactions: &redactions,
             segments: &segments,
         };
         let mut events = Vec::new();
@@ -300,6 +317,8 @@ impl EntityScan {
 struct EventReader<'a> {
     envelopes: HashMap<(usize, u32), Vec<EventEnvelope>>,
     files: &'a [&'a OeFile],
+    /// Each file's field redactions, by the same index as `files`; applied to every payload read from a file row.
+    redactions: &'a [Option<FieldRedactions>],
     segments: &'a [&'a LiveOverlaySegment],
 }
 
@@ -327,7 +346,12 @@ impl EventReader<'_> {
                     .and_then(|envelopes| envelopes.get(row_in_granule))
                     .cloned()
                     .ok_or(FormatError::RefOutOfRange { what: "row in granule" })?;
-                Ok((envelope, file.payload(row_ordinal)?))
+                let payload = file.payload(row_ordinal)?;
+                let payload = match self.redactions.get(index).and_then(Option::as_ref) {
+                    Some(redactions) => redactions.redact_payload(row_ordinal, payload),
+                    None => payload,
+                };
+                Ok((envelope, payload))
             }
             RowSource::Overlay { row, segment } => self
                 .segments

@@ -139,6 +139,7 @@ fn config(profile: Profile, bucket_nanos: Option<i64>) -> OeBuildConfig {
         },
         tenant_id: TenantId::new_test_id(5),
         time_series_bucket_nanos: bucket_nanos,
+        delivery_lineage: false,
     }
 }
 

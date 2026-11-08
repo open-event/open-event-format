@@ -95,6 +95,7 @@ fn file(rows: u64, rows_per_granule: usize) -> OeFile {
         },
         tenant_id: TenantId::new_test_id(3),
         time_series_bucket_nanos: None,
+        delivery_lineage: false,
     };
     let built = build_oe_file((0..rows).map(row).collect(), &config).unwrap();
     OeFile::open(built.bytes, Some(&built.file_seal)).unwrap()
@@ -362,7 +363,10 @@ fn a_live_scan_skips_fully_deleted_granules_and_marks_untouched_ones() {
     let expected: Vec<u32> = granules.iter().copied().filter(|id| *id != granules[1]).collect();
     assert_eq!(ids, expected, "the emptied granule is never scanned");
     for (batch, selection) in &seen {
-        let same = reference.iter().find(|other| other.granule_id == batch.granule_id).unwrap();
+        let same = reference
+            .iter()
+            .find(|other| other.granule_id == batch.granule_id)
+            .unwrap();
         assert_eq!(batch.row_count, same.row_count);
         for (column, other) in batch.columns.iter().zip(&same.columns) {
             assert_eq!(flatten(column), flatten(other));

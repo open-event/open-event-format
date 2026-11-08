@@ -9,6 +9,7 @@ fn entry(file_id: u128, first_sequence: u64, size_bytes: u64, part_state: PartSt
             last_sequence: first_sequence + 99,
         },
         feature_metadata: None,
+        field_deletion_vectors: Vec::new(),
         file_seal: [0u8; 32],
         file_id,
         file_type: FileType::OeFile,
@@ -34,6 +35,7 @@ fn generation(files: Vec<OeFileEntry>) -> ManifestGeneration {
         footer_mirror: None,
         generation: 1,
         index_artifacts: Vec::new(),
+        vector_segments: Vec::new(),
         retirements: Vec::new(),
     }
 }

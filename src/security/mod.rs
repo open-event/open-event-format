@@ -27,11 +27,13 @@ use std::mem::size_of;
 use std::sync::{Arc, Mutex, PoisonError};
 
 pub use state_chunk::*;
+pub use subject_fields::*;
 pub use subject_keys::*;
 pub use subject_payload::*;
 
 mod constant;
 mod state_chunk;
+mod subject_fields;
 mod subject_keys;
 mod subject_payload;
 
@@ -324,6 +326,10 @@ impl fmt::Debug for TenantDek {
 #[derive(Clone)]
 pub struct ContentKey(zeroize::Zeroizing<[u8; KEY_LEN]>);
 
+// Every clone of a content key owns its own `Zeroizing` copy of the material, scrubbed when that clone drops, so a key
+// cloned out of a key store never leaves its material behind in freed memory.
+impl zeroize::ZeroizeOnDrop for ContentKey {}
+
 impl ContentKey {
     /// Wraps a content key around [`KEY_LEN`] bytes of key material.
     pub fn new(key_material: [u8; KEY_LEN]) -> Self {
@@ -470,6 +476,9 @@ pub struct SealedContentKey {
     /// different plaintext under one nonce — exactly the AES-GCM reuse this type exists to prevent.
     state: Arc<Mutex<SealState>>,
 }
+
+// The only secret a sealing key holds is its `ContentKey`, which scrubs itself on drop (per clone).
+impl zeroize::ZeroizeOnDrop for SealedContentKey {}
 
 /// The mutable sealing progress for one content key: the epoch the next seal derives its nonce from, and every nonce
 /// already sealed under this key. Held behind a lock and shared by clones so nonce uniqueness holds no matter how many

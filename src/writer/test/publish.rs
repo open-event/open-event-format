@@ -70,6 +70,7 @@ fn build_config() -> OeBuildConfig {
         targets: LayoutTargets::default(),
         tenant_id: TenantId::new_test_id(9),
         time_series_bucket_nanos: None,
+        delivery_lineage: false,
     }
 }
 
@@ -340,6 +341,7 @@ fn covering_entry(range: SequenceRange, tenant: TenantId, part_state: PartState)
     OeFileEntry {
         coverage: range,
         feature_metadata: None,
+        field_deletion_vectors: Vec::new(),
         file_seal: [0u8; 32],
         file_id: 0,
         file_type: FileType::OeFile,
@@ -817,6 +819,7 @@ fn publish_is_not_short_circuited_by_another_tenants_covering_entry() {
     let other_tenant_entry = OeFileEntry {
         coverage: range,
         feature_metadata: None,
+        field_deletion_vectors: Vec::new(),
         file_seal: [7u8; 32],
         file_id: 999,
         file_type: FileType::OeFile,
@@ -886,6 +889,7 @@ fn manifest_covering(range: SequenceRange, tenant_id: TenantId) -> ManifestGener
         files: vec![OeFileEntry {
             coverage: range,
             feature_metadata: None,
+            field_deletion_vectors: Vec::new(),
             file_seal: [0u8; 32],
             file_id: 1,
             file_type: FileType::OeFile,

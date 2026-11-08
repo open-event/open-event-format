@@ -6,6 +6,10 @@ edition = "2024"
 rust-version = "1.96"
 publish = false
 
+[lib]
+# The library has no benchmarks of its own; without this `cargo bench` builds its unit tests, which need `write`.
+bench = false
+
 [features]
 write = []
 
@@ -50,6 +54,9 @@ zeekstd = "0.6.2"
 zeroize = "1"
 zstd = "0.13.3"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 aes-gcm = "0.11.1"
 
@@ -68,10 +75,12 @@ tempfile = "3"
 
 [[bench]]
 name = "encoding"
+path = "benchmark/micro/encoding.rs"
 harness = false
 
 [[bench]]
 name = "vector"
+path = "benchmark/micro/vector.rs"
 harness = false
 
 [lints.rust]

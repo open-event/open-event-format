@@ -9,6 +9,7 @@ use crate::object_store::sim::SimObjectStore;
 use crate::security::{FileSubjectKeyStore, SubjectPayloadRead, TenantDek, read_subject_payload};
 use crate::typed_id::TypedIdTestExt;
 use crate::writer::build::BuildRow;
+use crate::writer::build::{BuildInput, OeRow};
 use crate::writer::merge::execute_compaction;
 use crate::writer::merge::tests::{START_NANOS, build_config, payload_of, publish_built, rows_of};
 use crate::writer::publish::NoopPeerNotices;
