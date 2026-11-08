@@ -15,7 +15,7 @@
 
 ## What is OE?
 
-OE is the storage engine for events. Events first land in **OEJ**, an append-only journal that is the durable record, then get packed into **OE** files: immutable, self-describing column files for analytical queries. Everything is checksummed end to end, so corruption is always caught and never served.
+OE is a file format for events. Events first land in **OEJ**, an append-only journal that is the durable record, then get packed into **OE** files: immutable, self-describing column files for analytical queries. Everything is checksummed end to end, so corruption is always caught and never served.
 
 - **Built for events, not generic tables**: Every file carries a full event envelope (ids, streams, tenants, sequence numbers, timestamps, relationships) next to a schemaless variant payload, with vector columns for embeddings stored alongside events.
 - **Durable journal**: OEJ writes append-only frames, each acknowledged only after sync. 172,879 events/s at 128-event batches with a 1.322 ms p99 ack.
