@@ -70,6 +70,84 @@ fn select(data: &ColumnData, strategy: CascadeStrategy) -> crate::encoding::Enco
     encode_block_replayed_with(data, true, strategy, None, None, true).0
 }
 
+/// The classic path's whole-block decode and view decode of a stored block: the stage undone into the classic body,
+/// then that body parsed. `None` wherever it refuses.
+fn classic_decodes(pipeline: PipelineId, stored: &[u8]) -> (Option<ColumnData>, Option<Vec<Option<String>>>) {
+    let mut body = Vec::new();
+    if decompress_into(stored, &mut body, &SoftwareDecompressor).is_err() {
+        return (None, None);
+    }
+    let column = crate::encoding::decode_block_shared_with_body(pipeline, &body, None).ok();
+    let views = crate::encoding::decode_string_block_views_with_body(
+        pipeline,
+        pipeline.transform().unwrap(),
+        &body,
+        None,
+        None,
+    )
+    .ok()
+    .flatten()
+    .map(|array| array.iter().map(|value| value.map(str::to_owned)).collect());
+    (column, views)
+}
+
+/// The direct decodes of a stored block equal the classic path's, refusals included.
+fn assert_direct_matches_classic(pipeline: PipelineId, stored: &[u8]) {
+    let (column, views) = classic_decodes(pipeline, stored);
+    assert_eq!(decode_block(pipeline, stored).ok(), column);
+    let direct_views = crate::encoding::decode_string_block_views(pipeline, stored)
+        .ok()
+        .flatten()
+        .map(|array| array.iter().map(|value| value.map(str::to_owned)).collect::<Vec<_>>());
+    assert_eq!(direct_views, views);
+}
+
+/// Stores `relaid` as a block of `tag` claiming a `classic_len` classic body, without checking it restores.
+fn store_relaid(tag: u8, relaid: &[u8], classic_len: u32) -> Vec<u8> {
+    let mut out = classic_len.to_le_bytes().to_vec();
+    out.push(tag);
+    out.extend_from_slice(&crate::encoding::compress_zstd_framed(relaid, 3));
+    out
+}
+
+#[test]
+fn direct_decode_matches_the_classic_path_on_malformed_relaid_bodies() {
+    let cases = [
+        (
+            Transform::RawString,
+            column(&[Some("ab".into()), None, Some(String::new()), Some("é".into())]),
+        ),
+        (Transform::DictionaryString, column(&rooms(1500))),
+    ];
+    for (transform, data) in cases {
+        let (classic_bytes, side) = classic(transform, &data);
+        let (tag, relaid) = relay(transform, side, &classic_bytes).unwrap();
+        let pipeline = PipelineId::new(transform, Compression::StringZstd, ValueKind::String).with_side_stream(side);
+        let classic_len = classic_bytes.len() as u32;
+        assert_direct_matches_classic(pipeline, &store_relaid(tag, &relaid, classic_len));
+        // Every truncation, with the classic length kept or adjusted by the bytes cut.
+        for cut in 0..relaid.len() {
+            let head = relaid.get(..cut).unwrap();
+            for claim in [classic_len, classic_len - (relaid.len() - cut) as u32] {
+                assert_direct_matches_classic(pipeline, &store_relaid(tag, head, claim));
+            }
+        }
+        // Every single-byte change: a zero, a stray byte, invalid UTF-8.
+        for position in 0..relaid.len() {
+            for byte in [0u8, b'x', 0xff] {
+                let mut mutated = relaid.clone();
+                *mutated.get_mut(position).unwrap() = byte;
+                assert_direct_matches_classic(pipeline, &store_relaid(tag, &mutated, classic_len));
+            }
+        }
+        // Trailing bytes, and the other tag.
+        let mut longer = relaid.clone();
+        longer.push(0);
+        assert_direct_matches_classic(pipeline, &store_relaid(tag, &longer, classic_len + 1));
+        assert_direct_matches_classic(pipeline, &store_relaid(tag ^ 1, &relaid, classic_len));
+    }
+}
+
 fn round_trip_stage(transform: Transform, data: &ColumnData) {
     let (classic_bytes, side) = classic(transform, data);
     let stored = compress(transform, side, &classic_bytes, 3).expect("a relayout for this body");
@@ -82,6 +160,11 @@ fn round_trip_stage(transform: Transform, data: &ColumnData) {
         classic_bytes
     );
     assert_eq!(&decode_block(pipeline, &stored).unwrap(), data);
+    assert_direct_matches_classic(pipeline, &stored);
+    assert!(
+        with_relaid(transform, side, &stored, |_| Ok(())).unwrap().is_some(),
+        "the direct path is taken"
+    );
     let ColumnData::Strings(values) = data else {
         unreachable!("string fixtures")
     };
