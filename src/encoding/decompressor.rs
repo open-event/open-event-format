@@ -53,7 +53,7 @@ pub(crate) fn with_inflate_buffer<R>(decode: impl FnOnce(&mut Vec<u8>) -> R) -> 
 /// capacity — no byte is zeroed only to be overwritten — and the buffer's length becomes what the context reports
 /// written, never more. Output that is not exactly `expected` bytes long is a forged or truncated block, and refuses:
 /// a block is never served zero-padded or cut short.
-fn zstd_decompress_into(body: &[u8], expected: usize, plain: &mut Vec<u8>) -> Result<(), FormatError> {
+pub(crate) fn zstd_decompress_into(body: &[u8], expected: usize, plain: &mut Vec<u8>) -> Result<(), FormatError> {
     plain.clear();
     plain.reserve_exact(expected);
     let written = ZSTD_CONTEXT
@@ -147,6 +147,7 @@ impl Decompressor for SoftwareDecompressor {
             }
             Compression::Deflate => super::deflate::decompress_into(bytes, plain)?,
             Compression::SeekableZstd => super::seekable_zstd::decompress_all_into(bytes, plain)?,
+            Compression::StringZstd => super::string_zstd::decompress_into(bytes, plain, self)?,
             Compression::Lz4 => {
                 let mut reader = Reader::new(bytes);
                 let uncompressed_len = reader.u32("lz4 uncompressed length")? as usize;

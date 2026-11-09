@@ -627,8 +627,9 @@ fn external_ids_that_do_not_repeat_the_event_id_declare_no_elision() {
 fn a_reader_from_before_elision_refuses_the_file_and_a_stray_sentinel_is_an_error() {
     let (rows, _) = mixed_elision_rows();
     let built = build_oe_file(rows, &source_form_config(3)).unwrap();
-    // The occurred-relative `ingested_at` bit is a later, orthogonal one these rows happen to use.
-    let pre_elision_known: u64 = ((1 << 32) - 1) | required_features::OCCURRED_RELATIVE_INGESTED_AT;
+    // The occurred-relative `ingested_at` and 32-bit external-id index bits are later, orthogonal ones these rows use.
+    let pre_elision_known: u64 =
+        ((1 << 32) - 1) | required_features::OCCURRED_RELATIVE_INGESTED_AT | required_features::EXTERNAL_ID_INDEX_32;
     let declared = built.footer.required_feature_flags;
     assert_eq!(
         declared & !pre_elision_known,
@@ -668,5 +669,39 @@ fn elided_external_id_reads_decode_each_granule_once() {
         file.column_block_reads(),
         before,
         "external-id and event-id blocks are cached"
+    );
+}
+
+#[test]
+fn ids_sharing_a_32_bit_index_key_are_told_apart_by_confirmation() {
+    // Find two ids whose stable hashes share their high 32 bits (birthday bound: well under a million tries).
+    let mut seen = std::collections::HashMap::new();
+    let (a, b) = (0u64..4_000_000)
+        .find_map(|i| {
+            let id = format!("id-{i}").into_bytes();
+            let key = crate::indexes::stable_hash(&id) >> 32;
+            seen.insert(key, id.clone()).map(|other| (other, id))
+        })
+        .expect("a 32-bit key collision among four million ids");
+    assert_ne!(crate::indexes::stable_hash(&a), crate::indexes::stable_hash(&b));
+    let rows = vec![with_id(0, &a), with_id(1, b"$other"), with_id(2, &b), with_id(3, &a)];
+    let built = build_oe_file(rows, &source_form_config(2)).unwrap();
+    let declared = built.footer.required_feature_flags;
+    assert_ne!(declared & required_features::EXTERNAL_ID_INDEX_32, 0);
+    // A reader that predates the 32-bit index refuses the file instead of silently finding nothing.
+    let pre_index_known = required_features::KNOWN & !required_features::EXTERNAL_ID_INDEX_32;
+    assert_eq!(declared & !pre_index_known, required_features::EXTERNAL_ID_INDEX_32);
+    let file = OeFile::open(built.bytes, Some(&built.file_seal)).unwrap();
+    assert_eq!(file.rows_with_external_id(&a).unwrap(), vec![0, 3]);
+    assert_eq!(file.rows_with_external_id(&b).unwrap(), vec![2]);
+    assert_eq!(file.row_by_external_id(b"$other").unwrap(), Some(1));
+}
+
+#[test]
+fn a_file_without_external_ids_does_not_declare_the_32_bit_index() {
+    let built = build_oe_file(vec![plain_row(0), plain_row(1)], &source_form_config(2)).unwrap();
+    assert_eq!(
+        built.footer.required_feature_flags & required_features::EXTERNAL_ID_INDEX_32,
+        0
     );
 }

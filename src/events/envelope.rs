@@ -163,6 +163,26 @@ pub struct EventEnvelope {
     pub trace_id_hash_low: u64,
 }
 
+/// The `(entity_id_hash_low, entity_id_hash_high)` pair derived from an entity id: the low half is
+/// [`stable_hash`](crate::indexes::stable_hash) of the id's UTF-8 bytes and the high half is zero; an absent id derives
+/// `(0, 0)`. A writer may omit the stored entity hash columns from a file only when every row's hashes equal this
+/// derivation (required feature `ENTITY_HASH_COLUMNS_ELIDED`), and a reader of such a file recomputes them from
+/// `entity_id` with this function, so the derivation is frozen with the hash.
+pub fn derived_entity_id_hash(entity_id: Option<&str>) -> (u64, u64) {
+    match entity_id {
+        Some(id) => (crate::indexes::stable_hash(id.as_bytes()), 0),
+        None => (0, 0),
+    }
+}
+
+impl EventEnvelope {
+    /// Whether this envelope's entity hashes are exactly [`derived_entity_id_hash`] of its `entity_id`, so a file
+    /// holding it may omit the stored hash columns.
+    pub fn entity_hash_is_derived(&self) -> bool {
+        derived_entity_id_hash(self.entity_id.as_deref()) == (self.entity_id_hash_low, self.entity_id_hash_high)
+    }
+}
+
 #[cfg(test)]
 #[path = "test/envelope.rs"]
 mod tests;

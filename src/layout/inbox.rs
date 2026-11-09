@@ -10,6 +10,7 @@
 //! See: oe-file-layout/spec.md
 
 use super::entity_scan::{DeletesAndCorrections, EntityEvent};
+use super::event::{entity_hash_columns_elided, read_entity_hashes};
 use super::footer::{GranuleEntry, InboxRecipientEntry};
 use super::optional_features;
 use super::reader::scan::ScanColumn;
@@ -148,14 +149,20 @@ fn read_rows(
     // leaves untouched needs no per-row deletion test.
     let no_deletes = DeletionVector::new();
     let granule_ids: Vec<u32> = granules.iter().map(|granule| granule.granule_id).collect();
-    let columns = [
-        column_ids::EPOCH,
-        column_ids::SEQUENCE,
-        column_ids::ENTITY_ID_HASH_LOW,
-        column_ids::ENTITY_ID_HASH_HIGH,
-    ];
+    // A file that omits the entity hash blocks has its recipient hashes derived from `entity_id`, per granule.
+    let elided = entity_hash_columns_elided(file);
+    let columns: &[u32] = if elided {
+        &[column_ids::EPOCH, column_ids::SEQUENCE]
+    } else {
+        &[
+            column_ids::EPOCH,
+            column_ids::SEQUENCE,
+            column_ids::ENTITY_ID_HASH_LOW,
+            column_ids::ENTITY_ID_HASH_HIGH,
+        ]
+    };
     file.scan_projected_serial_live_redacted(
-        &columns,
+        columns,
         &granule_ids,
         deleted.unwrap_or(&no_deletes),
         redactions,
@@ -170,16 +177,20 @@ fn read_rows(
                 .ok_or(FormatError::RefOutOfRange {
                     what: "scanned granule missing from the granule directory",
                 })?;
-            let [epochs, sequences, lows, highs] = <[Vec<u64>; 4]>::try_from(
-                batch
-                    .columns
-                    .into_iter()
-                    .map(|column| scanned_u64s(column, rows))
-                    .collect::<Result<Vec<_>, _>>()?,
-            )
-            .map_err(|_| FormatError::Structural {
-                rule: "a scan batch holds one block per projected column",
-            })?;
+            let mut scanned = batch
+                .columns
+                .into_iter()
+                .map(|column| scanned_u64s(column, rows))
+                .collect::<Result<Vec<_>, _>>()?;
+            if elided {
+                let (lows, highs) = read_entity_hashes(file, batch.granule_id, rows)?;
+                scanned.push(lows);
+                scanned.push(highs);
+            }
+            let [epochs, sequences, lows, highs] =
+                <[Vec<u64>; 4]>::try_from(scanned).map_err(|_| FormatError::Structural {
+                    rule: "a scan batch holds one block per projected column",
+                })?;
             let mut envelopes = None;
             let keys = epochs.iter().zip(&sequences).zip(lows.iter().zip(&highs));
             for (row_in_granule, ((&epoch, &sequence), (&low, &high))) in keys.enumerate() {

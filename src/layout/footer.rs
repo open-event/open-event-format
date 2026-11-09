@@ -128,6 +128,15 @@ pub mod sections {
     /// Optional: the file's external-id index in its packed form (see [`encode_external_ids_packed`]). Writers emit
     /// it in place of the legacy fixed-width `EXTERNAL_IDS` section; readers accept either.
     pub const EXTERNAL_IDS_PACKED: u32 = 43;
+    /// Optional: the file's external-id index keyed on 32-bit hashes (see [`encode_external_ids_32`]). Writers emit
+    /// it when every entry's hash is truncated to its high 32 bits; a file carrying it declares the
+    /// `EXTERNAL_ID_INDEX_32` required feature, since a reader that ignored it would silently find no id.
+    pub const EXTERNAL_IDS_32: u32 = 44;
+    /// Optional: file-scope dictionary alphabets stored Zstandard-compressed (see [`super::PackedSharedDictionary`]),
+    /// for columns whose alphabet is the union of every granule's values rather than one repeated set. A file carrying
+    /// it declares the `PACKED_SHARED_DICTIONARIES` required feature, since a reader that ignored it could resolve no
+    /// shared-scope block of those columns.
+    pub const PACKED_SHARED_DICTIONARIES: u32 = 45;
 }
 
 /// Logical column kind codes (stored in the column directory).
@@ -343,7 +352,9 @@ pub struct StateRootEntry {
 
 /// One row's entry in the file's external-id index: a stable hash of the id and the row that carries it. The footer
 /// keeps the entries sorted by `(id_hash, row_ordinal)`, so finding an id is a binary search; two ids can share a
-/// hash, so a reader confirms every hit against the stored id before answering.
+/// hash, so a reader confirms every hit against the stored id before answering. Lookups compare only the high 32
+/// bits ([`ExternalIdEntry::key`]): current writers store the hash truncated to them (low 32 bits zero), and an
+/// older file's full hashes, sorted by the full value, are sorted by the high bits too.
 ///
 /// See: oe-query-metadata-and-indexes/spec.md
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -351,6 +362,18 @@ pub struct ExternalIdEntry {
     /// [`stable_hash`](crate::indexes::stable_hash) of the id's bytes.
     pub id_hash: u64,
     pub row_ordinal: u64,
+}
+
+impl ExternalIdEntry {
+    /// The 32-bit lookup key: the high half of `id_hash`.
+    pub fn key(&self) -> u32 {
+        (self.id_hash >> 32) as u32
+    }
+
+    /// The index hash current writers store for an id hash: its high 32 bits, low 32 bits zero.
+    pub fn truncated_hash(id_hash: u64) -> u64 {
+        id_hash & !0xFFFF_FFFF
+    }
 }
 
 /// One recipient's rows in an inbox file: where they start, how many there are, and the newest queue position among
@@ -512,6 +535,143 @@ pub struct SharedDictionaryEntry {
     /// Sorted ascending and deduplicated — the same order block-local dictionaries use, so codes keep the ascending
     /// sorted-order assignment in every scope.
     pub values: Vec<String>,
+}
+
+/// One column's file-scope dictionary alphabet held Zstandard-compressed (footer section `PACKED_SHARED_DICTIONARIES`):
+/// the same sorted, deduplicated values as a [`SharedDictionaryEntry`], for a column whose alphabet is the union of
+/// every granule's values — wide enough that storing it plainly, and expanding it on every open, would cost more than
+/// it saves. The footer keeps it compressed; a reader expands it with [`Self::values`] only when a block of the column
+/// is first resolved.
+///
+/// The compressed plaintext is `value_count` little-endian `u16` lengths, then every value's bytes back to back.
+///
+/// See: oe-encodings-and-compression/spec.md
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackedSharedDictionary {
+    pub column_id: u32,
+    pub value_count: u32,
+    /// Length of the decompressed plaintext, checked exactly on expansion.
+    pub plain_len: u32,
+    /// The Zstandard frame holding the plaintext.
+    pub compressed: Vec<u8>,
+}
+
+/// Largest plaintext a packed shared dictionary may claim: the decompression buffer is reserved up front, so a forged
+/// claim must not drive an unbounded allocation. Far above any alphabet the writer emits.
+pub const PACKED_SHARED_DICTIONARY_MAX_PLAIN_BYTES: u32 = 1 << 28;
+
+/// Zstandard level the writer compresses packed shared dictionaries at: the alphabet is written once per file and
+/// read once per open, so a slower level that shrinks it further is worth its build time.
+const PACKED_SHARED_DICTIONARY_ZSTD_LEVEL: i32 = 19;
+
+impl PackedSharedDictionary {
+    /// Packs a sorted, deduplicated alphabet whose every value fits a `u16` length. `None` when a value does not, or
+    /// the plaintext would exceed [`PACKED_SHARED_DICTIONARY_MAX_PLAIN_BYTES`].
+    pub fn pack(column_id: u32, values: &[String]) -> Option<Self> {
+        let mut plain = Vec::with_capacity(values.len() * 2 + values.iter().map(String::len).sum::<usize>());
+        for value in values {
+            plain.extend_from_slice(&u16::try_from(value.len()).ok()?.to_le_bytes());
+        }
+        for value in values {
+            plain.extend_from_slice(value.as_bytes());
+        }
+        let plain_len = u32::try_from(plain.len())
+            .ok()
+            .filter(|len| *len <= PACKED_SHARED_DICTIONARY_MAX_PLAIN_BYTES)?;
+        let compressed = zstd::bulk::compress(&plain, PACKED_SHARED_DICTIONARY_ZSTD_LEVEL).ok()?;
+        Some(Self {
+            column_id,
+            value_count: u32::try_from(values.len()).ok()?,
+            plain_len,
+            compressed,
+        })
+    }
+
+    /// Expands the alphabet into its values, refusing everything [`Self::text`] refuses.
+    pub fn values(&self) -> Result<Vec<String>, FormatError> {
+        Ok(self.text()?.to_values())
+    }
+
+    /// Decompresses the alphabet into one validated text arena, without allocating per value — enough to translate a
+    /// predicate into code space. Refuses a frame that does not decompress to exactly `plain_len` bytes, lengths that
+    /// do not account for the plaintext exactly, invalid UTF-8 (or a value boundary inside a character), and values
+    /// that are not strictly ascending.
+    pub fn text(&self) -> Result<SharedAlphabetText, FormatError> {
+        let count = self.value_count as usize;
+        let plain_len = self.plain_len as usize;
+        if self.plain_len > PACKED_SHARED_DICTIONARY_MAX_PLAIN_BYTES || count.saturating_mul(2) > plain_len {
+            return Err(FormatError::Structural {
+                rule: "packed shared dictionary plaintext length out of range",
+            });
+        }
+        let mut plain = Vec::new();
+        crate::encoding::decompressor::zstd_decompress_into(&self.compressed, plain_len, &mut plain)?;
+        let (lengths, text) = plain.split_at_checked(count * 2).ok_or(FormatError::Structural {
+            rule: "packed shared dictionary plaintext length out of range",
+        })?;
+        let text = simdutf8::basic::from_utf8(text).map_err(|_| FormatError::InvalidUtf8 {
+            what: "shared dictionary value",
+        })?;
+        let mut ends: Vec<u32> = Vec::with_capacity(count);
+        let mut start = 0usize;
+        let mut previous: Option<&str> = None;
+        for pair in lengths.chunks_exact(2) {
+            let len = match pair {
+                [lo, hi] => usize::from(u16::from_le_bytes([*lo, *hi])),
+                _ => 0,
+            };
+            let end = start + len;
+            let value = text.get(start..end).ok_or(FormatError::Structural {
+                rule: "packed shared dictionary lengths do not split its text into values",
+            })?;
+            if previous.is_some_and(|previous| previous >= value) {
+                return Err(FormatError::Structural {
+                    rule: "shared dictionary alphabet must be strictly ascending",
+                });
+            }
+            previous = Some(value);
+            // `end` is at most `plain_len`, itself bounded far below `u32::MAX`.
+            ends.push(end as u32);
+            start = end;
+        }
+        if start != text.len() {
+            return Err(FormatError::Structural {
+                rule: "packed shared dictionary has trailing bytes",
+            });
+        }
+        Ok(SharedAlphabetText {
+            text: text.to_owned(),
+            ends,
+        })
+    }
+}
+
+/// A packed shared dictionary's values held as one text arena and each value's end offset: validated, sorted, and
+/// cheap to build, since no value is allocated on its own. See [`PackedSharedDictionary::text`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedAlphabetText {
+    text: String,
+    ends: Vec<u32>,
+}
+
+impl SharedAlphabetText {
+    /// Every value, in alphabet (code) order, borrowed from the arena.
+    pub fn entries(&self) -> Vec<&str> {
+        let mut start = 0usize;
+        self.ends
+            .iter()
+            .map(|&end| {
+                let value = self.text.get(start..end as usize).unwrap_or_default();
+                start = end as usize;
+                value
+            })
+            .collect()
+    }
+
+    /// Every value as an owned string, in alphabet (code) order.
+    pub fn to_values(&self) -> Vec<String> {
+        self.entries().into_iter().map(str::to_owned).collect()
+    }
 }
 
 /// One schema-declared free-text field shredded by declaration into the free-text columnar family.
@@ -711,6 +871,10 @@ pub struct Footer {
     pub required_feature_flags: u64,
     pub schema_fingerprint: [u8; 32],
     pub shared_dictionaries: Vec<SharedDictionaryEntry>,
+    /// File-scope alphabets kept compressed until a reader first resolves a block of their column. Non-empty exactly
+    /// when the file declares the `PACKED_SHARED_DICTIONARIES` required feature; no column appears both here and in
+    /// `shared_dictionaries`.
+    pub packed_shared_dictionaries: Vec<PackedSharedDictionary>,
     pub shredded: Vec<ShredEntry>,
     /// A snapshot file's key index. `None` in every other file, and in a snapshot file that does not declare
     /// `SNAPSHOT_KEY_INDEX`.
@@ -1267,9 +1431,17 @@ fn encode_sections(footer: &Footer) -> SectionArea {
 
     // The external-id index: optional, emitted only when some row carries an external id.
     if !footer.external_ids.is_empty() {
-        sections.push(sections::EXTERNAL_IDS_PACKED, |out| {
-            encode_external_ids_packed(&footer.external_ids, out);
-        });
+        // Truncated hashes (every writer since `EXTERNAL_ID_INDEX_32`) take the 32-bit form; full hashes, which only
+        // a footer built by hand or by an older writer holds, keep the lossless 64-bit form.
+        if footer.external_ids.iter().all(|e| e.id_hash & 0xFFFF_FFFF == 0) {
+            sections.push(sections::EXTERNAL_IDS_32, |out| {
+                encode_external_ids_32(&footer.external_ids, out);
+            });
+        } else {
+            sections.push(sections::EXTERNAL_IDS_PACKED, |out| {
+                encode_external_ids_packed(&footer.external_ids, out);
+            });
+        }
     }
 
     // The inbox recipient directory: optional, emitted only for an inbox file.
@@ -1325,6 +1497,20 @@ fn encode_sections(footer: &Footer) -> SectionArea {
                     out.put_u16(value.len() as u16);
                     out.put_slice(value.as_bytes());
                 }
+            }
+        });
+    }
+
+    // Compressed file-scope alphabets: optional, emitted only for union alphabets some block recorded the scope of.
+    if !footer.packed_shared_dictionaries.is_empty() {
+        sections.push(sections::PACKED_SHARED_DICTIONARIES, |out| {
+            out.put_u32(footer.packed_shared_dictionaries.len() as u32);
+            for entry in &footer.packed_shared_dictionaries {
+                out.put_u32(entry.column_id);
+                out.put_u32(entry.value_count);
+                out.put_u32(entry.plain_len);
+                out.put_u32(entry.compressed.len() as u32);
+                out.put_slice(&entry.compressed);
             }
         });
     }
@@ -1694,6 +1880,105 @@ pub fn decode_external_ids_packed(bytes: &[u8]) -> Result<Vec<ExternalIdEntry>, 
                 row_ordinal: 0,
             });
         })?;
+        left -= n;
+    }
+    let bytes = r.take(packed_len(count, ordinal_width)?, "external id rows")?;
+    let mut slots = entries.iter_mut();
+    unpack_bits(bytes, ordinal_width, count, |row| {
+        if let Some(entry) = slots.next() {
+            entry.row_ordinal = row;
+        }
+    })?;
+    if r.remaining() != 0 {
+        return Err(FormatError::Structural {
+            rule: "external id index has trailing bytes",
+        });
+    }
+    Ok(entries)
+}
+
+/// 32-bit external-id index (section `EXTERNAL_IDS_32`): the layout of [`encode_external_ids_packed`] with every
+/// hash replaced by its high 32 bits ([`ExternalIdEntry::key`]): `count u32`, then when `count > 0`:
+/// `ordinal_width u8 | first_key u32`, then the `count - 1` key deltas in blocks of 128 as `width u8 |
+/// ceil(n * width / 8) bytes` (width at most 32), then all row ordinals packed at `ordinal_width` bits. Keys are
+/// non-decreasing, so deltas never wrap. The caller keeps entries sorted by key; low hash bits are dropped.
+pub fn encode_external_ids_32(entries: &[ExternalIdEntry], out: &mut Writer) {
+    out.put_u32(entries.len() as u32);
+    let Some(first) = entries.first() else {
+        return;
+    };
+    let max_ordinal = entries.iter().map(|entry| entry.row_ordinal).max().unwrap_or(0);
+    let ordinal_width = bit_width(max_ordinal);
+    out.put_u8(ordinal_width);
+    out.put_u32(first.key());
+    let deltas: Vec<u64> = entries
+        .windows(2)
+        .map(|pair| match pair {
+            [a, b] => u64::from(b.key().wrapping_sub(a.key())),
+            _ => 0,
+        })
+        .collect();
+    for block in deltas.chunks(EXTERNAL_ID_BLOCK) {
+        let width = block.iter().copied().map(bit_width).max().unwrap_or(0);
+        out.put_u8(width);
+        let mut packer = BitPacker::new();
+        for &delta in block {
+            packer.put(delta, width);
+        }
+        out.put_slice(&packer.finish());
+    }
+    let mut packer = BitPacker::new();
+    for entry in entries {
+        packer.put(entry.row_ordinal, ordinal_width);
+    }
+    out.put_slice(&packer.finish());
+}
+
+/// Decodes [`encode_external_ids_32`] into entries whose `id_hash` holds the key in its high 32 bits. Refuses
+/// truncated input, a delta width above 32, an ordinal width above 64, keys past 32 bits, and trailing bytes.
+pub fn decode_external_ids_32(bytes: &[u8]) -> Result<Vec<ExternalIdEntry>, FormatError> {
+    let mut r = Reader::new(bytes);
+    let count = r.u32("external id count")? as usize;
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let ordinal_width = r.u8("external id ordinal width")?;
+    let mut key = u64::from(r.u32("external id first key")?);
+    // Each delta block costs at least its width byte, so the block count bounds the entry count before allocating.
+    let blocks = (count - 1).div_ceil(EXTERNAL_ID_BLOCK);
+    if blocks > r.remaining() || ordinal_width > 64 {
+        return Err(FormatError::Structural {
+            rule: "external id count exceeds input",
+        });
+    }
+    let mut entries = Vec::with_capacity(count);
+    entries.push(ExternalIdEntry {
+        id_hash: key << 32,
+        row_ordinal: 0,
+    });
+    let mut left = count - 1;
+    while left > 0 {
+        let n = left.min(EXTERNAL_ID_BLOCK);
+        let width = r.u8("external id delta width")?;
+        if width > 32 {
+            return Err(FormatError::Structural {
+                rule: "external id key delta width exceeds 32",
+            });
+        }
+        let bytes = r.take(packed_len(n, width)?, "external id deltas")?;
+        // Every delta is below 2^32 and the key is checked after each block, so the u64 sum cannot overflow.
+        unpack_bits(bytes, width, n, |delta| {
+            key += delta;
+            entries.push(ExternalIdEntry {
+                id_hash: key << 32,
+                row_ordinal: 0,
+            });
+        })?;
+        if key > u64::from(u32::MAX) {
+            return Err(FormatError::Structural {
+                rule: "external id key exceeds 32 bits",
+            });
+        }
         left -= n;
     }
     let bytes = r.take(packed_len(count, ordinal_width)?, "external id rows")?;
@@ -2294,7 +2579,9 @@ pub fn decode_footer(blob: &[u8]) -> Result<Footer, FormatError> {
 
     // The external-id index: optional. The packed form wins; the legacy fixed 16-byte-entry form still opens.
     let mut external_ids = Vec::new();
-    if let Some(index_bytes) = decode_section(&directory, section_area, sections::EXTERNAL_IDS_PACKED)? {
+    if let Some(index_bytes) = decode_section(&directory, section_area, sections::EXTERNAL_IDS_32)? {
+        external_ids = decode_external_ids_32(index_bytes)?;
+    } else if let Some(index_bytes) = decode_section(&directory, section_area, sections::EXTERNAL_IDS_PACKED)? {
         external_ids = decode_external_ids_packed(index_bytes)?;
     } else if let Some(index_bytes) = decode_section(&directory, section_area, sections::EXTERNAL_IDS)? {
         let mut r = Reader::new(index_bytes);
@@ -2412,6 +2699,59 @@ pub fn decode_footer(blob: &[u8]) -> Result<Footer, FormatError> {
             }
             shared_dictionaries.push(SharedDictionaryEntry { column_id, values });
         }
+    }
+
+    // Compressed file-scope alphabets: optional. Only their framing is checked here; each one is expanded — and its
+    // values validated — when a reader first resolves a block of its column, so opening a file never pays for it.
+    let mut packed_shared_dictionaries: Vec<PackedSharedDictionary> = Vec::new();
+    if let Some(packed_bytes) = decode_section(&directory, section_area, sections::PACKED_SHARED_DICTIONARIES)? {
+        let mut r = Reader::new(packed_bytes);
+        let count = r.u32("packed shared dictionary count")? as usize;
+        // Each entry: column id, value count, plaintext length, and compressed length, 4 bytes each.
+        let count = bounded_count(count, 16, &r, "packed shared dictionary count exceeds input")?;
+        packed_shared_dictionaries = Vec::with_capacity(count);
+        for _ in 0..count {
+            let column_id = r.u32("packed shared dictionary column")?;
+            let value_count = r.u32("packed shared dictionary value count")?;
+            let plain_len = r.u32("packed shared dictionary plaintext length")?;
+            let compressed_len = r.u32("packed shared dictionary compressed length")? as usize;
+            let compressed = r.take(compressed_len, "packed shared dictionary bytes")?.to_vec();
+            if plain_len > PACKED_SHARED_DICTIONARY_MAX_PLAIN_BYTES || u64::from(value_count) * 2 > u64::from(plain_len)
+            {
+                return Err(FormatError::Structural {
+                    rule: "packed shared dictionary plaintext length out of range",
+                });
+            }
+            if shared_dictionaries.iter().any(|entry| entry.column_id == column_id)
+                || packed_shared_dictionaries
+                    .iter()
+                    .any(|entry| entry.column_id == column_id)
+            {
+                return Err(FormatError::Structural {
+                    rule: "a column carries more than one shared dictionary alphabet",
+                });
+            }
+            packed_shared_dictionaries.push(PackedSharedDictionary {
+                column_id,
+                value_count,
+                plain_len,
+                compressed,
+            });
+        }
+        if r.remaining() != 0 {
+            return Err(FormatError::Structural {
+                rule: "packed shared dictionary section has trailing bytes",
+            });
+        }
+    }
+    // A reader that predates the section would skip it and then miss every alphabet in it, so the section is valid
+    // only under its required bit.
+    if !packed_shared_dictionaries.is_empty()
+        && required_feature_flags & required_features::PACKED_SHARED_DICTIONARIES == 0
+    {
+        return Err(FormatError::Structural {
+            rule: "packed shared dictionaries without their required feature",
+        });
     }
 
     // The sparse shredded key set: optional, bounded like every counted section.
@@ -2724,6 +3064,7 @@ pub fn decode_footer(blob: &[u8]) -> Result<Footer, FormatError> {
         required_feature_flags,
         schema_fingerprint,
         shared_dictionaries,
+        packed_shared_dictionaries,
         shredded,
         snapshot_keys,
         sparse_keys,

@@ -205,7 +205,8 @@ fn graph_and_xor_float_fixtures_open_here_and_are_refused_by_older_readers() {
     assert_eq!(sweep.opened, ["oe-v1.0-graph.oe", "oe-v1.0-time-series-xor-floats.oe"]);
 
     assert_eq!(
-        open_as_reader_knowing(&graph.bytes, PRE_GRAPH_KNOWN).unwrap_err(),
+        // The 32-bit external-id index bit is a later, orthogonal one the graph rows happen to use.
+        open_as_reader_knowing(&graph.bytes, PRE_GRAPH_KNOWN | required_features::EXTERNAL_ID_INDEX_32).unwrap_err(),
         FormatError::UnknownRequiredFeature {
             bits: required_features::GRAPH
         }

@@ -389,6 +389,50 @@ fn mutated_packed_fsst_block_never_panics() {
     }
 }
 
+/// Flips bytes across valid relaid whole-block Zstandard string blocks (raw arena and dictionary) and truncates them:
+/// every read path refuses or answers, never panics, and every truncation is refused by a whole-block decode.
+#[test]
+fn mutated_string_zstd_block_never_panics() {
+    for distinct in [8_000u64, 300] {
+        let mut values = super::encoding::StringColumn::new();
+        for i in 0..8_192u64 {
+            values.push(
+                (i % 11 != 0)
+                    .then(|| format!("!room{}:example.org", i * 37 % distinct))
+                    .as_deref(),
+            );
+        }
+        let block = super::encoding::encode_block_replayed_with(
+            &ColumnData::Strings(values),
+            true,
+            super::encoding::CascadeStrategy::DecodeOptimized,
+            None,
+            None,
+            true,
+        )
+        .0;
+        assert_eq!(
+            block.pipeline.compression().unwrap(),
+            super::encoding::Compression::StringZstd
+        );
+        assert!(decode_block(block.pipeline, &block.bytes).is_ok());
+        let mut rng = XorShift(43);
+        for position in (0..block.bytes.len()).step_by(7) {
+            let mut mutated = block.bytes.clone();
+            mutated[position] ^= (rng.next() as u8) | 1;
+            let _ = decode_block(block.pipeline, &mutated);
+            let _ = super::encoding::decode_block_range(block.pipeline, &mutated, 3, 90);
+            let _ = super::encoding::take_block_rows(block.pipeline, &mutated, &[0, 5, 399]);
+            let _ = super::encoding::decode_string_block_views(block.pipeline, &mutated);
+            let equals = super::encoding::predicate::StringPredicate::Equals("!room37:example.org".to_owned());
+            let _ = super::encoding::predicate::filter_string_block(block.pipeline, &mutated, &equals);
+        }
+        for cut in (0..block.bytes.len()).step_by(13) {
+            assert!(decode_block(block.pipeline, &block.bytes[..cut]).is_err());
+        }
+    }
+}
+
 /// Flips bytes across a valid occurred-relative `ingested_at` body and truncates it: resolving it against its
 /// `occurred_at` refuses or answers, never panics, and every truncation is refused.
 #[test]
@@ -415,5 +459,81 @@ fn mutated_occurred_residual_block_never_panics() {
     }
     for cut in 0..block.bytes.len() {
         assert!(super::encoding::resolve_occurred_residual(&block.bytes[..cut], &occurred).is_err());
+    }
+}
+
+/// Flips bytes across a valid file that omits its entity hash columns: opening it and reading its envelopes, which
+/// derive each row's entity hashes from `entity_id`, refuses or answers, never panics.
+#[cfg(feature = "write")]
+#[test]
+fn mutated_entity_hash_elided_file_never_panics() {
+    let rows: Vec<_> = (0..40u64)
+        .map(|i| {
+            let mut row = plain_row(i);
+            row.envelope.entity_id = Some(format!("room-{}", i % 3));
+            let (low, high) = super::events::derived_entity_id_hash(row.envelope.entity_id.as_deref());
+            row.envelope.entity_id_hash_low = low;
+            row.envelope.entity_id_hash_high = high;
+            row
+        })
+        .collect();
+    let built = build_oe_file(rows, &source_form_config(8)).unwrap();
+    let file = OeFile::open(built.bytes.clone(), None).unwrap();
+    assert_ne!(
+        file.footer().required_feature_flags & super::layout::required_features::ENTITY_HASH_COLUMNS_ELIDED,
+        0
+    );
+    assert!(file.granule_envelopes(0).is_ok());
+    let mut rng = XorShift(47);
+    let mut position = 0usize;
+    while position < built.bytes.len() {
+        let mut mutated = built.bytes.clone();
+        mutated[position] ^= (rng.next() as u8) | 1;
+        if let Ok(file) = OeFile::open(mutated, None) {
+            for granule in file.footer().granules.iter().take(2) {
+                let _ = file.granule_envelopes(granule.granule_id);
+            }
+        }
+        position += 13;
+    }
+}
+
+/// Flips bytes across a compressed union alphabet (footer section `PACKED_SHARED_DICTIONARIES`) and truncates it, with
+/// the checksum recomputed: the footer decoder refuses or answers, and expanding every alphabet it accepts — what a
+/// reader does on first use — refuses or answers, never panics. Every truncation is refused by the footer decoder.
+#[cfg(feature = "write")]
+#[test]
+fn mutated_packed_shared_dictionary_section_never_panics() {
+    use super::layout::footer::PackedSharedDictionary;
+    let rows: Vec<_> = (0..16u64).map(plain_row).collect();
+    let mut footer = build_oe_file(rows, &source_form_config(8)).unwrap().footer;
+    let values: Vec<String> = (0..200).map(|id| format!("!room{id:06}:example.org")).collect();
+    footer.packed_shared_dictionaries = vec![
+        PackedSharedDictionary::pack(15, &values).unwrap(),
+        PackedSharedDictionary::pack(16, &["a".to_owned(), "é".to_owned()]).unwrap(),
+    ];
+    footer.required_feature_flags |= super::layout::required_features::PACKED_SHARED_DICTIONARIES;
+    let blob = encode_footer(&footer);
+    let decoded = decode_footer(&blob).unwrap();
+    assert_eq!(decoded.packed_shared_dictionaries[0].values().unwrap(), values);
+    let (entries, area) = footer_sections(&blob);
+    let id = sections::PACKED_SHARED_DICTIONARIES;
+    let (_, offset, len) = entries.iter().copied().find(|entry| entry.0 == id).unwrap();
+    let body = &area[offset..offset + len];
+    let mut rng = XorShift(59);
+    for position in 0..body.len() {
+        let mut mutated = body.to_vec();
+        mutated[position] ^= (rng.next() as u8) | 1;
+        if let Ok(footer) = decode_footer(&with_section(&blob, id, &mutated)) {
+            for entry in &footer.packed_shared_dictionaries {
+                let _ = entry.values();
+            }
+        }
+    }
+    for cut in 0..body.len() {
+        assert!(
+            decode_footer(&with_section(&blob, id, &body[..cut])).is_err(),
+            "cut at {cut}"
+        );
     }
 }

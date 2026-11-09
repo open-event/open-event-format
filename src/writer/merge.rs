@@ -201,11 +201,23 @@ fn read_stored_rows(file: &OeFile, redactions: Option<&FieldRedactions>) -> Resu
         let sources = u64s(column_ids::SOURCE_ID)?;
         let event_types = u64s(column_ids::EVENT_TYPE_ID)?;
         let entity_types = u64s(column_ids::ENTITY_TYPE_ID)?;
-        let entity_low = u64s(column_ids::ENTITY_ID_HASH_LOW)?;
-        let entity_high = u64s(column_ids::ENTITY_ID_HASH_HIGH)?;
         let flags = u64s(column_ids::FLAGS)?;
         let schema_versions = u64s(column_ids::SCHEMA_VERSION)?;
         let entity_ids = strings(column_ids::ENTITY_ID)?;
+        // A file that omits the entity hash blocks derives each row's hashes from its `entity_id`.
+        let (entity_low, entity_high): (Vec<u64>, Vec<u64>) =
+            if file.footer().required_feature_flags & crate::layout::required_features::ENTITY_HASH_COLUMNS_ELIDED != 0
+            {
+                entity_ids
+                    .iter()
+                    .map(|id| crate::events::derived_entity_id_hash(id.as_deref()))
+                    .unzip()
+            } else {
+                (
+                    u64s(column_ids::ENTITY_ID_HASH_LOW)?,
+                    u64s(column_ids::ENTITY_ID_HASH_HIGH)?,
+                )
+            };
         let actor_ids = strings(column_ids::ACTOR_ID)?;
         let account_ids = strings(column_ids::ACCOUNT_ID)?;
         let actor_low = u64s(column_ids::ACTOR_ID_HASH_LOW)?;

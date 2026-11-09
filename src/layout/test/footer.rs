@@ -64,6 +64,7 @@ fn minimal_footer() -> Footer {
         required_feature_flags: 0,
         schema_fingerprint: [0u8; 32],
         shared_dictionaries: Vec::new(),
+        packed_shared_dictionaries: Vec::new(),
         shredded: Vec::new(),
         snapshot_keys: None,
         sparse_keys: Vec::new(),
@@ -1733,4 +1734,221 @@ fn entity_summary_section_round_trips_and_requires_its_optional_feature() {
     // A footer without the section (an older file) reads as no summary.
     let decoded = decode_footer(&encode_footer(&minimal_footer())).unwrap();
     assert_eq!(decoded.entity_summary, None);
+}
+
+fn key_entry(key: u32, row_ordinal: u64) -> ExternalIdEntry {
+    entry(u64::from(key) << 32, row_ordinal)
+}
+
+fn external_id_32_round_trip(entries: Vec<ExternalIdEntry>) {
+    let mut footer = minimal_footer();
+    footer.external_ids = entries;
+    let sections = encode_sections(&footer);
+    if !footer.external_ids.is_empty() {
+        assert!(
+            sections
+                .directory
+                .iter()
+                .any(|(id, _)| *id == sections::EXTERNAL_IDS_32)
+        );
+        assert!(
+            !sections
+                .directory
+                .iter()
+                .any(|(id, _)| *id == sections::EXTERNAL_IDS_PACKED)
+        );
+    }
+    let decoded = decode_footer(&encode_footer(&footer)).expect("footer decodes without error");
+    assert_eq!(decoded.external_ids, footer.external_ids);
+    let mut out = Writer::new();
+    encode_external_ids_32(&footer.external_ids, &mut out);
+    assert_eq!(
+        decode_external_ids_32(out.bytes()).expect("32-bit index decodes"),
+        footer.external_ids
+    );
+}
+
+#[test]
+fn external_id_32_index_round_trips_edge_cases() {
+    external_id_32_round_trip(Vec::new());
+    external_id_32_round_trip(vec![key_entry(0, 0)]);
+    external_id_32_round_trip(vec![key_entry(u32::MAX, u64::MAX)]);
+    external_id_32_round_trip(vec![key_entry(5, 1), key_entry(5, 2), key_entry(5, 9), key_entry(6, 0)]);
+    external_id_32_round_trip(vec![key_entry(0, 0), key_entry(1, 1), key_entry(u32::MAX, 2)]);
+    let mut keys: Vec<u32> = (0..1000u32).map(|i| i.wrapping_mul(0x9E37_79B9)).collect();
+    keys.extend(std::iter::repeat_n(7, 300));
+    keys.sort_unstable();
+    external_id_32_round_trip(
+        keys.into_iter()
+            .enumerate()
+            .map(|(i, k)| key_entry(k, i as u64))
+            .collect(),
+    );
+}
+
+#[test]
+fn external_id_32_index_is_compact_and_rejects_hostile_input() {
+    let mut sorted: Vec<_> = (0..10_000u64)
+        .map(|i| {
+            entry(
+                ExternalIdEntry::truncated_hash(i.wrapping_mul(0x9E37_79B9_7F4A_7C15)),
+                i,
+            )
+        })
+        .collect();
+    sorted.sort_by_key(|e| (e.id_hash, e.row_ordinal));
+    let mut out = Writer::new();
+    encode_external_ids_32(&sorted, &mut out);
+    assert!(out.len() < sorted.len() * 5, "32-bit index is {} bytes", out.len());
+    let bytes = out.into_bytes();
+    let mut forged = bytes.clone();
+    forged.splice(0..4, u32::MAX.to_le_bytes());
+    assert!(decode_external_ids_32(&forged).is_err());
+    for len in 0..64 {
+        assert!(decode_external_ids_32(bytes.get(..len).unwrap_or_default()).is_err());
+    }
+    assert!(decode_external_ids_32(bytes.get(..bytes.len() - 1).unwrap_or_default()).is_err());
+    let mut trailing = bytes.clone();
+    trailing.push(0);
+    assert!(decode_external_ids_32(&trailing).is_err());
+    // count 2, ordinal width 0, first key 0, then a delta width of 33.
+    let mut wide = vec![2, 0, 0, 0, 0, 0, 0, 0, 0, 33];
+    wide.extend_from_slice(&[0; 5]);
+    assert!(decode_external_ids_32(&wide).is_err());
+    // An ordinal width above 64.
+    assert!(decode_external_ids_32(&[1, 0, 0, 0, 65, 0, 0, 0, 0]).is_err());
+    // Keys that climb past 32 bits: first key u32::MAX, then a delta of 1.
+    let overflow = [2, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 1, 1];
+    assert!(decode_external_ids_32(&overflow).is_err());
+}
+
+#[test]
+fn full_hash_indexes_keep_the_64_bit_section_and_the_32_bit_section_wins() {
+    // Full hashes (an older writer's) round trip losslessly through section 43.
+    let mut footer = minimal_footer();
+    footer.external_ids = vec![entry(3, 0), entry(9, 4)];
+    let sections = encode_sections(&footer);
+    assert!(
+        sections
+            .directory
+            .iter()
+            .any(|(id, _)| *id == sections::EXTERNAL_IDS_PACKED)
+    );
+    assert!(
+        !sections
+            .directory
+            .iter()
+            .any(|(id, _)| *id == sections::EXTERNAL_IDS_32)
+    );
+    // When a footer carries both, the 32-bit section answers.
+    let mut both = SectionArea {
+        bytes: Writer::new(),
+        directory: Vec::new(),
+    };
+    for (id, range) in &sections.directory {
+        let bytes = sections.bytes.bytes().get(range.clone()).unwrap_or_default().to_vec();
+        both.push(*id, |out| out.put_slice(&bytes));
+    }
+    let truncated = vec![key_entry(1, 0), key_entry(2, 4)];
+    both.push(sections::EXTERNAL_IDS_32, |out| encode_external_ids_32(&truncated, out));
+    let decoded = decode_footer(&assemble_footer(&footer, both)).expect("footer decodes");
+    assert_eq!(decoded.external_ids, truncated);
+}
+
+/// Release-mode decode timing for one million entries: `cargo test --release --all-features -- --ignored
+/// external_id_index_decode_timing --nocapture`.
+#[test]
+#[ignore = "release-mode external-id index decode timing"]
+fn external_id_index_decode_timing() {
+    let n = 1_000_000u64;
+    let mut full: Vec<_> = (0..n)
+        .map(|i| entry(crate::indexes::stable_hash(&i.to_le_bytes()), i))
+        .collect();
+    full.sort_unstable_by_key(|e| (e.id_hash, e.row_ordinal));
+    let mut short: Vec<_> = full
+        .iter()
+        .map(|e| entry(ExternalIdEntry::truncated_hash(e.id_hash), e.row_ordinal))
+        .collect();
+    short.sort_unstable_by_key(|e| (e.id_hash, e.row_ordinal));
+    let mut packed = Writer::new();
+    encode_external_ids_packed(&full, &mut packed);
+    let mut narrow = Writer::new();
+    encode_external_ids_32(&short, &mut narrow);
+    for _ in 0..3 {
+        let t = std::time::Instant::now();
+        let a = decode_external_ids_packed(packed.bytes()).unwrap();
+        let t43 = t.elapsed();
+        let t = std::time::Instant::now();
+        let b = decode_external_ids_32(narrow.bytes()).unwrap();
+        let t44 = t.elapsed();
+        assert_eq!((a.len(), b.len()), (full.len(), short.len()));
+        println!(
+            "section 43: {} B ({:.2} B/entry) {:?}; section 44: {} B ({:.2} B/entry) {:?}",
+            packed.len(),
+            packed.len() as f64 / n as f64,
+            t43,
+            narrow.len(),
+            narrow.len() as f64 / n as f64,
+            t44
+        );
+    }
+}
+
+/// A compressed union alphabet round-trips through the footer still compressed, expands to exactly the values it
+/// packed, and refuses — on expansion, never by panicking — a forged frame, a plaintext-length claim, lengths that do
+/// not split the text, and out-of-order values. Decoding the footer checks only the framing: a column carried twice
+/// is refused there.
+#[test]
+fn a_packed_shared_dictionary_round_trips_and_refuses_forgeries_when_expanded() {
+    let values: Vec<String> = (0..300).map(|id| format!("!room{id:06}:example.org")).collect();
+    let packed = PackedSharedDictionary::pack(15, &values).expect("an alphabet of short values packs");
+    assert!(packed.compressed.len() < values.iter().map(String::len).sum::<usize>() / 4);
+    let mut footer = minimal_footer();
+    footer.packed_shared_dictionaries = vec![packed.clone()];
+    // The section is valid only under its required bit.
+    assert!(decode_footer(&encode_footer(&footer)).is_err());
+    footer.required_feature_flags |= crate::layout::required_features::PACKED_SHARED_DICTIONARIES;
+    let decoded = decode_footer(&encode_footer(&footer)).expect("a packed alphabet decodes");
+    assert_eq!(decoded.packed_shared_dictionaries, footer.packed_shared_dictionaries);
+    assert_eq!(decoded.packed_shared_dictionaries[0].values().unwrap(), values);
+    assert_eq!(
+        packed.text().unwrap().entries(),
+        values.iter().map(String::as_str).collect::<Vec<_>>()
+    );
+
+    let mut wrong_len = packed.clone();
+    wrong_len.plain_len += 1;
+    assert!(wrong_len.values().is_err());
+    let mut huge = packed.clone();
+    huge.plain_len = PACKED_SHARED_DICTIONARY_MAX_PLAIN_BYTES + 1;
+    assert!(huge.values().is_err());
+    let mut forged = packed.clone();
+    forged.compressed = vec![0xFF; 16];
+    assert!(forged.values().is_err());
+    let mut miscounted = packed.clone();
+    miscounted.value_count -= 1;
+    assert!(miscounted.values().is_err());
+    let unsorted = PackedSharedDictionary::pack(15, &["b".to_owned(), "a".to_owned()]).unwrap();
+    assert!(unsorted.values().is_err());
+    let duplicated = PackedSharedDictionary::pack(15, &["a".to_owned(), "a".to_owned()]).unwrap();
+    assert!(duplicated.values().is_err());
+    // A value boundary inside a multi-byte character is refused, not sliced.
+    let mut split = PackedSharedDictionary::pack(15, &["é".to_owned()]).unwrap();
+    let mut plain = vec![1u8, 0];
+    plain.extend_from_slice("é".as_bytes());
+    plain.push(b'x');
+    split.compressed = zstd::bulk::compress(&plain, 3).unwrap();
+    split.plain_len = plain.len() as u32;
+    assert!(split.values().is_err());
+    assert!(PackedSharedDictionary::pack(15, &["x".repeat(usize::from(u16::MAX) + 1)]).is_none());
+
+    // One column cannot carry two alphabets.
+    footer.shared_dictionaries = vec![SharedDictionaryEntry {
+        column_id: 15,
+        values: vec!["a".to_owned()],
+    }];
+    assert!(decode_footer(&encode_footer(&footer)).is_err());
+    footer.shared_dictionaries.clear();
+    footer.packed_shared_dictionaries = vec![packed.clone(), packed];
+    assert!(decode_footer(&encode_footer(&footer)).is_err());
 }

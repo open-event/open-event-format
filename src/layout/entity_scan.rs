@@ -9,7 +9,7 @@
 //!
 //! See: oe-apis/spec.md
 
-use super::event::{overlay_column, read_u64s};
+use super::event::{overlay_column, read_entity_hashes, read_u64s};
 use super::footer::SortDirection;
 use super::reader::{OeFile, PayloadRead};
 use crate::artifacts::overlay::{LiveOverlaySegment, LiveOverlayStore};
@@ -247,8 +247,7 @@ impl EntityScan {
             let rows = granule.row_count as usize;
             let epochs = read_u64s(file, column_ids::EPOCH, granule.granule_id, rows)?;
             let sequences = read_u64s(file, column_ids::SEQUENCE, granule.granule_id, rows)?;
-            let lows = read_u64s(file, column_ids::ENTITY_ID_HASH_LOW, granule.granule_id, rows)?;
-            let highs = read_u64s(file, column_ids::ENTITY_ID_HASH_HIGH, granule.granule_id, rows)?;
+            let (lows, highs) = read_entity_hashes(file, granule.granule_id, rows)?;
             let keys = epochs.iter().zip(&sequences).zip(lows.iter().zip(&highs));
             for (row_in_granule, ((&epoch, &sequence), (&low, &high))) in keys.enumerate() {
                 let point = SequencePoint { epoch, sequence };

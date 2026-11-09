@@ -465,6 +465,14 @@ pub const SPARSE_SHRED_MIN_PRESENCE_PERCENT: u32 = 5;
 /// alphabet; beyond it every block keeps its own dictionary.
 pub const SHARED_DICTIONARY_MAX_VALUES: usize = 1024;
 
+/// Columns whose file-scope alphabet may be the union of every granule's values rather than one repeated set: the
+/// entity id, which equality lookups probe granule by granule and whose per-granule dictionaries otherwise repeat the
+/// same ids over and over. Such an alphabet is stored compressed in the footer (`PACKED_SHARED_DICTIONARIES`).
+pub const UNION_SHARED_DICTIONARY_COLUMNS: [u32; 1] = [column_ids::ENTITY_ID];
+
+/// Largest union alphabet a column may share; past it every block keeps its own dictionary or FSST form.
+pub const UNION_SHARED_DICTIONARY_MAX_VALUES: usize = 1 << 20;
+
 /// Pinned per-file budget on sparse shredded keys, so footer metadata cannot grow without limit; a qualifying path
 /// past the budget simply stays residual.
 pub const SPARSE_KEYS_PER_FILE_MAX: usize = 16;

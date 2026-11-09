@@ -90,6 +90,7 @@ fn minimal_footer(mark: ColumnMark) -> Footer {
         required_feature_flags: required_features::ALL,
         schema_fingerprint: [0u8; 32],
         shared_dictionaries: Vec::new(),
+        packed_shared_dictionaries: Vec::new(),
         shredded: Vec::new(),
         snapshot_keys: None,
         sparse_keys: Vec::new(),
@@ -138,6 +139,7 @@ fn file_with_mark(mark: ColumnMark, bytes: Vec<u8>, usable_optional_features: u6
         point_probe_counts: DashMap::default(),
         residual_seek_tables: DashMap::default(),
         shared_alphabets: HashMap::new(),
+        packed_shared_alphabets: HashMap::new(),
         shared_string_views: DashMap::new(),
         snapshot_first_keys_in_order: false,
         stripe_position_by_id: HashMap::new(),
@@ -835,6 +837,8 @@ fn batched_reads_over_long_text_agree_and_fsst_plaintext_size_matches_decode() {
     // Granules of 24 rows: enough values per block for the encoder to pick FSST over raw.
     let mut config = freetext_config();
     config.targets.index_granularity = 24;
+    // Without a trailing stage the free text keeps FSST rather than the whole-block Zstandard string stage.
+    config.lifecycle = BuildLifecycle::FreshPublicationWithoutTrailing;
     let built = build_oe_file(rows, &config).unwrap();
     let file = OeFile::open(built.bytes, Some(&built.file_seal)).unwrap();
     let refs: Vec<PayloadRef> = [40, 1, 2, 3, 5, 3, 47, 12, 13, 14, 15, 0, 30, 31]

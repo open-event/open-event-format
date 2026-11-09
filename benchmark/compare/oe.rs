@@ -11,6 +11,7 @@ use oe::columns::{FreetextDeclaration, PromotionPlan, column_ids};
 use oe::encoding::{ColumnData, SideStream, decode_block, take_block_rows};
 use oe::encoding::predicate::{
     NumericPredicate, StringPredicate, filter_numeric_block_or_decode, filter_string_block_or_decode,
+    filter_string_block_shared,
 };
 use oe::events::variant::VariantValue;
 use oe::deletes::{DeletionVector, encode_deletion_vector};
@@ -285,15 +286,21 @@ impl OeReader {
         let fold_ids: Vec<u32> = query.fold.iter().map(|n| self.column_id(n)).collect::<Result<_>>()?;
         let mut total = Partial::default();
         let entity_test = StringPredicate::Equals(entity_value.to_owned());
+        // The id is looked up once in the file's entity alphabet (when the file shares one); every shared-scope block
+        // is then answered by comparing codes.
+        let translated = self.file.shared_dictionary_predicate(column_ids::ENTITY_ID, &entity_test);
         let type_test = event_type.map(|code| NumericPredicate::Equals(i128::from(code)));
         for granule in self.file.granules_for_entity_hash(low) {
             let id = granule.granule_id;
             let raw = self.file.read_column_raw(column_ids::ENTITY_ID, id)?;
             let keep = if raw.pipeline.side_stream()? == SideStream::FileScopeDictionary {
-                // The block's codes point into the file's shared alphabet, which only the reader resolves.
-                match self.file.read_column(column_ids::ENTITY_ID, id)?.data {
-                    ColumnData::Strings(values) => entity_test.filter_decoded(&values),
-                    _ => return Err(anyhow!("entity_id is not a string column")),
+                // The block's codes point into the file's shared alphabet, translated above.
+                match filter_string_block_shared(raw.pipeline, &raw.body, &entity_test, translated.as_ref())? {
+                    Some(keep) => keep,
+                    None => match self.file.read_column(column_ids::ENTITY_ID, id)?.data {
+                        ColumnData::Strings(values) => entity_test.filter_decoded(&values),
+                        _ => return Err(anyhow!("entity_id is not a string column")),
+                    },
                 }
             } else {
                 filter_string_block_or_decode(raw.pipeline, &raw.body, &entity_test)?

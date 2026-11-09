@@ -3525,6 +3525,7 @@ fn a_replay_past_the_plain_form_falls_back_to_full_selection() {
         Some(Compression::None),
         None,
         None,
+        false,
     );
     assert!(
         block.bytes.len() <= plain.bytes.len(),

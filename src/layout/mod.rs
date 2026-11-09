@@ -600,8 +600,37 @@ pub mod required_features {
     /// declares them — the same reasoning as [`XOR_FLOAT_BLOCKS`]. Declared only when some block is stored that way.
     pub const OCCURRED_RELATIVE_INGESTED_AT: u64 = 1 << 34;
 
+    /// The file stores no `entity_id_hash_low` / `entity_id_hash_high` blocks: every row's entity hashes equal
+    /// [`derived_entity_id_hash`](crate::events::derived_entity_id_hash) of its `entity_id`, so a reader recomputes
+    /// them from that column where it needs a per-row hash, and matches an entity inside a granule against the
+    /// `entity_id` block itself. The per-granule entity hash filters and the entity summary are still built from
+    /// the same hashes. Required and refusing on purpose: a reader that predates it would fail to find the hash
+    /// blocks only when it came to read them, after answering from other columns, and a rewriter that predates it
+    /// could not carry the hashes forward. Declared only on a file that omits the columns.
+    pub const ENTITY_HASH_COLUMNS_ELIDED: u64 = 1 << 35;
+
+    /// The file's external-id index is stored in the 32-bit-key footer section `EXTERNAL_IDS_32` (44). Required and
+    /// refusing on purpose: a reader that predates it would ignore the section and silently answer every external-id
+    /// lookup with "not found". Declared exactly when the file carries a non-empty external-id index.
+    pub const EXTERNAL_ID_INDEX_32: u64 = 1 << 36;
+
+    /// At least one string block stores the relaid whole-block Zstandard stage (pipeline compression 6): offset
+    /// tables replaced by value terminators and dictionary codes by byte planes, then compressed with Zstandard.
+    /// Required and refusing on purpose: a reader that predates the stage would refuse each such block only when it
+    /// came to decode it, after it had already answered from the file's other columns, and a rewriter that predates
+    /// it would copy the blocks into a file that no longer declares them — the same reasoning as
+    /// [`XOR_FLOAT_BLOCKS`]. Declared only when some block is stored that way.
+    pub const STRING_ZSTD_BLOCKS: u64 = 1 << 37;
+
+    /// At least one column's file-scope dictionary alphabet lives Zstandard-compressed in the footer section
+    /// `PACKED_SHARED_DICTIONARIES` (45) — a union alphabet over every granule's values, against which that column's
+    /// shared-scope blocks store only their codes. Required and refusing on purpose: a reader that predates it would
+    /// skip the section and then fail on every such block for want of its alphabet, after answering from the file's
+    /// other columns. Declared exactly when the section is present.
+    pub const PACKED_SHARED_DICTIONARIES: u64 = 1 << 38;
+
     /// Every required feature this reader implements.
-    pub const KNOWN: u64 = (1 << 35) - 1;
+    pub const KNOWN: u64 = (1 << 39) - 1;
 
     /// The full required set every v1 file declares, `COLUMNAR_MARKS` included — the writer emits the columnar,
     /// per-stripe marks form. Excludes `FOOTER_ENCRYPTED` (opt-in per build, set only when the caller requests footer
@@ -609,8 +638,11 @@ pub mod required_features {
     /// only on an audit file), `XOR_FLOAT_BLOCKS` (set only on a file that stores a Chimp block) and `VECTOR_COLUMNS` (set
     /// only on a file with vector columns), `EXTERNAL_ID_EVENT_ID_ELISION` (set only on a file that elides an
     /// external id), `PACKED_STRING_OFFSETS` (set only on a file that stores a packed-lengths FSST block) and
-    /// `OCCURRED_RELATIVE_INGESTED_AT` (set only on a file that stores an occurred-relative `ingested_at` block); declaring a
-    /// bit before it applies would misrepresent the file.
+    /// `OCCURRED_RELATIVE_INGESTED_AT` (set only on a file that stores an occurred-relative `ingested_at` block) and
+    /// `EXTERNAL_ID_INDEX_32` (set only on a file with an external-id index) and `STRING_ZSTD_BLOCKS` (set only on a
+    /// file that stores a relaid whole-block Zstandard string block) and `PACKED_SHARED_DICTIONARIES` (set only on a file
+    /// carrying a compressed union alphabet); declaring a bit before it applies would
+    /// misrepresent the file.
     pub const ALL: u64 = KNOWN
         & !FOOTER_ENCRYPTED
         & !GRAPH
@@ -619,7 +651,11 @@ pub mod required_features {
         & !VECTOR_COLUMNS
         & !EXTERNAL_ID_EVENT_ID_ELISION
         & !PACKED_STRING_OFFSETS
-        & !OCCURRED_RELATIVE_INGESTED_AT;
+        & !OCCURRED_RELATIVE_INGESTED_AT
+        & !EXTERNAL_ID_INDEX_32
+        & !ENTITY_HASH_COLUMNS_ELIDED
+        & !STRING_ZSTD_BLOCKS
+        & !PACKED_SHARED_DICTIONARIES;
 }
 
 /// Optional feature flags: unknown optional features are ignored; known ones are validated and used.

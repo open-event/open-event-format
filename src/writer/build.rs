@@ -12,13 +12,14 @@ use crate::artifacts::batch::{
 };
 use crate::columns::{
     FreetextDeclaration, PROVENANCE_COLUMNS, PathStatistics, PromotionPlan, RELATIONSHIP_COLUMNS, REQUIRED_COLUMNS,
-    SHARED_DICTIONARY_MAX_VALUES, column_ids, promoted_present, validate_promotion_plan,
+    SHARED_DICTIONARY_MAX_VALUES, UNION_SHARED_DICTIONARY_COLUMNS, UNION_SHARED_DICTIONARY_MAX_VALUES, column_ids,
+    promoted_present, validate_promotion_plan,
 };
 use crate::deletes::SubjectId;
 use crate::encoding::{
-    BlockStats, CascadeStrategy, ColumnData, FsstTable, ReplayCapture, SideStream, StringColumn, Transform, ValueKind,
-    count_set_bits, encode_block_replayed, encode_block_with_shared_dictionary, encode_block_with_xor_floats,
-    encode_occurred_residual, seekable_zstd,
+    BlockStats, CascadeStrategy, ColumnData, Compression, FsstTable, ReplayCapture, SideStream, StringColumn,
+    Transform, ValueKind, count_set_bits, encode_block_replayed_with, encode_block_with_shared_dictionary,
+    encode_block_with_xor_floats, encode_occurred_residual, seekable_zstd,
 };
 use crate::error::FormatError;
 use crate::events::provenance::{SignedEventProvenance, hex_lower_into};
@@ -38,9 +39,9 @@ use crate::invariants::sim::SerialEncodeExecutor;
 use crate::layout::footer::{
     ClusteringEntry, ColumnDescriptor, ColumnKind, ColumnMark, EntityHashFilterEntry, ExactCounts, FileDictionaries,
     Footer, FreetextEntry, FreetextRowOffsets, GranuleEntry, GraphBlockEntry, GraphDirectory, InboxRecipientEntry,
-    MarksPageEntry, PageDirectoryEntry, PageMinMax, PageStats, PayloadGranule, PresenceEntry, ResidualCompression,
-    SharedDictionaryEntry, ShredEntry, SortDirection, SortednessProof, StripeEntry, StripeNdvEntry, StripeProofEntry,
-    TextTokenEntry, TextTokenOffsetsEntry, encode_stripe_marks_pages,
+    MarksPageEntry, PackedSharedDictionary, PageDirectoryEntry, PageMinMax, PageStats, PayloadGranule, PresenceEntry,
+    ResidualCompression, SharedDictionaryEntry, ShredEntry, SortDirection, SortednessProof, StripeEntry,
+    StripeNdvEntry, StripeProofEntry, TextTokenEntry, TextTokenOffsetsEntry, encode_stripe_marks_pages,
 };
 use crate::layout::graph::{ChainCover, EventIdIndex, GraphInput, encode_graph_blocks, state_root_entries};
 use crate::layout::reader::{OeFile, PayloadRead};
@@ -646,6 +647,64 @@ fn static_routes_compatible(source: &Footer, config: &OeBuildConfig) -> bool {
 
 /// Whether a string column of this id may share one file-scope alphabet: the envelope, promoted/shredded and context
 /// families, whose alphabets are closed value sets.
+/// Every file-scope alphabet `footer` declares, its compressed (union) ones expanded; `None` when one fails to expand.
+fn source_shared_alphabets(footer: &Footer) -> Option<BTreeMap<u32, Vec<String>>> {
+    let mut alphabets: BTreeMap<u32, Vec<String>> = footer
+        .shared_dictionaries
+        .iter()
+        .map(|entry| (entry.column_id, entry.values.clone()))
+        .collect();
+    for entry in &footer.packed_shared_dictionaries {
+        alphabets.insert(entry.column_id, entry.values().ok()?);
+    }
+    Some(alphabets)
+}
+
+/// The union of every granule's present values as a sorted alphabet, when sharing it is estimated to store the column
+/// smaller than per-granule dictionaries would: every row's code at the union's width plus the alphabet once, against
+/// each granule's distinct values plus its rows' codes at the granule's own width (or, when smaller, the granule's
+/// text itself), both with text estimated at half its raw size for the compression each form applies. `None` past
+/// [`UNION_SHARED_DICTIONARY_MAX_VALUES`], when a value's length does not fit the footer's `u16` prefix, or when it
+/// would not pay.
+fn union_alphabet<'a>(granule_values: Vec<Box<dyn Iterator<Item = &'a str> + 'a>>) -> Option<Vec<String>> {
+    fn code_bits(distinct: usize) -> u64 {
+        u64::from(usize::BITS - distinct.saturating_sub(1).leading_zeros())
+    }
+    let mut union: ahash::AHashSet<&str> = ahash::AHashSet::new();
+    let mut local_bits = 0u64;
+    let mut rows = 0u64;
+    for values in granule_values {
+        let mut local: ahash::AHashSet<&str> = ahash::AHashSet::new();
+        let mut present = 0u64;
+        let mut text_bytes = 0u64;
+        for value in values {
+            present += 1;
+            text_bytes += value.len() as u64;
+            if local.insert(value) {
+                union.insert(value);
+            }
+        }
+        if union.len() > UNION_SHARED_DICTIONARY_MAX_VALUES {
+            return None;
+        }
+        let distinct_bytes: u64 = local.iter().map(|value| value.len() as u64).sum();
+        let dictionary_bits = distinct_bytes * 4 + present * code_bits(local.len());
+        local_bits += dictionary_bits.min(text_bytes * 4);
+        rows += present;
+    }
+    if union.len() < 2 || union.iter().any(|value| value.len() > usize::from(u16::MAX)) {
+        return None;
+    }
+    let union_bytes: u64 = union.iter().map(|value| value.len() as u64).sum();
+    let shared_bits = rows * code_bits(union.len()) + union_bytes * 4;
+    if shared_bits >= local_bits {
+        return None;
+    }
+    let mut alphabet: Vec<String> = union.into_iter().map(str::to_owned).collect();
+    alphabet.sort_unstable();
+    Some(alphabet)
+}
+
 fn shareable_column(column_id: u32) -> bool {
     column_id < column_ids::FREETEXT_BASE || (column_ids::CONTEXT_BASE..column_ids::EMBEDDING_BASE).contains(&column_id)
 }
@@ -1497,6 +1556,9 @@ struct GranulePieces {
     /// bytes, and the row-indexed `(offset, len)` offsets table over them (same shape as `offsets_bytes`/`residual_bytes`
     /// below, scoped to one free-text column instead of the whole granule). Empty unless the build opted into the index.
     freetext_row_offsets: Vec<(u32, Vec<u8>, Vec<u8>)>,
+    /// The rows' `entity_id_hash_low` values when the file omits the entity hash blocks, so the granule's entity hash
+    /// filter is still built from them; empty when the block carries them.
+    elided_entity_hashes: Vec<u64>,
     /// Whether this granule alone carries a late event — see `build_granule`'s computation of the same name.
     has_internal_late_event: bool,
     offsets_bytes: Vec<u8>,
@@ -1513,6 +1575,7 @@ impl GranulePieces {
             by_event_type: Vec::new(),
             by_source: Vec::new(),
             dictionary_bytes: Vec::new(),
+            elided_entity_hashes: Vec::new(),
             entry,
             freetext_row_offsets: Vec::new(),
             has_internal_late_event: false,
@@ -1834,14 +1897,16 @@ fn build_entity_hash_filters(granules: &[GranulePieces]) -> BTreeMap<u32, Vec<u8
     let mut distinct: HashSet<u64> = HashSet::default();
     let mut filters = BTreeMap::new();
     for granule in granules {
-        let Some(hashes) = granule.blocks.iter().find_map(|block| {
+        let stored = granule.blocks.iter().find_map(|block| {
             (block.column_id == column_ids::ENTITY_ID_HASH_LOW)
                 .then_some(match &block.data {
                     ColumnData::U64(values) => Some(values.as_slice()),
                     _ => None,
                 })
                 .flatten()
-        }) else {
+        });
+        let elided = (!granule.elided_entity_hashes.is_empty()).then_some(granule.elided_entity_hashes.as_slice());
+        let Some(hashes) = stored.or(elided) else {
             continue;
         };
         distinct.clear();
@@ -3207,9 +3272,30 @@ fn build_oe_file_sealed_in_order(
         (shred_plan, sparse_keys, shred_kinds)
     };
 
+    // Whether the file omits the entity hash columns: every row's hashes are the derivation from its `entity_id`, so
+    // a reader recomputes them. Only primary-order files of a profile that never sorts or keys by the hashes omit
+    // them — the entity projection's and the inbox's min/max pruning and recipient keys read the stored blocks. A
+    // sparse update changes no envelope, so it keeps whatever the source decided.
+    let elide_entity_hash = match source {
+        Some(source) => source.header.feature_flags & required_features::ENTITY_HASH_COLUMNS_ELIDED != 0,
+        None => {
+            order == RowOrder::Sequence
+                && config.profile != Profile::Inbox
+                && rows.par_iter().all(|row| {
+                    crate::events::derived_entity_id_hash(row.envelope.entity_id.as_deref())
+                        == (row.envelope.entity_id_hash_low, row.envelope.entity_id_hash_high)
+                })
+        }
+    };
+    let keeps_column = |column_id: u32| {
+        !(elide_entity_hash
+            && (column_id == column_ids::ENTITY_ID_HASH_LOW || column_id == column_ids::ENTITY_ID_HASH_HIGH))
+    };
+
     // Column directory: required + promoted + shredded + free-text.
     let mut columns: Vec<ColumnDescriptor> = REQUIRED_COLUMNS
         .iter()
+        .filter(|spec| keeps_column(spec.column_id))
         .map(|spec| ColumnDescriptor {
             column_id: spec.column_id,
             name: spec.name.to_owned(),
@@ -3460,6 +3546,7 @@ fn build_oe_file_sealed_in_order(
                     config.freetext_row_offset_index,
                     carries_provenance,
                     carries_relationships,
+                    elide_entity_hash,
                     wanted,
                     residual,
                 )
@@ -3549,6 +3636,7 @@ fn build_oe_file_sealed_in_order(
     let block_columns: Vec<u32> = REQUIRED_COLUMNS
         .iter()
         .map(|spec| spec.column_id)
+        .filter(|&column_id| keeps_column(column_id))
         .chain((0..config.promotion.columns.len()).map(|index| column_ids::PROMOTED_BASE + index as u32))
         .chain(shred_plan.iter().map(|entry| entry.column_id))
         .chain(freetext_entries.iter().map(|entry| entry.column_id))
@@ -3842,7 +3930,12 @@ fn build_oe_file_sealed_in_order(
             if xor_floats && matches!(data, ColumnData::F64(_)) {
                 encode_block_with_xor_floats(data, block.random_access, strategy)
             } else {
-                encode_block_replayed(data, block.random_access, strategy, replay, shared).0
+                // Only the shredded payload and free-text columns weigh whole-block Zstandard for strings: the
+                // envelope and relationship columns are what equality lookups probe granule by granule, and they
+                // keep the layouts a filter answers without inflating anything.
+                let string_zstd = block.random_access
+                    && (column_ids::SHREDDED_BASE..column_ids::CONTEXT_BASE).contains(&block.column_id);
+                encode_block_replayed_with(data, block.random_access, strategy, replay, shared, string_zstd).0
             }
         };
         let mut text_tokens: Vec<TextTokenEntry> = Vec::new();
@@ -4167,12 +4260,22 @@ fn build_oe_file_sealed_in_order(
                 })
             })
         });
+    // Every source alphabet, compressed (union) ones expanded. `None` when one fails to expand: such a source shares
+    // no decoding domain with any candidate, so nothing of it is reused.
+    let source_shared: Option<BTreeMap<u32, Vec<String>>> = match update_reuse {
+        Some(reuse) => source_shared_alphabets(&reuse.source.footer),
+        None => Some(BTreeMap::new()),
+    };
+    // Columns whose alphabet is a union over granules: those go to the footer compressed.
+    let mut union_columns: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
     let mut shared_alphabets: BTreeMap<u32, Vec<String>> = if reuse_source_alphabets {
-        update_reuse
-            .into_iter()
-            .flat_map(|reuse| &reuse.source.footer.shared_dictionaries)
-            .map(|entry| (entry.column_id, entry.values.clone()))
-            .collect()
+        union_columns.extend(
+            update_reuse
+                .into_iter()
+                .flat_map(|reuse| &reuse.source.footer.packed_shared_dictionaries)
+                .map(|entry| entry.column_id),
+        );
+        source_shared.clone().unwrap_or_default()
     } else {
         BTreeMap::new()
     };
@@ -4249,22 +4352,45 @@ fn build_oe_file_sealed_in_order(
                 shared_alphabets.insert(column_id, first.iter().map(|value| (*value).to_owned()).collect());
             }
         }
+        // Union alphabets: a column listed in `UNION_SHARED_DICTIONARY_COLUMNS` whose granules do not repeat one set
+        // may still share the union of their values, when its codes are estimated to cost less than the per-granule
+        // dictionaries (or FSST arenas) they replace, the alphabet itself included. Each block still keeps its local
+        // form when that is smaller (`encode_dictionary_string`'s exact trial).
+        for column_id in UNION_SHARED_DICTIONARY_COLUMNS {
+            if shared_alphabets.contains_key(&column_id) {
+                continue;
+            }
+            let mut granule_values: Vec<Box<dyn Iterator<Item = &str> + '_>> = Vec::new();
+            for granule in &granules {
+                for block in &granule.blocks {
+                    if block.column_id == column_id
+                        && let ColumnData::Strings(values) = &block.data
+                    {
+                        granule_values.push(Box::new(values.iter_present()));
+                    }
+                }
+            }
+            for col in &config.analytical_columns {
+                if col.column_id == column_id
+                    && let ColumnData::Strings(values) = &col.data
+                {
+                    for (g_start, g_end) in &granule_row_ranges {
+                        granule_values.push(Box::new(
+                            (*g_start..*g_end).filter_map(|index| values.get(index).flatten()),
+                        ));
+                    }
+                }
+            }
+            if let Some(alphabet) = union_alphabet(granule_values) {
+                shared_alphabets.insert(column_id, alphabet);
+                union_columns.insert(column_id);
+            }
+        }
     }
 
     // File-scope metadata is part of a block's decoding domain. Reuse is enabled only after the candidate has derived
     // the same schema, routing, dictionaries, granule geometry, and shared alphabets as the source. Any mismatch turns
     // this build into the ordinary full rewrite before one source extent is borrowed.
-    let source_shared: BTreeMap<u32, Vec<String>> = update_reuse
-        .map(|reuse| {
-            reuse
-                .source
-                .footer
-                .shared_dictionaries
-                .iter()
-                .map(|entry| (entry.column_id, entry.values.clone()))
-                .collect()
-        })
-        .unwrap_or_default();
     let update_reuse = update_reuse.filter(|reuse| {
         reuse.source.footer.columns == columns
             && reuse.source.footer.dictionaries == dictionaries
@@ -4275,9 +4401,11 @@ fn build_oe_file_sealed_in_order(
             // `shared_alphabets` contains every eligible alphabet; the footer contains only alphabets an encoded
             // source block actually selected. Every source-used decoding domain must still exist byte-identically,
             // while a candidate-only eligible alphabet is irrelevant until one of its newly encoded blocks selects it.
-            && source_shared
-                .iter()
-                .all(|(column_id, values)| shared_alphabets.get(column_id) == Some(values))
+            && source_shared.as_ref().is_some_and(|source_shared| {
+                source_shared
+                    .iter()
+                    .all(|(column_id, values)| shared_alphabets.get(column_id) == Some(values))
+            })
             && reuse.source.footer.granules.len() == granules.len()
             && reuse.source.footer.granules.iter().zip(&granules).all(|(source, candidate)| {
                 source.granule_id == candidate.entry.granule_id
@@ -4566,6 +4694,12 @@ fn build_oe_file_sealed_in_order(
         std::iter::once(piece.pipeline)
             .chain(piece.pages.iter().map(|page| page.1))
             .any(|pipeline| pipeline.transform() == Ok(Transform::OccurredResidual))
+    });
+    // Whether any block or page stores a string block under the relaid whole-block Zstandard stage.
+    let string_zstd_blocks = pieces.iter().any(|piece| {
+        std::iter::once(piece.pipeline)
+            .chain(piece.pages.iter().map(|page| page.1))
+            .any(|pipeline| pipeline.compression() == Ok(Compression::StringZstd))
     });
     // Whether any block or page stores FSST with bitpacked value lengths.
     let packed_string_offsets = pieces.iter().any(|piece| {
@@ -5309,11 +5443,23 @@ fn build_oe_file_sealed_in_order(
 
     // Consumes `shared_alphabets` — no block encodes against it past this point — so each alphabet moves into the
     // footer entry rather than being duplicated string by string.
-    let shared_dictionaries: Vec<SharedDictionaryEntry> = shared_alphabets
-        .into_iter()
-        .filter(|(column_id, _)| file_scope_columns.contains(column_id))
-        .map(|(column_id, values)| SharedDictionaryEntry { column_id, values })
-        .collect();
+    // A union alphabet goes to the footer compressed; one that cannot be packed (it never fails for an alphabet the
+    // writer selected) keeps the plain form, which resolves the same blocks.
+    let mut shared_dictionaries: Vec<SharedDictionaryEntry> = Vec::new();
+    let mut packed_shared_dictionaries: Vec<PackedSharedDictionary> = Vec::new();
+    for (column_id, values) in shared_alphabets {
+        if !file_scope_columns.contains(&column_id) {
+            continue;
+        }
+        match union_columns
+            .contains(&column_id)
+            .then(|| PackedSharedDictionary::pack(column_id, &values))
+            .flatten()
+        {
+            Some(packed) => packed_shared_dictionaries.push(packed),
+            None => shared_dictionaries.push(SharedDictionaryEntry { column_id, values }),
+        }
+    }
 
     // An audit file declares its own required feature, so a reader or rewriter that predates audit files refuses it.
     // A file with edges declares the dense sequence numbers its edges name and both edge features: the forward blocks
@@ -5342,11 +5488,23 @@ fn build_oe_file_sealed_in_order(
     if occurred_relative_ingested_at {
         required_feature_flags |= required_features::OCCURRED_RELATIVE_INGESTED_AT;
     }
+    if string_zstd_blocks {
+        required_feature_flags |= required_features::STRING_ZSTD_BLOCKS;
+    }
     if !state_roots.is_empty() {
         required_feature_flags |= required_features::GRAPH_STATE_ROOTS;
     }
+    if !source_form_indexes.external_ids.is_empty() {
+        required_feature_flags |= required_features::EXTERNAL_ID_INDEX_32;
+    }
     if source_form_indexes.elides_event_ids {
         required_feature_flags |= required_features::EXTERNAL_ID_EVENT_ID_ELISION;
+    }
+    if elide_entity_hash {
+        required_feature_flags |= required_features::ENTITY_HASH_COLUMNS_ELIDED;
+    }
+    if !packed_shared_dictionaries.is_empty() {
+        required_feature_flags |= required_features::PACKED_SHARED_DICTIONARIES;
     }
     let footer = Footer {
         audit,
@@ -5402,6 +5560,7 @@ fn build_oe_file_sealed_in_order(
         required_feature_flags,
         schema_fingerprint: *schema_hash.finalize().as_bytes(),
         shared_dictionaries,
+        packed_shared_dictionaries,
         shredded: shred_plan,
         snapshot_keys,
         sparse_keys,
@@ -5753,6 +5912,7 @@ fn build_granule(
     freetext_row_offset_index: bool,
     carries_provenance: bool,
     carries_relationships: bool,
+    elide_entity_hash: bool,
     wanted: Option<&HashSet<u32>>,
     build_residual: bool,
 ) -> Result<GranulePieces, FormatError> {
@@ -6402,6 +6562,28 @@ fn build_granule(
         }
     }
 
+    // A file that omits the entity hash columns stores neither block; the low hashes stay with the granule only to
+    // build its entity hash filter.
+    let mut elided_entity_hashes = Vec::new();
+    if elide_entity_hash {
+        let mut kept = Vec::with_capacity(blocks.len());
+        for block in blocks {
+            match (block.column_id, block.data) {
+                // A sparse rebuild that does not want the hashes holds placeholders for them; its filter is the
+                // source's.
+                (column_ids::ENTITY_ID_HASH_LOW, ColumnData::U64(values)) if wants(column_ids::ENTITY_ID_HASH_LOW) => {
+                    elided_entity_hashes = values;
+                }
+                (column_ids::ENTITY_ID_HASH_LOW | column_ids::ENTITY_ID_HASH_HIGH, _) => {}
+                (column_id, data) => kept.push(PendingBlock {
+                    column_id,
+                    data,
+                    ..block
+                }),
+            }
+        }
+        blocks = kept;
+    }
     if wanted.is_some() {
         blocks.retain(|block| wants(block.column_id));
     }
@@ -6413,6 +6595,7 @@ fn build_granule(
         by_event_type,
         by_source,
         dictionary_bytes,
+        elided_entity_hashes,
         freetext_row_offsets,
         has_internal_late_event,
         offsets_bytes,

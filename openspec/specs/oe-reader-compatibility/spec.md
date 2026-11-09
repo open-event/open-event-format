@@ -69,9 +69,34 @@ Pipeline transform 15 (FSST with bitpacked value lengths) SHALL have an availabi
 - **WHEN** a reader without transform 15 is handed a block whose pipeline id names it
 - **THEN** it returns a structural "unknown transform" error and decodes nothing
 
+### Requirement: String-zstd blocks are gated by a required feature
+Pipeline trailing compression 6 (`string_zstd`, a string block relaid and compressed whole with Zstandard) SHALL be refused, like every unknown compression, by a reader that does not implement it: decoding the pipeline id SHALL return a structural "unknown compression" error and decode nothing. A file holding such a block SHALL declare required feature bit 37 (`string_zstd_blocks`); a reader whose known required set lacks bit 37 SHALL refuse the file at open.
+
+#### Scenario: Unknown compression refused cleanly
+- **WHEN** a reader without compression 6 is handed a block whose pipeline id names it
+- **THEN** it returns a structural "unknown compression" error and decodes nothing
+
+#### Scenario: A file declaring bit 37 is refused by an older reader
+- **WHEN** a file stores a compression-6 block and is opened by a reader whose known required set predates bit 37
+- **THEN** the file declares bit 37 and that reader refuses it at open
+
+### Requirement: Packed shared dictionaries are gated by a required feature
+A file that stores footer section `PACKED_SHARED_DICTIONARIES` (45, compressed union alphabets for file-scope dictionary blocks) SHALL declare required feature bit 38 (`packed_shared_dictionaries`): a reader that predates the section would skip it as unknown and then fail on the first shared-scope block of such a column, after answering from the file's other columns. A reader whose known required set lacks bit 38 SHALL refuse the file at open; this reader knows bits 0 through 38.
+
+#### Scenario: A file declaring bit 38 is refused by an older reader
+- **WHEN** a file carries a compressed union alphabet and is opened by a reader whose known required set predates bit 38
+- **THEN** the file declares bit 38 and that reader refuses it at open
+
 ### Requirement: Occurred-relative ingested-at blocks are gated by a required feature
 Pipeline transform 16 (`ingested_at` stored relative to `occurred_at`) SHALL have an availability window opening at format version 1.0 and SHALL be refused, like every unknown transform, by a reader that does not implement it. Its body SHALL NOT decode on its own: a decode handed the bare block without the granule's `occurred_at` SHALL return a structural error rather than values. A file holding such a block SHALL declare required feature bit 34 (`occurred_relative_ingested_at`); a reader whose known required set lacks bit 34 SHALL refuse the file at open.
 
 #### Scenario: Occurred-relative transform refused without its window
 - **WHEN** a reader without transform 16 is handed a block whose pipeline id names it
 - **THEN** it refuses the pipeline before decoding a byte, and a bare decode of the block without `occurred_at` returns a structural error
+
+### Requirement: Entity hash columns may be elided behind a required feature
+A writer MAY omit the `entity_id_hash_low` and `entity_id_hash_high` blocks from a primary-order file of any profile but `inbox` when every row's entity hashes equal the frozen derivation from its `entity_id`: the low half is `stable_hash` of the id's UTF-8 bytes and the high half is zero, and an absent id derives `(0, 0)`. Such a file SHALL drop both columns from its column directory and SHALL declare required feature bit 35 (`entity_hash_columns_elided`); a file with any row whose hashes are not the derivation SHALL store the columns and SHALL NOT declare the bit. The per-granule entity hash filters and the entity summary SHALL still be built from the same hashes. A reader of such a file SHALL recompute a row's entity hashes from `entity_id` wherever it needs them, so envelopes, entity scans and merge reads return exactly the hashes that were written; a reader whose known required set lacks bit 35 SHALL refuse the file at open. Files that store the columns SHALL keep reading unchanged.
+
+#### Scenario: Elided entity hashes read back as written
+- **WHEN** a file is built from rows whose entity hashes are the derivation from their `entity_id`
+- **THEN** it stores no entity hash blocks, declares bit 35, and returns every envelope with the hashes it was written with, while a reader that does not know bit 35 refuses it at open

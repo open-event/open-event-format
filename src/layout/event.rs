@@ -5,13 +5,16 @@
 
 use super::footer::GranuleEntry;
 use super::reader::{ColumnRead, OeFile, PayloadRead};
+use super::required_features;
 use crate::artifacts::batch::{PAYLOAD_FLAG_EXTERNAL_REF, decode_variant_dictionary};
 use crate::artifacts::overlay::LiveOverlaySegment;
 use crate::columns::column_ids;
 use crate::encoding::{ColumnData, StringColumn};
 use crate::error::FormatError;
 use crate::events::variant::VariantRef;
-use crate::events::{EventEnvelope, EventFlags, EventId, SequencePoint, StreamId, TimestampValue};
+use crate::events::{
+    EventEnvelope, EventFlags, EventId, SequencePoint, StreamId, TimestampValue, derived_entity_id_hash,
+};
 use crate::file::bytes::slice;
 use arrow_array::*;
 use hashbrown::HashMap;
@@ -283,6 +286,53 @@ fn string_at((presence, values): &(Vec<u8>, StringColumn), rows: usize, row: usi
     values.get(index).flatten().map(str::to_owned)
 }
 
+/// Whether `file` omits the stored entity hash blocks (required feature `ENTITY_HASH_COLUMNS_ELIDED`), so a per-row
+/// entity hash is derived from `entity_id` instead.
+pub(crate) fn entity_hash_columns_elided(file: &OeFile) -> bool {
+    file.footer().required_feature_flags & required_features::ENTITY_HASH_COLUMNS_ELIDED != 0
+}
+
+/// One granule's entity hashes, `(low, high)` per row: the stored blocks, or, in a file that omits them, the
+/// derivation from each row's `entity_id`.
+pub(crate) fn read_entity_hashes(
+    file: &OeFile,
+    granule_id: u32,
+    rows: usize,
+) -> Result<(Vec<u64>, Vec<u64>), FormatError> {
+    if !entity_hash_columns_elided(file) {
+        return Ok((
+            read_u64s(file, column_ids::ENTITY_ID_HASH_LOW, granule_id, rows)?,
+            read_u64s(file, column_ids::ENTITY_ID_HASH_HIGH, granule_id, rows)?,
+        ));
+    }
+    Ok(derive_entity_hashes(
+        &read_strings(file, column_ids::ENTITY_ID, granule_id)?,
+        rows,
+    ))
+}
+
+/// The entity hashes derived from an `entity_id` block read by [`read_strings`], `(low, high)` per row.
+fn derive_entity_hashes((presence, values): &(Vec<u8>, StringColumn), rows: usize) -> (Vec<u64>, Vec<u64>) {
+    let mut lows = Vec::with_capacity(rows);
+    let mut highs = Vec::with_capacity(rows);
+    let dense = values.len() == rows;
+    let mut next = 0usize;
+    for row in 0..rows {
+        let id = if dense {
+            values.get(row).flatten()
+        } else if presence.get(row / 8).is_some_and(|byte| byte & (1 << (row % 8)) != 0) {
+            next += 1;
+            values.get(next - 1).flatten()
+        } else {
+            None
+        };
+        let (low, high) = derived_entity_id_hash(id);
+        lows.push(low);
+        highs.push(high);
+    }
+    (lows, highs)
+}
+
 /// The file dictionary entry named by row `row` of a dictionary-id column.
 fn dictionary_entry<'a>(values: &'a [String], ids: &[u64], row: usize) -> Result<&'a str, FormatError> {
     let id = ids.get(row).copied().unwrap_or_default();
@@ -341,12 +391,18 @@ impl EnvelopeColumns {
         let source_id = u64s(column_ids::SOURCE_ID)?;
         let event_type_id = u64s(column_ids::EVENT_TYPE_ID)?;
         let entity_type_id = u64s(column_ids::ENTITY_TYPE_ID)?;
-        let entity_id_hash_low = u64s(column_ids::ENTITY_ID_HASH_LOW)?;
-        let entity_id_hash_high = u64s(column_ids::ENTITY_ID_HASH_HIGH)?;
         let flags = u64s(column_ids::FLAGS)?;
         let schema_version = u64s(column_ids::SCHEMA_VERSION)?;
         let event_id = read_u128s(file, column_ids::EVENT_ID, granule_id, rows)?;
         let entity_id = read_strings(file, column_ids::ENTITY_ID, granule_id)?;
+        let (entity_id_hash_low, entity_id_hash_high) = if entity_hash_columns_elided(file) {
+            derive_entity_hashes(&entity_id, rows)
+        } else {
+            (
+                u64s(column_ids::ENTITY_ID_HASH_LOW)?,
+                u64s(column_ids::ENTITY_ID_HASH_HIGH)?,
+            )
+        };
         let actor_id = read_strings(file, column_ids::ACTOR_ID, granule_id)?;
         let account_id = read_strings(file, column_ids::ACCOUNT_ID, granule_id)?;
         let actor_id_hash_low = u64s(column_ids::ACTOR_ID_HASH_LOW)?;

@@ -376,7 +376,10 @@ pub struct SharedDictionaryPredicate {
 
 /// Translates `predicate` into code space against a file-scope shared alphabet, once per file; hand the result to
 /// [`filter_string_block_shared`] for every block of the column.
-pub fn translate_for_shared_dictionary(predicate: &StringPredicate, alphabet: &[String]) -> SharedDictionaryPredicate {
+pub fn translate_for_shared_dictionary<T: AsRef<str>>(
+    predicate: &StringPredicate,
+    alphabet: &[T],
+) -> SharedDictionaryPredicate {
     SharedDictionaryPredicate {
         test: dictionary_code_test(predicate, alphabet),
     }

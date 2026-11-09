@@ -63,6 +63,7 @@ fn footer_with(granules: Vec<GranuleEntry>, row_count: u64) -> Footer {
         required_feature_flags: 0,
         schema_fingerprint: [7u8; 32],
         shared_dictionaries: Vec::new(),
+        packed_shared_dictionaries: Vec::new(),
         shredded: Vec::new(),
         snapshot_keys: None,
         sparse_keys: Vec::new(),
