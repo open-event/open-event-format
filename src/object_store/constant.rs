@@ -1,0 +1,3 @@
+pub const CHECKPOINT_INTERVAL: u64 = 64;
+
+pub const MIN_MULTIPART_PART_BYTES: u64 = 5 * 1024 * 1024;

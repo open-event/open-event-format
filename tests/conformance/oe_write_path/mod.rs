@@ -1,0 +1,8 @@
+mod compaction_folds_sidecar_files_into_the_base;
+mod file_roll_boundary_owned_by_publish_policy;
+mod idempotent_oe_publication;
+mod ingest_to_acknowledgement_pipeline;
+mod oe_publish_boundary_gates_visibility;
+mod oe_publish_side_effect_transaction_discipline;
+mod oe_rewrite_preserves_one_format_and_correctness;
+mod single_protected_payload_record_with_safe_retry;

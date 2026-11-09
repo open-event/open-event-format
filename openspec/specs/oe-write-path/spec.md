@@ -1,0 +1,93 @@
+## Purpose
+
+Defines the path an event takes from arrival to being safely stored:
+
+- From ingest to a durable acknowledgement, with safe retries on the OEJ journal.
+- Publishing OE files from OEJ idempotently (re-runs don't duplicate data), and later rewriting/repacking OE files.
+- The publish boundary that gates when a OE becomes visible, and how a service that derives state from those rows stages, promotes, or rolls back that state across the boundary.
+
+The concrete write-path, safe-retry, publish, and rewrite detail are embedded in [write-path-detail.md](write-path-detail.md).
+
+## Requirements
+### Requirement: Ingest-to-acknowledgement pipeline
+The write path SHALL follow this pipeline: validate → serialize into a pending compact-batch descriptor on the worker's lock-free queue (READY) → reach the flush target (default 16 KiB; 4 KiB for latency-critical/low-load) → claim and reserve a contiguous `(epoch, sequence)` range → submit an aligned OEJ frame via io_uring (`io_uring_cmd` NVMe passthrough; filesystem io_uring in the non-NVMe dev fallback) → verify header CRC-64/NVME and frame BLAKE3 → HARDENED → record reconstructable safe-retry metadata → COMMITTED → decode into LiveOverlay → acknowledge per the API durability/freshness contract → become OE-publication eligible. LiveOverlay publication SHALL NOT redefine durability (durability is OEJ completion); it defines query visibility for OEJ-backed rows not yet OE-covered. A flush that finds more than one flush target's worth of records pending SHALL claim and reserve them one flush target's worth at a time, each as its own frame under its own contiguous range, append every frame, and make them all durable with one durability barrier; no frame of the flush SHALL be HARDENED before that barrier completes and its bytes are verified.
+
+#### Scenario: A burst commits behind one barrier
+- **WHEN** a worker flushes more than three flush targets' worth of pending records at once
+- **THEN** they are appended as consecutive frames covering consecutive sequence ranges, one sync makes them durable, and every receipt points at the frame that holds its event
+
+#### Scenario: Append-only commit
+- **WHEN** an append-only event's OEJ frame is durable and its safe-retry receipt is recorded or reconstructable
+- **THEN** HARDENED becomes COMMITTED immediately and the client may be acknowledged
+
+### Requirement: Single protected payload record with safe retry
+The system SHALL NOT require both a full KV buffer payload and an OEJ payload before acknowledgement; OEJ SHALL be the protected event payload record. Safe-retry state SHALL use client/connector delivery identity, scope, commit receipt, OEJ frame cursor, status class, expiry, and minimal dedupe metadata, and SHALL be reconstructable after restart/takeover from retained replay-guard rows plus OEJ coverage. Replaying a retained OEJ frame SHALL NOT enqueue duplicate events while the original acknowledgement is within the replay-guard window. A retry of a delivery whose earlier attempt was appended but whose durability is unknown SHALL NOT be enqueued while that attempt's receipt is within the replay-guard window; it SHALL be reported as unresolved until replay finds the frame durable in OEJ, which settles the receipt as acknowledged.
+
+#### Scenario: Replay within guard window
+- **WHEN** a retained OEJ frame is replayed while the original acknowledgement is still within the replay-guard window
+- **THEN** no duplicate events are enqueued
+
+#### Scenario: Retry after a failed durability barrier
+- **WHEN** a client retries a delivery whose earlier attempt was appended but whose sync or verification read failed
+- **THEN** the retry is reported as unresolved and no second copy is appended
+
+### Requirement: Idempotent OE publication
+Publishing OE from OEJ SHALL follow this sequence and atomically publish the manifest entry, projection metadata, deletion-vector generation, and coverage watermarks. The publisher SHALL be idempotent: re-publishing the same journal range SHALL produce either the same file identity or a safely replaceable file. LiveOverlay segments SHALL become evictable only after the new published OE range is visible, and OEJ retention/segment recycling SHALL advance only after publication and the configured recovery safety window.
+
+#### Scenario: Re-publish same range
+- **WHEN** the publisher re-publishes a journal range it already published
+- **THEN** the result is the same file identity or a safely replaceable file, with no double-counting
+
+### Requirement: File roll boundary owned by publish policy
+The OE file boundary SHALL be owned by publish policy, not by the file-layout rules. The publisher SHALL pack a contiguous durable OEJ range into one OE and SHALL roll (seal) the file on a dual trigger, whichever fires first: (a) a compressed byte target (default ~1 GiB), or (b) a maximum open-time window (default minutes-scale), so that low-volume tenants seal small compact files and OEJ/LiveOverlay retention can advance even when the byte target is never reached. The 512 MiB stripe-size clamp SHALL act only as a safety backstop and SHALL NOT be the primary roll trigger. Either trigger SHALL produce a `Sealed` file via the `OpenTmp → Sealed` edge.
+
+#### Scenario: High-volume tenant rolls on bytes
+- **WHEN** a tenant's open OE reaches the compressed byte target before the time window elapses
+- **THEN** the publisher seals the file at the byte target, producing a wide file with a handful of stripes
+
+#### Scenario: Low-volume tenant rolls on time
+- **WHEN** a tenant's open OE has not reached the byte target when the maximum time window elapses
+- **THEN** the publisher seals the small compact file so OEJ retention and LiveOverlay eviction can advance
+
+### Requirement: OE rewrite preserves one format and correctness
+OE rewrite/repacking SHALL select Active source files, mark them Outdated only after the replacement generation is published, select rewrite scope incrementally using per-granule `clustering_quality` rather than whole-file resorts by default, rebuild data/marks/indexes/aggregates (including `variant_shredded_field_blocks` and variant dictionary blocks), write replacement files in the same OE format, verify BLAKE3/aggregate/marks/deletion-vector accounting, publish a new generation manifest atomically, and move superseded files to DeleteOnDestroy only after the safety window and in-flight query horizon expire. Rewrite SHALL NOT create a new file format or separate freshness/historical/cold/archive OE classes.
+
+#### Scenario: Source files retired safely
+- **WHEN** an OE rewrite produces a replacement generation
+- **THEN** source files are marked Outdated only after the replacement is published and deleted only after the safety window and in-flight query horizon expire
+
+### Requirement: Compaction folds sidecar files into the base
+SuperOE compaction SHALL fold sidecar files into the rewritten base: promotion-backfill vertical projections SHALL be folded in and dropped (they are transient bridges), and derived-columns sibling files SHALL be folded in once their columns are settled per their declared settle horizon, with a new sibling re-emitted for the unsettled tail. Folding SHALL preserve row alignment, deletion-vector and correction accounting, and BLAKE3 verification, and SHALL publish atomically in one manifest generation.
+
+#### Scenario: Settled derived columns folded in
+- **WHEN** compaction rewrites a range whose derived-columns sibling has columns past their settle horizon
+- **THEN** the settled columns are embedded in the new base file and a sibling is re-emitted only for the unsettled tail
+
+### Requirement: OE publish boundary gates visibility
+A OE SHALL NOT be visible until the complete publish boundary succeeds (OePublishRule): select a contiguous durable OEJ range, validate each frame by CRC-64/NVME precheck and authoritative BLAKE3, decode only `oe_oej_compact_batch_v1` (rejecting every other `payload_encoding`), stage the OE object and manifest entry to tenant-qualified staging, verify size/schema/BLAKE3/tenant/range/feature-directory/quota, publish the manifest entry and OEs only after all checks pass, and emit peer notices only after publication succeeds. Failed or losing attempts SHALL leak no peer notices or public reads, and OEJ coverage SHALL remain the recovery source until published OEs plus the retention safety window allow journal retention to advance.
+
+#### Scenario: Failed publish leaks nothing
+- **WHEN** a OE publish attempt fails a checksum or loses the commit race
+- **THEN** no peer frame is sent, staged side effects are discarded, and no public read observes the attempt
+
+#### Scenario: Object uploaded and verified before the manifest names it
+- **WHEN** a publish attempt uploads its OE object to the application's object store
+- **THEN** the stored size and CRC-64/NVME are checked against the build before any manifest generation is written, a failed upload aborts any multipart upload and writes no generation, and multipart parts begin only on stripe boundaries
+
+#### Scenario: Lost race after upload
+- **WHEN** an attempt loses the range to a different file after its object was uploaded
+- **THEN** the object is left in place, unreferenced by any generation, for the application's sweep of unreferenced keys
+
+### Requirement: OE-publish side-effect transaction discipline
+When a service mutates derived state while observing rows during OE publication, it SHALL record staged changes (or a rollback point) under the publish attempt id, promote staged state only at `after_oe_publish_before_peer_notice` if the manifest publication wins, otherwise roll back or rebuild from the last checkpoint plus UnifiedEvents, and SHALL finish rollback/rebuild before answering reads, emitting outputs, or accepting more publish-side mutations.
+
+#### Scenario: Side effect rolled back on lost publish
+- **WHEN** a service staged derived-state changes for a publish attempt that then loses
+- **THEN** it rolls back or rebuilds from its last checkpoint plus UnifiedEvents before serving reads
+
+### Requirement: Graph files seal per subject by event count or age
+Each subject's events SHALL fill that subject's own open graph file. The application SHALL seal a subject's open file once it holds the policy's event count (4096 by default) or once the policy's age (five minutes by default) has passed since its first event arrived, whichever comes first, reading the time through the shared clock; an empty file SHALL never seal. The open file's event count and first-arrival time are the application's durable state, not OE's.
+
+#### Scenario: Seal by count and by age
+- **WHEN** a subject's open file reaches 4096 events, or a quiet subject's first event has waited the policy's age
+- **THEN** the seal check fires with the event-count trigger, or the age trigger, and not a moment before

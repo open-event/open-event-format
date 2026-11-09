@@ -1,0 +1,248 @@
+use super::*;
+use crate::typed_id::TypedIdTestExt;
+
+const FILE_ID: u128 = 0xF11E_D00D;
+
+#[test]
+fn a_destroyed_key_stays_a_tombstone_across_re_registration() {
+    let scheme = AeadScheme::default();
+    let tenant_dek = TenantDek::new([3u8; 32]);
+    let id = ContentKeyId::new_test_id(1001);
+    let content_key = ContentKey::new([9u8; 32]);
+    let wrapped = tenant_dek.wrap_content_key(&content_key, id, scheme).unwrap();
+    let sealed = content_key.seal(1, FILE_ID, 0, b"pii payload", scheme).unwrap();
+
+    let mut store = ContentKeyStore::new(tenant_dek);
+    store.register(id, wrapped.clone());
+    store.destroy(id);
+    assert!(store.is_destroyed(id));
+
+    store.register(id, wrapped);
+    assert!(
+        store.is_destroyed(id),
+        "a destroyed key must stay destroyed after a re-registration"
+    );
+    assert_eq!(
+        store.decrypt_or_tombstone(id, 1, FILE_ID, &sealed),
+        DecryptOutcome::Tombstone,
+        "an erased subject stays a tombstone even after their id is registered again"
+    );
+}
+
+#[test]
+fn erasing_before_registration_stays_terminal() {
+    let scheme = AeadScheme::default();
+    let tenant_dek = TenantDek::new([3u8; 32]);
+    let id = ContentKeyId::new_test_id(2002);
+    let content_key = ContentKey::new([9u8; 32]);
+    let wrapped = tenant_dek.wrap_content_key(&content_key, id, scheme).unwrap();
+    let sealed = content_key.seal(1, FILE_ID, 0, b"pii payload", scheme).unwrap();
+
+    let mut store = ContentKeyStore::new(tenant_dek);
+    store.destroy(id);
+    assert!(store.is_destroyed(id), "erasing an unseen id must leave a tombstone");
+
+    store.register(id, wrapped);
+    assert!(
+        store.is_destroyed(id),
+        "a registration after an erase-before-register must not resurrect the key"
+    );
+    assert_eq!(
+        store.decrypt_or_tombstone(id, 1, FILE_ID, &sealed),
+        DecryptOutcome::Tombstone,
+        "an erased subject stays a tombstone even when their registration was replayed after the erasure"
+    );
+}
+
+#[test]
+fn a_sealing_key_never_rolls_past_its_reserved_epoch_range() {
+    let scheme = AeadScheme::default();
+    let mut first = SealedContentKey::with_epoch_range(ContentKey::new([7u8; 32]), 0, 2, scheme).unwrap();
+    let sealed_a = first.encrypt(9, FILE_ID, b"a").unwrap();
+    let sealed_b = first.encrypt(9, FILE_ID, b"b").unwrap();
+    assert!(
+        first.encrypt(9, FILE_ID, b"c").is_none(),
+        "a spent epoch range must refuse to seal, never roll into another checkout's epochs"
+    );
+
+    let mut second = SealedContentKey::with_epoch_range(ContentKey::new([7u8; 32]), 2, 4, scheme).unwrap();
+    let sealed_c = second.encrypt(9, FILE_ID, b"c").unwrap();
+
+    let nonce_len = scheme.nonce_len();
+    let nonces: HashSet<_> = [&sealed_a, &sealed_b, &sealed_c]
+        .iter()
+        .map(|blob| blob.get(..nonce_len))
+        .collect();
+    assert_eq!(nonces.len(), 3, "no nonce may repeat within or across checkouts");
+}
+
+#[test]
+fn an_empty_or_inverted_epoch_reservation_is_rejected() {
+    let scheme = AeadScheme::default();
+    assert!(SealedContentKey::with_epoch_range(ContentKey::new([7u8; 32]), 2, 2, scheme).is_none());
+    assert!(SealedContentKey::with_epoch_range(ContentKey::new([7u8; 32]), 3, 2, scheme).is_none());
+    let mut exhausted = SealedContentKey::new(ContentKey::new([7u8; 32]), u64::MAX, scheme);
+    assert!(
+        exhausted.encrypt(9, FILE_ID, b"a").is_none(),
+        "the first seal must check the epoch limit, not only epoch rolls"
+    );
+}
+
+#[test]
+fn cloning_a_sealing_key_shares_its_nonce_history() {
+    let scheme = AeadScheme::default();
+    let key = SealedContentKey::new(ContentKey::new([4u8; 32]), 0, scheme);
+    let mut original = key.clone();
+    let mut clone = key;
+
+    let sealed_a = original.encrypt(9, FILE_ID, b"plaintext-a").unwrap();
+    let sealed_b = clone.encrypt(9, FILE_ID, b"plaintext-b").unwrap();
+
+    let nonce_len = scheme.nonce_len();
+    assert_ne!(
+        sealed_a.get(..nonce_len),
+        sealed_b.get(..nonce_len),
+        "two clones of one sealing key must never seal different plaintexts under the same nonce"
+    );
+}
+
+#[test]
+fn re_sealing_one_block_id_never_repeats_a_nonce() {
+    let scheme = AeadScheme::default();
+    let mut key = SealedContentKey::new(ContentKey::new([8u8; 32]), 0, scheme);
+    let first = key.encrypt(1, FILE_ID, b"v1").unwrap();
+    let second = key.encrypt(1, FILE_ID, b"v2").unwrap();
+
+    let nonce_len = scheme.nonce_len();
+    assert_ne!(
+        first.get(..nonce_len),
+        second.get(..nonce_len),
+        "a re-seal of one block id must roll to a fresh nonce, never repeat the deterministic one"
+    );
+}
+
+#[test]
+fn a_subject_keys_job_requires_the_tenant_dek_lease_too() {
+    let tenant = TenantId::new_test_id(7);
+    let region = KeyResidencyRegion("eu-west".to_owned());
+    let subject_lease = KeyLease {
+        residency: region.clone(),
+        scope: KeyScope::SubjectKeys,
+        tenant_id: tenant,
+    };
+    let dek_lease = KeyLease {
+        residency: region.clone(),
+        scope: KeyScope::TenantDek,
+        tenant_id: tenant,
+    };
+
+    assert!(
+        !is_eligible_for_job(
+            tenant,
+            KeyScope::SubjectKeys,
+            &region,
+            std::slice::from_ref(&subject_lease)
+        ),
+        "a subject-key lease alone must not satisfy a SubjectKeys job"
+    );
+    assert!(
+        is_eligible_for_job(
+            tenant,
+            KeyScope::SubjectKeys,
+            &region,
+            &[subject_lease.clone(), dek_lease.clone()]
+        ),
+        "holding both the subject-key and tenant-DEK leases makes the node eligible"
+    );
+
+    let other_tenant_dek = KeyLease {
+        residency: region.clone(),
+        scope: KeyScope::TenantDek,
+        tenant_id: TenantId::new_test_id(8),
+    };
+    assert!(
+        !is_eligible_for_job(
+            tenant,
+            KeyScope::SubjectKeys,
+            &region,
+            &[subject_lease.clone(), other_tenant_dek]
+        ),
+        "the tenant-DEK lease must be for the same tenant as the job"
+    );
+
+    let other_region = KeyResidencyRegion("us-east".to_owned());
+    assert!(
+        !is_eligible_for_job(
+            tenant,
+            KeyScope::SubjectKeys,
+            &other_region,
+            &[subject_lease, dek_lease]
+        ),
+        "leases for one region must not satisfy a job that must run in another"
+    );
+}
+
+#[test]
+fn key_material_lives_in_self_scrubbing_containers() {
+    let master = MasterKey::new([1u8; 32]);
+    let dek = TenantDek::new([2u8; 32]);
+    let content = ContentKey::new([3u8; 32]);
+    let _: &zeroize::Zeroizing<[u8; 32]> = &master.0;
+    let _: &zeroize::Zeroizing<[u8; 32]> = &dek.0;
+    let _: &zeroize::Zeroizing<[u8; 32]> = &content.0;
+
+    let scheme = AeadScheme::default();
+    let id = ContentKeyId::new_test_id(3003);
+    let wrapped = dek.wrap_content_key(&content, id, scheme).unwrap();
+    let unwrapped = dek.unwrap_content_key(&wrapped, id, scheme).unwrap();
+    let _: &zeroize::Zeroizing<[u8; 32]> = &unwrapped.0;
+}
+
+#[test]
+fn open_rejects_a_block_replayed_into_a_different_slot() {
+    let scheme = AeadScheme::default();
+    let content_key = ContentKey::new([7u8; 32]);
+    let sealed = content_key.seal(3, FILE_ID, 0, b"single-subject pii", scheme).unwrap();
+
+    assert_eq!(
+        content_key.open(3, FILE_ID, &sealed, scheme).as_deref(),
+        Some(b"single-subject pii".as_slice()),
+        "the block opens under the id it was sealed for"
+    );
+    assert!(
+        content_key.open(4, FILE_ID, &sealed, scheme).is_none(),
+        "the same intact blob opened under a different block id is rejected"
+    );
+}
+
+#[test]
+fn seal_binds_a_distinct_subkey_per_epoch_even_when_the_nonce_collides() {
+    let scheme = AeadScheme::AesGcm256;
+    let content_key = ContentKey::new([5u8; 32]);
+    let block_id = 5;
+    let low = content_key.seal(block_id, FILE_ID, 0, b"secret", scheme).unwrap();
+    let high = content_key
+        .seal(block_id, FILE_ID, 1u64 << 32, b"secret", scheme)
+        .unwrap();
+
+    let nonce_len = scheme.nonce_len();
+    assert_eq!(
+        low.get(..nonce_len),
+        high.get(..nonce_len),
+        "the two epochs must share the low-32-bit nonce this test targets"
+    );
+    assert_ne!(
+        low, high,
+        "a colliding nonce must still seal under distinct subkeys, so the ciphertexts differ"
+    );
+    assert_eq!(
+        content_key.open(block_id, FILE_ID, &low, scheme).as_deref(),
+        Some(b"secret".as_slice()),
+        "the epoch-0 blob round-trips"
+    );
+    assert_eq!(
+        content_key.open(block_id, FILE_ID, &high, scheme).as_deref(),
+        Some(b"secret".as_slice()),
+        "the epoch-2^32 blob round-trips under its own subkey"
+    );
+}

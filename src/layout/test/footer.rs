@@ -1,0 +1,1841 @@
+use super::*;
+use crate::benchmarks::{ProfileOverheadMeasurement, profile_overhead_gate_passes};
+use crate::events::{RelationshipKind, RelationshipRef};
+use crate::layout::HEADER_BLOCK_LEN;
+use crate::vector::{EmbeddingModel, VectorElement, VectorMetric};
+use crate::writer::build::{BuiltOe, build_oe_file};
+use crate::writer::source_form::tests::{plain_row, source_form_config};
+
+fn minimal_footer() -> Footer {
+    Footer {
+        audit: None,
+        clustering: Vec::new(),
+        columns: vec![ColumnDescriptor {
+            column_id: 0,
+            internal_only: false,
+            kind: ColumnKind::U64,
+            name: "epoch".to_owned(),
+            nullable: false,
+        }],
+        dictionaries: FileDictionaries::default(),
+        embedding_row_offsets: Vec::new(),
+        entity_hash_filters: Vec::new(),
+        entity_summary: None,
+        escape_hatches: Vec::new(),
+        exact_counts: ExactCounts {
+            row_count: 1,
+            ..ExactCounts::default()
+        },
+        external_ids: Vec::new(),
+        format_version: (1, 0),
+        freetext: Vec::new(),
+        freetext_row_offsets: Vec::new(),
+        granules: vec![GranuleEntry {
+            compressed_bytes_estimate: 0,
+            first_epoch: 1,
+            first_row_ordinal: 0,
+            first_sequence: 1,
+            granule_id: 0,
+            last_epoch: 1,
+            last_sequence: 100,
+            max_ingested_at_physical: 0,
+            max_occurred_at_physical: 0,
+            min_ingested_at_physical: 0,
+            min_occurred_at_physical: 0,
+            row_count: 1,
+            stripe_id: 0,
+        }],
+        graph: None,
+        inbox_recipients: Vec::new(),
+        integrity_gaps: Vec::new(),
+        io_alignment_bytes: 0,
+        marks: Vec::new(),
+        marks_directory: Vec::new(),
+        marks_page_offsets: Vec::new(),
+        marks_pages: Vec::new(),
+        optional_feature_flags: 0,
+        page_directory: Vec::new(),
+        page_minmax: Vec::new(),
+        page_stats: Vec::new(),
+        payload_granules: Vec::new(),
+        presence: Vec::new(),
+        profile: crate::layout::Profile::Event,
+        reference_filters: None,
+        required_feature_flags: 0,
+        schema_fingerprint: [0u8; 32],
+        shared_dictionaries: Vec::new(),
+        packed_shared_dictionaries: Vec::new(),
+        shredded: Vec::new(),
+        snapshot_keys: None,
+        sparse_keys: Vec::new(),
+        state_roots: Vec::new(),
+        stripe_checksums: Vec::new(),
+        stripe_proofs: Vec::new(),
+        stripe_ndv: Vec::new(),
+        stripes: Vec::new(),
+        text_token_indexes: Vec::new(),
+        text_token_offsets: Vec::new(),
+        time_series_rollups: None,
+        vector_columns: Vec::new(),
+    }
+}
+
+#[test]
+fn clustering_entries_round_trip_through_encode_decode() {
+    let mut footer = minimal_footer();
+    footer.clustering = vec![
+        ClusteringEntry {
+            clustering_quality: 0.9,
+            granule_id: 0,
+            projection_id: 1,
+            sortedness_proof: Some(SortednessProof {
+                column_names: vec!["entity_id_hash".to_owned(), "occurred_at".to_owned()],
+                direction: SortDirection::Ascending,
+            }),
+        },
+        ClusteringEntry {
+            clustering_quality: 0.2,
+            granule_id: 1,
+            projection_id: 1,
+            sortedness_proof: None,
+        },
+    ];
+
+    let bytes = encode_footer(&footer);
+    let decoded = decode_footer(&bytes).expect("footer decodes without error");
+    assert_eq!(decoded.clustering, footer.clustering);
+}
+
+#[test]
+fn a_shared_dictionary_alphabet_must_be_strictly_ascending_to_decode() {
+    let mut footer = minimal_footer();
+    footer.shared_dictionaries = vec![SharedDictionaryEntry {
+        column_id: 7,
+        values: vec!["active".to_owned(), "closed".to_owned(), "open".to_owned()],
+    }];
+    let bytes = encode_footer(&footer);
+    let decoded = decode_footer(&bytes).expect("a sorted alphabet decodes");
+    assert_eq!(decoded.shared_dictionaries, footer.shared_dictionaries);
+
+    for values in [
+        vec!["closed".to_owned(), "active".to_owned()],
+        vec!["active".to_owned(), "active".to_owned()],
+    ] {
+        footer.shared_dictionaries = vec![SharedDictionaryEntry { column_id: 7, values }];
+        let bytes = encode_footer(&footer);
+        assert!(
+            decode_footer(&bytes).is_err(),
+            "an out-of-order or duplicated alphabet must refuse to decode"
+        );
+    }
+}
+
+#[test]
+fn text_token_entries_round_trip_through_encode_decode() {
+    use crate::indexes::text_token::TextTokenIndex;
+
+    let mut footer = minimal_footer();
+    footer.text_token_indexes = vec![
+        TextTokenEntry {
+            column_id: 7,
+            granule_id: 0,
+            index_bytes: TextTokenIndex::build_from_values(&["alpha beta", "gamma"], false).encode(),
+            page_index: 0,
+        },
+        TextTokenEntry {
+            column_id: 7,
+            granule_id: 0,
+            index_bytes: TextTokenIndex::build_from_values(&["delta"], false).encode(),
+            page_index: 1,
+        },
+    ];
+
+    let bytes = encode_footer(&footer);
+    let decoded = decode_footer(&bytes).expect("footer decodes without error");
+    assert_eq!(decoded.text_token_indexes, footer.text_token_indexes);
+
+    let index = TextTokenIndex::decode(&decoded.text_token_indexes[0].index_bytes).expect("stored index decodes");
+    assert!(index.might_contain_token("beta"));
+    assert!(!index.might_contain_token("delta"));
+}
+
+#[test]
+fn entity_hash_filter_ranges_round_trip_through_encode_decode() {
+    let mut footer = minimal_footer();
+    footer.entity_hash_filters = vec![
+        EntityHashFilterEntry {
+            granule_id: 0,
+            index_len: 296,
+            index_offset: 4096,
+        },
+        EntityHashFilterEntry {
+            granule_id: 1,
+            index_len: 40,
+            index_offset: 8192,
+        },
+    ];
+
+    let bytes = encode_footer(&footer);
+    let decoded = decode_footer(&bytes).expect("footer decodes without error");
+    assert_eq!(decoded.entity_hash_filters, footer.entity_hash_filters);
+}
+
+#[test]
+fn absent_entity_hash_filter_section_decodes_to_empty() {
+    let footer = minimal_footer();
+    let bytes = encode_footer(&footer);
+    let decoded = decode_footer(&bytes).expect("footer decodes without error");
+    assert!(decoded.entity_hash_filters.is_empty());
+}
+
+#[test]
+fn external_id_index_and_reference_filters_round_trip_through_encode_decode() {
+    let mut footer = minimal_footer();
+    footer.external_ids = vec![
+        ExternalIdEntry {
+            id_hash: 3,
+            row_ordinal: 0,
+        },
+        ExternalIdEntry {
+            id_hash: 9,
+            row_ordinal: 4,
+        },
+    ];
+    footer.reference_filters = Some(vec![ReferenceFilterEntry {
+        column_id: 7005,
+        filter: vec![1, 2, 3],
+        granule_id: 0,
+    }]);
+    let decoded = decode_footer(&encode_footer(&footer)).expect("footer decodes without error");
+    assert_eq!(decoded.external_ids, footer.external_ids);
+    assert_eq!(decoded.reference_filters, footer.reference_filters);
+
+    footer.reference_filters = Some(Vec::new());
+    let decoded = decode_footer(&encode_footer(&footer)).expect("footer decodes without error");
+    assert_eq!(decoded.reference_filters, Some(Vec::new()));
+    let decoded = decode_footer(&encode_footer(&minimal_footer())).expect("footer decodes without error");
+    assert_eq!(decoded.reference_filters, None);
+    assert!(decoded.external_ids.is_empty());
+}
+
+fn external_id_round_trip(entries: Vec<ExternalIdEntry>) {
+    let mut footer = minimal_footer();
+    footer.external_ids = entries;
+    let decoded = decode_footer(&encode_footer(&footer)).expect("footer decodes without error");
+    assert_eq!(decoded.external_ids, footer.external_ids);
+    let mut out = Writer::new();
+    encode_external_ids_packed(&footer.external_ids, &mut out);
+    assert_eq!(
+        decode_external_ids_packed(out.bytes()).expect("packed index decodes"),
+        footer.external_ids
+    );
+}
+
+fn entry(id_hash: u64, row_ordinal: u64) -> ExternalIdEntry {
+    ExternalIdEntry { id_hash, row_ordinal }
+}
+
+#[test]
+fn packed_external_id_index_round_trips_edge_cases() {
+    external_id_round_trip(Vec::new());
+    external_id_round_trip(vec![entry(42, 7)]);
+    external_id_round_trip(vec![entry(0, 0)]);
+    external_id_round_trip(vec![entry(5, 1), entry(5, 2), entry(5, 9), entry(6, 0)]);
+    external_id_round_trip(vec![
+        entry(0, 0),
+        entry(1, 1),
+        entry(u64::MAX - 1, 2),
+        entry(u64::MAX, u64::MAX),
+    ]);
+    external_id_round_trip(vec![entry(u64::MAX, 3)]);
+    let mut hash = 0u64;
+    let entries: Vec<_> = (0..1000u64)
+        .map(|i| {
+            let gap = if (200..400).contains(&i) {
+                0
+            } else {
+                i.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 12
+            };
+            hash = hash.wrapping_add(gap);
+            entry(hash, i * 3)
+        })
+        .collect();
+    external_id_round_trip(entries);
+}
+
+#[test]
+fn packed_external_id_index_is_compact_and_rejects_hostile_input() {
+    let mut sorted: Vec<_> = (0..10_000u64)
+        .map(|i| entry(i.wrapping_mul(0x9E37_79B9_7F4A_7C15), i))
+        .collect();
+    sorted.sort_by_key(|e| (e.id_hash, e.row_ordinal));
+    let mut out = Writer::new();
+    encode_external_ids_packed(&sorted, &mut out);
+    assert!(out.len() < sorted.len() * 10, "packed index is {} bytes", out.len());
+    let bytes = out.into_bytes();
+    let mut forged = bytes.clone();
+    forged.splice(0..4, u32::MAX.to_le_bytes());
+    assert!(decode_external_ids_packed(&forged).is_err());
+    for len in 0..64 {
+        assert!(decode_external_ids_packed(bytes.get(..len).unwrap_or_default()).is_err());
+    }
+    assert!(decode_external_ids_packed(bytes.get(..bytes.len() - 1).unwrap_or_default()).is_err());
+    let mut trailing = bytes.clone();
+    trailing.push(0);
+    assert!(decode_external_ids_packed(&trailing).is_err());
+    let mut wide = vec![2, 0, 0, 0, 65];
+    wide.extend_from_slice(&[0; 9]);
+    assert!(decode_external_ids_packed(&wide).is_err());
+}
+
+#[test]
+fn legacy_external_id_section_still_decodes() {
+    let mut footer = minimal_footer();
+    footer.external_ids = vec![entry(3, 0), entry(9, 4), entry(u64::MAX, 1)];
+    let packed = encode_sections(&footer);
+    let mut legacy = SectionArea {
+        bytes: Writer::new(),
+        directory: Vec::new(),
+    };
+    for (id, range) in &packed.directory {
+        if *id == sections::EXTERNAL_IDS_PACKED {
+            legacy.push(sections::EXTERNAL_IDS, |out| {
+                out.put_u32(footer.external_ids.len() as u32);
+                for e in &footer.external_ids {
+                    out.put_u64(e.id_hash);
+                    out.put_u64(e.row_ordinal);
+                }
+            });
+        } else {
+            let bytes = packed.bytes.bytes().get(range.clone()).unwrap_or_default().to_vec();
+            legacy.push(*id, |out| out.put_slice(&bytes));
+        }
+    }
+    assert!(legacy.directory.iter().any(|(id, _)| *id == sections::EXTERNAL_IDS));
+    let decoded = decode_footer(&assemble_footer(&footer, legacy)).expect("legacy footer decodes");
+    assert_eq!(decoded.external_ids, footer.external_ids);
+}
+
+#[test]
+fn inbox_recipient_directory_round_trips_and_rejects_a_forged_count() {
+    let mut footer = minimal_footer();
+    footer.inbox_recipients = vec![
+        InboxRecipientEntry {
+            entity_id_hash_high: 2,
+            entity_id_hash_low: 1,
+            first_row_ordinal: 0,
+            last_epoch: 1,
+            last_sequence: 9,
+            row_count: 3,
+        },
+        InboxRecipientEntry {
+            entity_id_hash_high: 2,
+            entity_id_hash_low: 5,
+            first_row_ordinal: 3,
+            last_epoch: 2,
+            last_sequence: 4,
+            row_count: 1,
+        },
+    ];
+    let mut bytes = encode_footer(&footer);
+    let decoded = decode_footer(&bytes).expect("footer decodes without error");
+    assert_eq!(decoded.inbox_recipients, footer.inbox_recipients);
+    let decoded = decode_footer(&encode_footer(&minimal_footer())).expect("footer decodes without error");
+    assert!(decoded.inbox_recipients.is_empty());
+
+    let (entry_start, section_offset, section_len) = find_directory_entry(&bytes, sections::INBOX_RECIPIENTS);
+    bytes[section_offset..section_offset + 4].copy_from_slice(&3u32.to_le_bytes());
+    let section_bytes = bytes[section_offset..section_offset + section_len].to_vec();
+    write_checksum_at(&mut bytes, entry_start, &section_bytes);
+    assert_eq!(
+        decode_footer(&bytes),
+        Err(FormatError::Structural {
+            rule: "inbox recipient count exceeds input"
+        })
+    );
+}
+
+#[test]
+fn absent_text_token_section_decodes_to_empty() {
+    let footer = minimal_footer();
+    let bytes = encode_footer(&footer);
+    let decoded = decode_footer(&bytes).expect("footer decodes without error");
+    assert!(decoded.text_token_indexes.is_empty());
+}
+
+#[test]
+fn embedding_row_offsets_round_trip_through_encode_decode() {
+    let mut footer = minimal_footer();
+    footer.embedding_row_offsets = vec![
+        EmbeddingRowOffsets {
+            bytes_len: 128,
+            bytes_offset: 64,
+            column_id: 5000,
+            granule_id: 0,
+            offsets_len: 16,
+            offsets_offset: 48,
+        },
+        EmbeddingRowOffsets {
+            bytes_len: 256,
+            bytes_offset: 200,
+            column_id: 5000,
+            granule_id: 1,
+            offsets_len: 16,
+            offsets_offset: 184,
+        },
+    ];
+
+    let bytes = encode_footer(&footer);
+    let decoded = decode_footer(&bytes).expect("footer decodes without error");
+    assert_eq!(decoded.embedding_row_offsets, footer.embedding_row_offsets);
+}
+
+#[test]
+fn page_minmax_round_trips_through_encode_decode() {
+    let mut footer = minimal_footer();
+    footer.page_minmax = vec![
+        PageMinMax {
+            column_id: 7,
+            granule_id: 0,
+            max_i128: Some(9_000),
+            min_i128: Some(-42),
+            null_count: 2,
+            page_index: 0,
+            row_count: 100,
+        },
+        PageMinMax {
+            column_id: 7,
+            granule_id: 1,
+            max_i128: None,
+            min_i128: None,
+            null_count: 0,
+            page_index: 3,
+            row_count: 64,
+        },
+    ];
+
+    let bytes = encode_footer(&footer);
+    let decoded = decode_footer(&bytes).expect("footer decodes without error");
+    assert_eq!(decoded.page_minmax, footer.page_minmax);
+}
+
+#[test]
+fn footer_without_embedding_row_offsets_decodes_to_empty_vec() {
+    let footer = minimal_footer();
+    assert!(footer.embedding_row_offsets.is_empty());
+    let bytes = encode_footer(&footer);
+    let decoded = decode_footer(&bytes).expect("footer decodes");
+    assert!(decoded.embedding_row_offsets.is_empty());
+}
+
+#[test]
+fn footer_without_clustering_decodes_to_empty_vec() {
+    let footer = minimal_footer();
+    assert!(footer.clustering.is_empty());
+    let bytes = encode_footer(&footer);
+    let decoded = decode_footer(&bytes).expect("footer decodes");
+    assert!(decoded.clustering.is_empty());
+}
+
+#[test]
+fn all_granules_sorted_for_returns_true_when_every_entry_has_matching_proof() {
+    let ordering = ["entity_id_hash", "occurred_at"];
+    let mut footer = minimal_footer();
+    footer.clustering = vec![
+        ClusteringEntry {
+            clustering_quality: 0.9,
+            granule_id: 0,
+            projection_id: 2,
+            sortedness_proof: Some(SortednessProof {
+                column_names: ordering.iter().map(|s| s.to_string()).collect(),
+                direction: SortDirection::Ascending,
+            }),
+        },
+        ClusteringEntry {
+            clustering_quality: 0.85,
+            granule_id: 1,
+            projection_id: 2,
+            sortedness_proof: Some(SortednessProof {
+                column_names: ordering.iter().map(|s| s.to_string()).collect(),
+                direction: SortDirection::Ascending,
+            }),
+        },
+    ];
+
+    assert!(footer.all_granules_sorted_for(2, &ordering, SortDirection::Ascending));
+}
+
+#[test]
+fn all_granules_sorted_for_returns_false_when_any_entry_lacks_proof() {
+    let ordering = ["entity_id_hash", "occurred_at"];
+    let mut footer = minimal_footer();
+    footer.granules.push(second_granule());
+    footer.clustering = vec![
+        ClusteringEntry {
+            clustering_quality: 0.9,
+            granule_id: 0,
+            projection_id: 2,
+            sortedness_proof: Some(SortednessProof {
+                column_names: ordering.iter().map(|s| s.to_string()).collect(),
+                direction: SortDirection::Ascending,
+            }),
+        },
+        ClusteringEntry {
+            clustering_quality: 0.3,
+            granule_id: 1,
+            projection_id: 2,
+            sortedness_proof: None,
+        },
+    ];
+
+    assert!(!footer.all_granules_sorted_for(2, &ordering, SortDirection::Ascending));
+}
+
+#[test]
+fn all_granules_sorted_for_returns_false_when_a_granule_has_no_clustering_entry() {
+    let ordering = ["entity_id_hash", "occurred_at"];
+    let mut footer = minimal_footer();
+    footer.granules.push(second_granule());
+    footer.clustering = vec![ClusteringEntry {
+        clustering_quality: 0.9,
+        granule_id: 0,
+        projection_id: 2,
+        sortedness_proof: Some(SortednessProof {
+            column_names: ordering.iter().map(|s| s.to_string()).collect(),
+            direction: SortDirection::Ascending,
+        }),
+    }];
+
+    assert!(!footer.all_granules_sorted_for(2, &ordering, SortDirection::Ascending));
+}
+
+fn second_granule() -> GranuleEntry {
+    GranuleEntry {
+        granule_id: 1,
+        first_row_ordinal: 1,
+        first_sequence: 101,
+        last_sequence: 200,
+        ..minimal_footer().granules[0]
+    }
+}
+
+#[test]
+fn all_granules_sorted_for_returns_false_for_unknown_projection() {
+    let footer = minimal_footer();
+    assert!(!footer.all_granules_sorted_for(99, &["epoch"], SortDirection::Ascending));
+}
+
+const DIRECTORY_START: usize = 56;
+const DIRECTORY_ENTRY_LEN: usize = 52;
+
+fn section_count(bytes: &[u8]) -> u32 {
+    u32::from_le_bytes(bytes[52..56].try_into().expect("4 bytes"))
+}
+
+fn find_directory_entry(bytes: &[u8], id: u32) -> (usize, usize, usize) {
+    let count = section_count(bytes) as usize;
+    let section_area_start = DIRECTORY_START + count * DIRECTORY_ENTRY_LEN;
+    for index in 0..count {
+        let entry_start = DIRECTORY_START + index * DIRECTORY_ENTRY_LEN;
+        let entry_id = u32::from_le_bytes(bytes[entry_start..entry_start + 4].try_into().expect("4 bytes"));
+        if entry_id == id {
+            let rel_offset = u64::from_le_bytes(bytes[entry_start + 4..entry_start + 12].try_into().expect("8 bytes"));
+            let len = u64::from_le_bytes(bytes[entry_start + 12..entry_start + 20].try_into().expect("8 bytes"));
+            return (entry_start, section_area_start + rel_offset as usize, len as usize);
+        }
+    }
+    panic!("section {id} not found in directory");
+}
+
+fn write_u64_at(bytes: &mut [u8], at: usize, value: u64) {
+    bytes[at..at + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+fn write_checksum_at(bytes: &mut [u8], entry_start: usize, section_bytes: &[u8]) {
+    let checksum = blake3::hash(section_bytes);
+    bytes[entry_start + 20..entry_start + 52].copy_from_slice(checksum.as_bytes());
+}
+
+#[test]
+fn inconsistent_recorded_count_is_rejected_without_unbounded_allocation() {
+    let footer = minimal_footer();
+    let mut bytes = encode_footer(&footer);
+
+    let (entry_start, section_offset, section_len) = find_directory_entry(&bytes, sections::COLUMNS);
+    bytes[section_offset..section_offset + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+    let section_bytes = bytes[section_offset..section_offset + section_len].to_vec();
+    write_checksum_at(&mut bytes, entry_start, &section_bytes);
+
+    let err = decode_footer(&bytes).expect_err("forged column count must be rejected");
+    assert_eq!(
+        err,
+        FormatError::Structural {
+            rule: "column count exceeds input"
+        }
+    );
+}
+
+#[test]
+fn oversized_byte_extent_is_rejected() {
+    let footer = minimal_footer();
+    let mut bytes = encode_footer(&footer);
+
+    let (entry_start, _section_offset, section_len) = find_directory_entry(&bytes, sections::MARKS);
+    write_u64_at(&mut bytes, entry_start + 12, section_len as u64 + 1_000_000_000);
+
+    let err = decode_footer(&bytes).expect_err("oversized extent must be rejected");
+    assert_eq!(err, FormatError::Truncated { what: "section" });
+}
+
+#[test]
+fn unknown_section_id_is_skipped_without_being_read() {
+    let footer = minimal_footer();
+    let bytes = encode_footer(&footer);
+
+    let count = section_count(&bytes);
+    let insert_at = DIRECTORY_START + count as usize * DIRECTORY_ENTRY_LEN;
+
+    let mut forged_entry = Vec::with_capacity(DIRECTORY_ENTRY_LEN);
+    forged_entry.extend_from_slice(&9_999u32.to_le_bytes());
+    forged_entry.extend_from_slice(&0u64.to_le_bytes());
+    forged_entry.extend_from_slice(&u64::MAX.to_le_bytes());
+    forged_entry.extend_from_slice(&[0u8; 32]);
+
+    let mut mutated = bytes.clone();
+    mutated.splice(insert_at..insert_at, forged_entry);
+    mutated[52..56].copy_from_slice(&(count + 1).to_le_bytes());
+
+    let decoded = decode_footer(&mutated).expect("unknown section is skipped, not read");
+    assert_eq!(decoded.columns, footer.columns);
+}
+
+#[test]
+fn checksum_mismatch_is_rejected_rather_than_decoded() {
+    let footer = minimal_footer();
+    let mut bytes = encode_footer(&footer);
+
+    let (_entry_start, section_offset, _section_len) = find_directory_entry(&bytes, sections::COLUMNS);
+    bytes[section_offset] ^= 0xFF;
+
+    let err = decode_footer(&bytes).expect_err("tampered section must fail checksum verification");
+    assert_eq!(
+        err,
+        FormatError::Blake3Mismatch {
+            scope: "footer section"
+        }
+    );
+}
+
+fn sample_mark(projection_id: u32, column_id: u32, granule_id: u32, first_value_offset: Option<u64>) -> ColumnMark {
+    ColumnMark {
+        codec_pipeline_id: PipelineId(7),
+        column_id,
+        compressed_offset: u64::from(granule_id) * 1000,
+        compressed_size: 100 + u64::from(granule_id),
+        first_value_offset,
+        granule_id,
+        page_count: 1,
+        projection_id,
+        row_count: 8192,
+        uncompressed_offset: u64::from(granule_id) * 2000,
+        uncompressed_size: 200 + u64::from(granule_id),
+    }
+}
+
+fn sample_page(projection_id: u32, column_id: u32, granule_id: u32, page_index: u32) -> PageDirectoryEntry {
+    let base = u64::from(granule_id) * 10 + u64::from(page_index);
+    PageDirectoryEntry {
+        column_id,
+        compressed_len: 50 + base,
+        compressed_offset: base * 1000,
+        first_row_ordinal: base * 8192,
+        granule_id,
+        max_f64: Some(base as f64 + 0.5),
+        max_i128: Some(base as i128 + 100),
+        max_occurred_at_physical: base as i64 + 5,
+        max_sequence: base + 9,
+        min_f64: Some(base as f64),
+        min_i128: Some(base as i128),
+        min_occurred_at_physical: -(base as i64) - 5,
+        min_sequence: base,
+        null_count: page_index,
+        page_index,
+        projection_id,
+        row_count: 4096,
+    }
+}
+
+#[test]
+fn columnar_marks_round_trip_to_byte_identical_logical_directory() {
+    let marks = vec![
+        sample_mark(0, 1, 0, None),
+        sample_mark(0, 1, 1, Some(42)),
+        sample_mark(0, 1, 2, None),
+        sample_mark(0, 2, 0, None),
+        sample_mark(1, 1, 0, None),
+    ];
+    let page_directory = vec![
+        sample_page(0, 1, 0, 0),
+        sample_page(0, 1, 0, 1),
+        sample_page(0, 1, 1, 0),
+        sample_page(0, 1, 2, 0),
+        sample_page(0, 2, 0, 0),
+        sample_page(1, 1, 0, 0),
+    ];
+    let granule_stripe_ids = BTreeMap::from([(0, 0), (1, 0), (2, 1)]);
+
+    let bytes = encode_columnar_marks(&marks, &page_directory, &granule_stripe_ids).expect("encode succeeds");
+    let (mut decoded_marks, mut decoded_pages) = decode_columnar_marks(&bytes).expect("decode succeeds");
+
+    let mark_sort_key = |mark: &ColumnMark| (mark.projection_id, mark.column_id, mark.granule_id);
+    let mut expected_marks = marks;
+    decoded_marks.sort_by_key(mark_sort_key);
+    expected_marks.sort_by_key(mark_sort_key);
+    assert_eq!(decoded_marks, expected_marks);
+
+    let page_sort_key =
+        |page: &PageDirectoryEntry| (page.projection_id, page.column_id, page.granule_id, page.page_index);
+    let mut expected_pages = page_directory;
+    decoded_pages.sort_by_key(page_sort_key);
+    expected_pages.sort_by_key(page_sort_key);
+    assert_eq!(decoded_pages, expected_pages);
+}
+
+#[test]
+fn columnar_marks_round_trip_with_no_page_directory() {
+    let marks = vec![sample_mark(0, 1, 0, None), sample_mark(0, 1, 1, None)];
+    let granule_stripe_ids = BTreeMap::from([(0, 0), (1, 0)]);
+
+    let bytes = encode_columnar_marks(&marks, &[], &granule_stripe_ids).expect("encode succeeds");
+    let (mut decoded_marks, decoded_pages) = decode_columnar_marks(&bytes).expect("decode succeeds");
+
+    let sort_key = |mark: &ColumnMark| (mark.projection_id, mark.column_id, mark.granule_id);
+    let mut expected_marks = marks;
+    decoded_marks.sort_by_key(sort_key);
+    expected_marks.sort_by_key(sort_key);
+    assert_eq!(decoded_marks, expected_marks);
+    assert!(decoded_pages.is_empty(), "no page directory was supplied to encode");
+}
+
+#[test]
+fn columnar_page_directory_count_beyond_remaining_bytes_is_rejected() {
+    let mut out = Writer::new();
+    out.put_u32(0);
+    for _ in 0..8 {
+        encode_u64_column(&mut out, std::iter::empty());
+    }
+    out.put_u32(200);
+    out.put_slice(&[0u8; 400]);
+    let err =
+        decode_marks_page_directory(1, 0, &out.into_bytes()).expect_err("forged page directory count must be rejected");
+    assert_eq!(
+        err,
+        FormatError::Structural {
+            rule: "columnar page directory count exceeds input"
+        }
+    );
+}
+
+#[test]
+fn columnar_marks_count_beyond_decoded_arrays_is_rejected() {
+    let mut out = Writer::new();
+    out.put_u32(64);
+    for _ in 0..8 {
+        encode_u64_column(&mut out, std::iter::empty());
+    }
+    out.put_slice(&[0u8; 64]);
+    let err = decode_marks_page(1, 0, &out.into_bytes()).expect_err("forged mark count must be rejected");
+    assert_eq!(
+        err,
+        FormatError::Structural {
+            rule: "columnar marks column length mismatch"
+        }
+    );
+}
+
+#[test]
+fn columnar_marks_encode_rejects_a_granule_missing_from_the_stripe_map() {
+    let marks = vec![sample_mark(0, 1, 0, None)];
+    let err = encode_columnar_marks(&marks, &[], &BTreeMap::new()).expect_err("missing stripe mapping must error");
+    assert_eq!(
+        err,
+        FormatError::Structural {
+            rule: "columnar marks encode missing granule stripe mapping"
+        }
+    );
+}
+
+#[test]
+fn columnar_marks_encode_rejects_a_page_directory_entry_missing_from_the_stripe_map() {
+    let marks = vec![sample_mark(0, 1, 0, None)];
+    let page_directory = vec![sample_page(0, 1, 5, 0)];
+    let granule_stripe_ids = BTreeMap::from([(0, 0)]);
+    let err = encode_columnar_marks(&marks, &page_directory, &granule_stripe_ids)
+        .expect_err("missing stripe mapping must error");
+    assert_eq!(
+        err,
+        FormatError::Structural {
+            rule: "columnar marks encode missing granule stripe mapping"
+        }
+    );
+}
+
+#[test]
+fn columnar_marks_is_a_known_required_feature_every_new_file_declares() {
+    use crate::layout::required_features;
+
+    assert_eq!(required_features::COLUMNAR_MARKS, 1 << 15);
+    assert_eq!(
+        required_features::KNOWN & required_features::COLUMNAR_MARKS,
+        required_features::COLUMNAR_MARKS
+    );
+    assert_eq!(
+        required_features::ALL & required_features::COLUMNAR_MARKS,
+        required_features::COLUMNAR_MARKS
+    );
+}
+
+fn columnar_granule(granule_id: u32, stripe_id: u32) -> GranuleEntry {
+    GranuleEntry {
+        compressed_bytes_estimate: 0,
+        first_epoch: 1,
+        first_row_ordinal: 0,
+        first_sequence: 1,
+        granule_id,
+        last_epoch: 1,
+        last_sequence: 100,
+        max_ingested_at_physical: 0,
+        max_occurred_at_physical: 0,
+        min_ingested_at_physical: 0,
+        min_occurred_at_physical: 0,
+        row_count: 1,
+        stripe_id,
+    }
+}
+
+#[test]
+fn columnar_marks_footer_decodes_directory_only_leaving_row_oriented_marks_and_page_directory_empty() {
+    let mut footer = minimal_footer();
+    footer.required_feature_flags = required_features::COLUMNAR_MARKS;
+    footer.granules = vec![columnar_granule(0, 0), columnar_granule(1, 0), columnar_granule(2, 1)];
+    footer.exact_counts.row_count = 3;
+    footer.marks = vec![
+        sample_mark(0, 1, 0, None),
+        sample_mark(0, 1, 1, None),
+        sample_mark(0, 1, 2, None),
+    ];
+    footer.page_directory = vec![
+        sample_page(0, 1, 0, 0),
+        sample_page(0, 1, 1, 0),
+        sample_page(0, 1, 2, 0),
+    ];
+
+    let bytes = encode_footer(&footer);
+    let decoded = decode_footer(&bytes).expect("footer decodes");
+
+    assert!(
+        decoded.marks.is_empty(),
+        "row-oriented marks must stay empty for a columnar file"
+    );
+    assert!(
+        decoded.page_directory.is_empty(),
+        "row-oriented page directory must stay empty for a columnar file"
+    );
+    assert_eq!(
+        decoded.marks_directory.len(),
+        2,
+        "one page per (projection, column, stripe) group"
+    );
+
+    let mut rebuilt_marks = Vec::new();
+    let mut rebuilt_pages = Vec::new();
+    for entry in &decoded.marks_directory {
+        let (marks, pages) = decode_columnar_marks_page(&decoded.marks_pages, entry).expect("every page decodes");
+        rebuilt_marks.extend(marks);
+        rebuilt_pages.extend(pages);
+    }
+
+    let mark_sort_key = |mark: &ColumnMark| (mark.projection_id, mark.column_id, mark.granule_id);
+    rebuilt_marks.sort_by_key(mark_sort_key);
+    let mut expected_marks = footer.marks.clone();
+    expected_marks.sort_by_key(mark_sort_key);
+    assert_eq!(rebuilt_marks, expected_marks);
+
+    let page_sort_key =
+        |page: &PageDirectoryEntry| (page.projection_id, page.column_id, page.granule_id, page.page_index);
+    rebuilt_pages.sort_by_key(page_sort_key);
+    let mut expected_pages = footer.page_directory.clone();
+    expected_pages.sort_by_key(page_sort_key);
+    assert_eq!(rebuilt_pages, expected_pages);
+}
+
+#[test]
+fn row_oriented_marks_footer_leaves_columnar_directory_empty() {
+    let mut footer = minimal_footer();
+    footer.marks = vec![sample_mark(0, 1, 0, None)];
+
+    let bytes = encode_footer(&footer);
+    let decoded = decode_footer(&bytes).expect("footer decodes");
+
+    assert_eq!(decoded.marks, footer.marks);
+    assert!(decoded.marks_directory.is_empty());
+    assert!(decoded.marks_pages.is_empty());
+}
+
+#[test]
+fn columnar_and_row_oriented_forms_decode_to_the_same_logical_directory() {
+    let marks = vec![
+        sample_mark(0, 1, 0, None),
+        sample_mark(0, 1, 1, Some(42)),
+        sample_mark(0, 1, 2, None),
+        sample_mark(0, 2, 0, None),
+        sample_mark(1, 1, 0, None),
+    ];
+    let page_directory = vec![
+        sample_page(0, 1, 0, 0),
+        sample_page(0, 1, 0, 1),
+        sample_page(0, 1, 1, 0),
+        sample_page(0, 1, 2, 0),
+        sample_page(0, 2, 0, 0),
+        sample_page(1, 1, 0, 0),
+    ];
+    let granules = vec![columnar_granule(0, 0), columnar_granule(1, 0), columnar_granule(2, 1)];
+
+    let mut row_oriented = minimal_footer();
+    row_oriented.granules = granules.clone();
+    row_oriented.exact_counts.row_count = 3;
+    row_oriented.marks = marks.clone();
+    row_oriented.page_directory = page_directory.clone();
+    let row_decoded = decode_footer(&encode_footer(&row_oriented)).expect("row-oriented footer decodes");
+
+    let mut columnar = minimal_footer();
+    columnar.required_feature_flags = required_features::COLUMNAR_MARKS;
+    columnar.granules = granules;
+    columnar.exact_counts.row_count = 3;
+    columnar.marks = marks;
+    columnar.page_directory = page_directory;
+    let col_decoded = decode_footer(&encode_footer(&columnar)).expect("columnar footer decodes");
+
+    assert!(
+        col_decoded.marks.is_empty() && col_decoded.page_directory.is_empty(),
+        "a columnar footer carries no row-oriented marks or page directory"
+    );
+    assert!(
+        !row_decoded.marks.is_empty() && !row_decoded.page_directory.is_empty(),
+        "the row-oriented footer carries both sections"
+    );
+
+    let mut col_marks = Vec::new();
+    let mut col_pages = Vec::new();
+    for entry in &col_decoded.marks_directory {
+        let (page_marks, page_pages) =
+            decode_columnar_marks_page(&col_decoded.marks_pages, entry).expect("page decodes");
+        col_marks.extend(page_marks);
+        col_pages.extend(page_pages);
+    }
+
+    let mark_key = |m: &ColumnMark| (m.projection_id, m.column_id, m.granule_id);
+    let page_key = |p: &PageDirectoryEntry| (p.projection_id, p.column_id, p.granule_id, p.page_index);
+
+    let mut expected_marks = row_decoded.marks.clone();
+    expected_marks.sort_by_key(mark_key);
+    col_marks.sort_by_key(mark_key);
+    assert_eq!(
+        col_marks, expected_marks,
+        "columnar marks must equal the row-oriented directory field for field"
+    );
+
+    let mut expected_pages = row_decoded.page_directory.clone();
+    expected_pages.sort_by_key(page_key);
+    col_pages.sort_by_key(page_key);
+    assert_eq!(
+        col_pages, expected_pages,
+        "columnar per-page directory must equal the row-oriented one"
+    );
+
+    for expected in &expected_marks {
+        let got = col_marks
+            .iter()
+            .find(|m| mark_key(m) == mark_key(expected))
+            .expect("every (projection, column, granule) resolves in the columnar directory");
+        assert_eq!(
+            (got.compressed_offset, got.compressed_size, got.row_count),
+            (expected.compressed_offset, expected.compressed_size, expected.row_count),
+        );
+    }
+}
+
+#[test]
+fn all_granules_sorted_for_returns_false_when_columns_differ() {
+    let mut footer = minimal_footer();
+    footer.clustering = vec![ClusteringEntry {
+        clustering_quality: 0.9,
+        granule_id: 0,
+        projection_id: 3,
+        sortedness_proof: Some(SortednessProof {
+            column_names: vec!["epoch".to_owned()],
+            direction: SortDirection::Ascending,
+        }),
+    }];
+
+    assert!(!footer.all_granules_sorted_for(3, &["occurred_at", "epoch"], SortDirection::Ascending));
+}
+
+#[test]
+fn page_directory_bounds_that_are_inverted_are_rejected_by_both_encodings() {
+    let inverted = PageDirectoryEntry {
+        max_i128: Some(10),
+        min_i128: Some(100),
+        ..sample_page(0, 1, 5, 0)
+    };
+
+    let mut row_oriented = minimal_footer();
+    row_oriented.page_directory = vec![inverted];
+    assert!(
+        decode_footer(&encode_footer(&row_oriented)).is_err(),
+        "an inverted integer bound must not decode from the row-oriented directory"
+    );
+
+    let marks = vec![sample_mark(0, 1, 5, None)];
+    let granule_stripe_ids = std::collections::BTreeMap::from([(5u32, 0u32)]);
+    let bytes = encode_columnar_marks(&marks, &[inverted], &granule_stripe_ids).expect("encode succeeds");
+    assert!(
+        decode_columnar_marks(&bytes).is_err(),
+        "an inverted integer bound must not decode from the columnar directory"
+    );
+
+    for forged in [
+        PageDirectoryEntry {
+            max_i128: None,
+            ..sample_page(0, 1, 5, 0)
+        },
+        PageDirectoryEntry {
+            max_sequence: 1,
+            min_sequence: 9,
+            ..sample_page(0, 1, 5, 0)
+        },
+        PageDirectoryEntry {
+            max_occurred_at_physical: -100,
+            min_occurred_at_physical: 100,
+            ..sample_page(0, 1, 5, 0)
+        },
+        PageDirectoryEntry {
+            null_count: 5000,
+            row_count: 4096,
+            ..sample_page(0, 1, 5, 0)
+        },
+    ] {
+        let mut footer = minimal_footer();
+        footer.page_directory = vec![forged];
+        assert!(decode_footer(&encode_footer(&footer)).is_err());
+    }
+}
+
+#[test]
+fn every_profile_round_trips_through_the_footer() {
+    for profile in [
+        Profile::Audit,
+        Profile::Event,
+        Profile::Graph,
+        Profile::Inbox,
+        Profile::Log,
+        Profile::Snapshot,
+        Profile::TimeSeries,
+    ] {
+        let mut footer = minimal_footer();
+        footer.profile = profile;
+        assert_eq!(decode_footer(&encode_footer(&footer)).unwrap().profile, profile);
+    }
+}
+
+#[test]
+fn an_event_footer_carries_no_profile_section() {
+    let event = encode_footer(&minimal_footer());
+    let mut graph = minimal_footer();
+    graph.profile = Profile::Graph;
+    let graph = encode_footer(&graph);
+    assert_eq!(graph.len(), event.len() + 4 + 8 + 8 + 32 + 1);
+}
+
+fn stored_section_ids(built: &BuiltOe) -> Vec<u32> {
+    let end = built.bytes.len() - built.tree_len.unwrap_or(0) as usize;
+    let blob = &built.bytes[end - built.footer_len as usize..end - 8];
+    (0..section_count(blob) as usize)
+        .map(|index| {
+            let at = DIRECTORY_START + index * DIRECTORY_ENTRY_LEN;
+            u32::from_le_bytes(blob[at..at + 4].try_into().unwrap())
+        })
+        .collect()
+}
+
+#[test]
+fn a_profile_adds_one_footer_entry_and_one_byte_to_a_file() {
+    let rows = || (0..20).map(plain_row).collect::<Vec<_>>();
+    let event = build_oe_file(rows(), &source_form_config(4)).unwrap();
+    let mut config = source_form_config(4);
+    config.profile = Profile::Graph;
+    let graph = build_oe_file(rows(), &config).unwrap();
+    assert!(!stored_section_ids(&event).contains(&sections::PROFILE));
+    assert!(stored_section_ids(&graph).contains(&sections::PROFILE));
+
+    let measurement = ProfileOverheadMeasurement {
+        event_file_bytes: event.bytes.len() as u64,
+        event_header_block_bytes: event.footer.stripes[0].file_offset,
+        profiled_file_bytes: graph.bytes.len() as u64,
+        profiled_header_block_bytes: graph.footer.stripes[0].file_offset,
+    };
+    println!(
+        "profile overhead: {} extra bytes, header block {} bytes",
+        measurement.profiled_file_bytes - measurement.event_file_bytes,
+        measurement.profiled_header_block_bytes
+    );
+    assert_eq!(measurement.profiled_file_bytes - measurement.event_file_bytes, 52 + 1);
+    assert_eq!(measurement.profiled_header_block_bytes, HEADER_BLOCK_LEN as u64);
+    assert!(profile_overhead_gate_passes(&measurement));
+}
+
+#[test]
+fn an_unknown_footer_profile_code_is_a_structural_error() {
+    let mut footer = minimal_footer();
+    footer.profile = Profile::Graph;
+    let mut blob = encode_footer(&footer);
+    let last = blob.len() - 1;
+    assert_eq!(blob[last], Profile::Graph.code());
+    blob[last] = 0xEE;
+    let section_count = u32::from_le_bytes(blob[52..56].try_into().unwrap()) as usize;
+    let directory_end = 56 + section_count * 52;
+    for entry in 0..section_count {
+        let at = 56 + entry * 52;
+        if u32::from_le_bytes(blob[at..at + 4].try_into().unwrap()) == sections::PROFILE {
+            let offset = u64::from_le_bytes(blob[at + 4..at + 12].try_into().unwrap()) as usize;
+            let hash = crate::file::integrity::hash_tree(&blob[directory_end + offset..directory_end + offset + 1]);
+            blob[at + 20..at + 52].copy_from_slice(hash.as_bytes());
+        }
+    }
+    assert_eq!(
+        decode_footer(&blob).unwrap_err(),
+        FormatError::Structural {
+            rule: "unknown profile"
+        }
+    );
+}
+
+fn audit_footer(retention: Option<ObjectLockRetention>, legal_hold: bool) -> Footer {
+    let mut footer = minimal_footer();
+    footer.audit = Some(AuditTrail {
+        chain_end: [7; 32],
+        chain_start: [3; 32],
+        legal_hold,
+        retention,
+    });
+    footer.profile = Profile::Audit;
+    footer.required_feature_flags |= required_features::AUDIT_HASH_CHAIN;
+    footer
+}
+
+fn graph_footer() -> Footer {
+    let mut footer = minimal_footer();
+    footer.profile = Profile::Graph;
+    footer.required_feature_flags |= required_features::GRAPH_DENSE_IDS
+        | required_features::GRAPH_CSR_FORWARD
+        | required_features::GRAPH_CSR_REVERSE;
+    footer.graph = Some(GraphDirectory {
+        chain_cover: None,
+        blocks: vec![GraphBlockEntry {
+            granule_id: 0,
+            len: 300,
+            offset: 4_096,
+        }],
+        depth: None,
+        event_ids: None,
+        first_sn: 77,
+        subject: b"!room:example.org".to_vec(),
+        unresolved: vec![UnresolvedEdge {
+            child: 77,
+            parent: RelationshipRef::to_external(RelationshipKind::Prev, b"$missing:example.org").unwrap(),
+        }],
+    });
+    footer
+}
+
+#[test]
+fn an_audit_trail_round_trips_through_the_footer() {
+    for (retention, legal_hold) in [
+        (None, false),
+        (None, true),
+        (
+            Some(ObjectLockRetention {
+                mode: RetentionMode::Governance,
+                retain_until: crate::events::TimestampValue::from_physical_nanos(-5),
+            }),
+            false,
+        ),
+        (
+            Some(ObjectLockRetention {
+                mode: RetentionMode::Compliance,
+                retain_until: crate::events::TimestampValue::from_physical_nanos(i64::MAX),
+            }),
+            true,
+        ),
+    ] {
+        let footer = audit_footer(retention, legal_hold);
+        assert_eq!(decode_footer(&encode_footer(&footer)).unwrap(), footer);
+    }
+    assert!(RetentionMode::from_u8(2).is_err());
+    assert_eq!(decode_footer(&encode_footer(&minimal_footer())).unwrap().audit, None);
+}
+
+#[test]
+fn an_audit_section_without_its_feature_or_profile_is_refused() {
+    let refused = Err(FormatError::Structural {
+        rule: "an audit section, the audit_hash_chain feature and the audit profile appear together",
+    });
+    let mut no_bit = audit_footer(None, false);
+    no_bit.required_feature_flags &= !required_features::AUDIT_HASH_CHAIN;
+    assert_eq!(decode_footer(&encode_footer(&no_bit)), refused);
+    let mut wrong_profile = audit_footer(None, false);
+    wrong_profile.profile = Profile::Log;
+    assert_eq!(decode_footer(&encode_footer(&wrong_profile)), refused);
+    let mut no_section = audit_footer(None, false);
+    no_section.audit = None;
+    assert_eq!(decode_footer(&encode_footer(&no_section)), refused);
+}
+
+#[test]
+fn the_graph_edge_directory_round_trips_through_the_footer() {
+    let footer = graph_footer();
+    assert_eq!(decode_footer(&encode_footer(&footer)).unwrap().graph, footer.graph);
+    assert_eq!(decode_footer(&encode_footer(&minimal_footer())).unwrap().graph, None);
+}
+
+#[test]
+fn a_graph_depth_range_round_trips_and_a_reversed_one_is_refused() {
+    let mut footer = graph_footer();
+    if let Some(graph) = &mut footer.graph {
+        graph.depth = Some(crate::layout::graph::DepthRange { max: 90, min: 12 });
+    }
+    assert_eq!(decode_footer(&encode_footer(&footer)).unwrap().graph, footer.graph);
+
+    if let Some(graph) = &mut footer.graph {
+        graph.depth = Some(crate::layout::graph::DepthRange { max: 11, min: 12 });
+    }
+    assert_eq!(
+        decode_footer(&encode_footer(&footer)),
+        Err(FormatError::Structural {
+            rule: "graph depth section holds a minimum then a maximum it does not pass",
+        })
+    );
+}
+
+fn indexed_graph_footer() -> Footer {
+    let mut footer = graph_footer();
+    footer.required_feature_flags |= required_features::GRAPH_EVENT_ID_INDEX;
+    if let Some(graph) = &mut footer.graph {
+        graph.event_ids = crate::layout::graph::EventIdIndex::build([(&b"$a:example.org"[..], 77)]).unwrap();
+    }
+    footer
+}
+
+#[test]
+fn a_graph_event_id_index_round_trips_only_with_its_feature_bit() {
+    let footer = indexed_graph_footer();
+    assert_eq!(decode_footer(&encode_footer(&footer)).unwrap().graph, footer.graph);
+
+    let mut no_bit = indexed_graph_footer();
+    no_bit.required_feature_flags &= !required_features::GRAPH_EVENT_ID_INDEX;
+    let mut no_index = indexed_graph_footer();
+    if let Some(graph) = &mut no_index.graph {
+        graph.event_ids = None;
+    }
+    let mut outside = indexed_graph_footer();
+    if let Some(index) = outside.graph.as_mut().and_then(|graph| graph.event_ids.as_mut()) {
+        index.sns[0] = 78;
+    }
+    let mut repeated = indexed_graph_footer();
+    if let Some(index) = repeated.graph.as_mut().and_then(|graph| graph.event_ids.as_mut()) {
+        index.hashes.push(index.hashes[0]);
+        index.sns.push(77);
+    }
+    let mut no_filter = indexed_graph_footer();
+    if let Some(index) = no_filter.graph.as_mut().and_then(|graph| graph.event_ids.as_mut()) {
+        index.filter.clear();
+    }
+    let mut no_graph = indexed_graph_footer();
+    no_graph.graph = None;
+    no_graph.required_feature_flags &= !required_features::GRAPH;
+    no_graph.required_feature_flags |= required_features::GRAPH_EVENT_ID_INDEX;
+    for footer in [no_bit, no_index, outside, repeated, no_filter, no_graph] {
+        assert!(decode_footer(&encode_footer(&footer)).is_err());
+    }
+}
+
+fn chain_cover_footer() -> Footer {
+    let mut footer = graph_footer();
+    footer.required_feature_flags |= required_features::GRAPH_CHAIN_COVER;
+    if let Some(graph) = &mut footer.graph {
+        graph.chain_cover = Some(crate::layout::graph::ChainCover::build(
+            &crate::layout::graph::ChainCoverInput {
+                labels: vec![crate::layout::graph::ChainLabel { chain_id: 4, seq: 9 }],
+                links: vec![
+                    crate::layout::graph::ChainLink {
+                        from_chain: 4,
+                        from_seq: 9,
+                        to_chain: 2,
+                        to_seq: 3,
+                    },
+                    crate::layout::graph::ChainLink {
+                        from_chain: 1,
+                        from_seq: 5,
+                        to_chain: 0,
+                        to_seq: 1,
+                    },
+                ],
+            },
+        ));
+    }
+    footer
+}
+
+#[test]
+fn a_graph_chain_cover_round_trips_only_with_its_feature_bit() {
+    let footer = chain_cover_footer();
+    assert_eq!(decode_footer(&encode_footer(&footer)).unwrap().graph, footer.graph);
+
+    let mut no_bit = chain_cover_footer();
+    no_bit.required_feature_flags &= !required_features::GRAPH_CHAIN_COVER;
+    let mut no_cover = chain_cover_footer();
+    if let Some(graph) = &mut no_cover.graph {
+        graph.chain_cover = None;
+    }
+    let mut unsorted_links = chain_cover_footer();
+    if let Some(cover) = unsorted_links
+        .graph
+        .as_mut()
+        .and_then(|graph| graph.chain_cover.as_mut())
+    {
+        cover.links.swap(0, 1);
+    }
+    let mut inverted_range = chain_cover_footer();
+    if let Some(cover) = inverted_range
+        .graph
+        .as_mut()
+        .and_then(|graph| graph.chain_cover.as_mut())
+    {
+        cover.chains[0].min_seq = 10;
+    }
+    let mut no_graph = chain_cover_footer();
+    no_graph.graph = None;
+    no_graph.required_feature_flags &= !required_features::GRAPH;
+    no_graph.required_feature_flags |= required_features::GRAPH_CHAIN_COVER;
+    for footer in [no_bit, no_cover, unsorted_links, inverted_range, no_graph] {
+        assert!(decode_footer(&encode_footer(&footer)).is_err());
+    }
+}
+
+#[test]
+fn graph_edges_and_their_feature_bits_come_together_on_a_graph_profile_file() {
+    let mut event_profile = graph_footer();
+    event_profile.profile = Profile::Event;
+    let mut forward_only = graph_footer();
+    forward_only.required_feature_flags &= !required_features::GRAPH_CSR_REVERSE;
+    let mut sparse_ids = graph_footer();
+    sparse_ids.required_feature_flags &= !required_features::GRAPH_DENSE_IDS;
+    let mut bits_without_edges = graph_footer();
+    bits_without_edges.graph = None;
+    let mut overflowing = graph_footer();
+    if let Some(graph) = &mut overflowing.graph {
+        graph.first_sn = u64::MAX;
+    }
+    let mut unresolved_outside = graph_footer();
+    if let Some(graph) = &mut unresolved_outside.graph {
+        graph.unresolved[0].child = 78;
+    }
+    let mut unresolved_by_sequence = graph_footer();
+    if let Some(graph) = &mut unresolved_by_sequence.graph {
+        graph.unresolved[0].parent = RelationshipRef::to_subject_sequence(RelationshipKind::Prev, 3);
+    }
+    for footer in [
+        event_profile,
+        forward_only,
+        sparse_ids,
+        bits_without_edges,
+        overflowing,
+        unresolved_outside,
+        unresolved_by_sequence,
+    ] {
+        assert!(matches!(
+            decode_footer(&encode_footer(&footer)),
+            Err(FormatError::Structural { .. })
+        ));
+    }
+}
+
+fn state_roots_footer() -> Footer {
+    let mut footer = graph_footer();
+    footer.exact_counts.row_count = 3;
+    footer.granules[0].row_count = 3;
+    footer.required_feature_flags |= required_features::GRAPH_STATE_ROOTS;
+    footer.state_roots = [0, 2]
+        .into_iter()
+        .map(|row_ordinal| StateRootEntry {
+            root: StateRoot {
+                address: [row_ordinal as u8 + 1; 32],
+                entry_count: 40 + row_ordinal as u32,
+            },
+            row_ordinal,
+        })
+        .collect();
+    footer
+}
+
+#[test]
+fn state_roots_round_trip_through_the_footer() {
+    let footer = state_roots_footer();
+    assert_eq!(
+        decode_footer(&encode_footer(&footer)).unwrap().state_roots,
+        footer.state_roots
+    );
+    assert!(
+        decode_footer(&encode_footer(&graph_footer()))
+            .unwrap()
+            .state_roots
+            .is_empty()
+    );
+}
+
+#[test]
+fn state_roots_come_only_with_their_bit_on_a_graph_file_with_edges_and_name_its_rows_in_order() {
+    let mut bit_without_roots = state_roots_footer();
+    bit_without_roots.state_roots.clear();
+    let mut roots_without_bit = state_roots_footer();
+    roots_without_bit.required_feature_flags &= !required_features::GRAPH_STATE_ROOTS;
+    let mut without_edges = state_roots_footer();
+    without_edges.graph = None;
+    without_edges.required_feature_flags &=
+        !(required_features::GRAPH_CSR_FORWARD | required_features::GRAPH_CSR_REVERSE);
+    let mut event_profile = state_roots_footer();
+    event_profile.profile = Profile::Event;
+    let mut out_of_order = state_roots_footer();
+    out_of_order.state_roots.reverse();
+    let mut past_the_file = state_roots_footer();
+    past_the_file.state_roots[1].row_ordinal = 3;
+    for footer in [
+        bit_without_roots,
+        roots_without_bit,
+        without_edges,
+        event_profile,
+        out_of_order,
+        past_the_file,
+    ] {
+        assert!(matches!(
+            decode_footer(&encode_footer(&footer)),
+            Err(FormatError::Structural { .. })
+        ));
+    }
+}
+
+#[test]
+fn a_snapshot_key_index_round_trips_only_with_one_first_key_per_granule() {
+    let mut footer = minimal_footer();
+    assert_eq!(footer.granules.len(), 1);
+    footer.snapshot_keys = Some(SnapshotKeyIndex::build(&["a", "b"], &[0]).unwrap());
+    assert_eq!(
+        decode_footer(&encode_footer(&footer)).unwrap().snapshot_keys,
+        footer.snapshot_keys
+    );
+
+    footer.snapshot_keys = Some(SnapshotKeyIndex::build(&["a", "b"], &[0, 1]).unwrap());
+    assert_eq!(
+        decode_footer(&encode_footer(&footer)).unwrap_err(),
+        FormatError::Structural {
+            rule: "snapshot key index must hold one first key per granule"
+        }
+    );
+}
+
+fn time_series_footer() -> Footer {
+    let mut footer = minimal_footer();
+    footer.profile = Profile::TimeSeries;
+    footer.columns.push(ColumnDescriptor {
+        column_id: 1000,
+        internal_only: false,
+        kind: ColumnKind::F64,
+        name: "cpu".to_owned(),
+        nullable: true,
+    });
+    let mut aggregate = crate::layout::time_series::FloatAggregate::default();
+    aggregate.add(0.25);
+    footer.time_series_rollups = Some(crate::layout::time_series::TimeSeriesRollups {
+        bucket_nanos: 60_000_000_000,
+        buckets: vec![crate::layout::time_series::RollupBucket {
+            aggregates: vec![aggregate],
+            bucket: -3,
+            first_row_ordinal: 0,
+            row_count: 1,
+        }],
+        column_ids: vec![1000],
+    });
+    footer
+}
+
+#[test]
+fn time_series_rollups_round_trip_and_ride_only_a_time_series_footer_over_its_rows_and_float_columns() {
+    let footer = time_series_footer();
+    let decoded = decode_footer(&encode_footer(&footer)).unwrap();
+    assert_eq!(decoded.time_series_rollups, footer.time_series_rollups);
+    assert!(
+        decode_footer(&encode_footer(&minimal_footer()))
+            .unwrap()
+            .time_series_rollups
+            .is_none()
+    );
+
+    let refused = FormatError::Structural {
+        rule: "time-series rollups cover a time-series file's rows and float columns",
+    };
+    let mut event = time_series_footer();
+    event.profile = Profile::Event;
+    assert_eq!(decode_footer(&encode_footer(&event)).unwrap_err(), refused);
+    let mut more_rows = time_series_footer();
+    more_rows.exact_counts.row_count = 2;
+    assert_eq!(decode_footer(&encode_footer(&more_rows)).unwrap_err(), refused);
+    let mut not_a_float = time_series_footer();
+    if let Some(rollups) = &mut not_a_float.time_series_rollups {
+        rollups.column_ids = vec![0];
+    }
+    assert_eq!(decode_footer(&encode_footer(&not_a_float)).unwrap_err(), refused);
+}
+
+fn section_bytes_by_id(area: &SectionArea) -> Vec<(u32, Vec<u8>)> {
+    area.directory
+        .iter()
+        .map(|(id, range)| (*id, area.bytes.bytes()[range.clone()].to_vec()))
+        .collect()
+}
+
+#[test]
+fn time_series_rollups_section_holds_exactly_the_standalone_encoding() {
+    let footer = time_series_footer();
+    let mut without = time_series_footer();
+    without.time_series_rollups = None;
+    let with_sections = section_bytes_by_id(&encode_sections(&footer));
+    let without_sections = section_bytes_by_id(&encode_sections(&without));
+
+    let rollups = footer.time_series_rollups.as_ref().unwrap();
+    let rollup_sections: Vec<&Vec<u8>> = with_sections
+        .iter()
+        .filter(|(id, _)| *id == sections::TIME_SERIES_ROLLUPS)
+        .map(|(_, bytes)| bytes)
+        .collect();
+    assert_eq!(rollup_sections, vec![&rollups.encode()]);
+    let others: Vec<(u32, Vec<u8>)> = with_sections
+        .into_iter()
+        .filter(|(id, _)| *id != sections::TIME_SERIES_ROLLUPS)
+        .collect();
+    assert_eq!(others, without_sections);
+
+    let bytes = encode_footer(&footer);
+    let (_, offset, len) = find_directory_entry(&bytes, sections::TIME_SERIES_ROLLUPS);
+    assert_eq!(&bytes[offset..offset + len], rollups.encode().as_slice());
+    assert_eq!(
+        decode_footer(&bytes).unwrap().time_series_rollups,
+        footer.time_series_rollups
+    );
+}
+
+fn vector_footer(element: VectorElement, metric: VectorMetric) -> Footer {
+    let mut footer = minimal_footer();
+    footer.required_feature_flags |= crate::layout::required_features::VECTOR_COLUMNS;
+    footer.columns.push(ColumnDescriptor {
+        column_id: 5001,
+        internal_only: true,
+        kind: ColumnKind::Vector,
+        name: "embedding".to_owned(),
+        nullable: false,
+    });
+    footer.vector_columns = vec![VectorColumnMeta {
+        column_id: 5001,
+        element,
+        model: EmbeddingModel {
+            dimension: 384,
+            digest: [3u8; 32],
+            id: "minilm".to_owned(),
+            metric,
+        },
+        representation_of: 5000,
+    }];
+    footer
+}
+
+#[test]
+fn vector_column_metadata_round_trips_for_every_element_type_and_metric() {
+    for element in [
+        VectorElement::F16,
+        VectorElement::F32,
+        VectorElement::I8,
+        VectorElement::U1,
+    ] {
+        for metric in [VectorMetric::Cosine, VectorMetric::Dot, VectorMetric::L2] {
+            let footer = vector_footer(element, metric);
+            let decoded = decode_footer(&encode_footer(&footer)).unwrap();
+            assert_eq!(decoded.vector_columns, footer.vector_columns);
+            assert_eq!(decoded.columns, footer.columns);
+        }
+    }
+}
+
+#[test]
+fn a_footer_without_vector_columns_stays_byte_identical() {
+    let footer = minimal_footer();
+    let bytes = encode_footer(&footer);
+    let decoded = decode_footer(&bytes).unwrap();
+    assert!(decoded.vector_columns.is_empty());
+    assert_eq!(encode_footer(&decoded), bytes);
+}
+
+#[test]
+fn vector_metadata_must_cover_exactly_the_vector_columns() {
+    let mut footer = vector_footer(VectorElement::I8, VectorMetric::Cosine);
+    footer.vector_columns.clear();
+    footer.required_feature_flags &= !crate::layout::required_features::VECTOR_COLUMNS;
+    assert!(decode_footer(&encode_footer(&footer)).is_err());
+    let mut undeclared = vector_footer(VectorElement::I8, VectorMetric::Cosine);
+    undeclared.required_feature_flags &= !crate::layout::required_features::VECTOR_COLUMNS;
+    assert!(decode_footer(&encode_footer(&undeclared)).is_err());
+}
+
+#[test]
+fn footer_decode_rejects_granule_row_counts_that_disagree_with_the_file() {
+    let built = build_oe_file((0..12).map(plain_row).collect(), &source_form_config(4)).unwrap();
+    assert!(built.footer.granules.len() > 1);
+    decode_footer(&encode_footer(&built.footer)).unwrap();
+    let mut overrun = built.footer.clone();
+    overrun.granules[0].row_count += 1;
+    assert!(decode_footer(&encode_footer(&overrun)).is_err());
+    let mut undercount = built.footer.clone();
+    undercount.exact_counts.row_count += 1;
+    assert!(decode_footer(&encode_footer(&undercount)).is_err());
+}
+
+#[test]
+fn entity_summary_section_round_trips_and_requires_its_optional_feature() {
+    use crate::indexes::entity_summary::{EntityKey, EntitySummary};
+    for summary in [
+        EntitySummary::from_keys([EntityKey::new(1, 2), EntityKey::new(3, 4)]),
+        EntitySummary::from_keys((0..1_000).map(|i| EntityKey::new(i, i * 7))),
+    ] {
+        let mut footer = minimal_footer();
+        footer.entity_summary = Some(summary.clone());
+        footer.optional_feature_flags |= crate::layout::optional_features::ENTITY_SUMMARY;
+        let decoded = decode_footer(&encode_footer(&footer)).unwrap();
+        assert_eq!(decoded.entity_summary, Some(summary.clone()));
+
+        footer.optional_feature_flags &= !crate::layout::optional_features::ENTITY_SUMMARY;
+        assert!(decode_footer(&encode_footer(&footer)).is_err());
+    }
+    let decoded = decode_footer(&encode_footer(&minimal_footer())).unwrap();
+    assert_eq!(decoded.entity_summary, None);
+}
+
+fn key_entry(key: u32, row_ordinal: u64) -> ExternalIdEntry {
+    entry(u64::from(key) << 32, row_ordinal)
+}
+
+fn external_id_32_round_trip(entries: Vec<ExternalIdEntry>) {
+    let mut footer = minimal_footer();
+    footer.external_ids = entries;
+    let sections = encode_sections(&footer);
+    if !footer.external_ids.is_empty() {
+        assert!(
+            sections
+                .directory
+                .iter()
+                .any(|(id, _)| *id == sections::EXTERNAL_IDS_32)
+        );
+        assert!(
+            !sections
+                .directory
+                .iter()
+                .any(|(id, _)| *id == sections::EXTERNAL_IDS_PACKED)
+        );
+    }
+    let decoded = decode_footer(&encode_footer(&footer)).expect("footer decodes without error");
+    assert_eq!(decoded.external_ids, footer.external_ids);
+    let mut out = Writer::new();
+    encode_external_ids_32(&footer.external_ids, &mut out);
+    assert_eq!(
+        decode_external_ids_32(out.bytes()).expect("32-bit index decodes"),
+        footer.external_ids
+    );
+}
+
+#[test]
+fn external_id_32_index_round_trips_edge_cases() {
+    external_id_32_round_trip(Vec::new());
+    external_id_32_round_trip(vec![key_entry(0, 0)]);
+    external_id_32_round_trip(vec![key_entry(u32::MAX, u64::MAX)]);
+    external_id_32_round_trip(vec![key_entry(5, 1), key_entry(5, 2), key_entry(5, 9), key_entry(6, 0)]);
+    external_id_32_round_trip(vec![key_entry(0, 0), key_entry(1, 1), key_entry(u32::MAX, 2)]);
+    let mut keys: Vec<u32> = (0..1000u32).map(|i| i.wrapping_mul(0x9E37_79B9)).collect();
+    keys.extend(std::iter::repeat_n(7, 300));
+    keys.sort_unstable();
+    external_id_32_round_trip(
+        keys.into_iter()
+            .enumerate()
+            .map(|(i, k)| key_entry(k, i as u64))
+            .collect(),
+    );
+}
+
+#[test]
+fn external_id_32_index_is_compact_and_rejects_hostile_input() {
+    let mut sorted: Vec<_> = (0..10_000u64)
+        .map(|i| {
+            entry(
+                ExternalIdEntry::truncated_hash(i.wrapping_mul(0x9E37_79B9_7F4A_7C15)),
+                i,
+            )
+        })
+        .collect();
+    sorted.sort_by_key(|e| (e.id_hash, e.row_ordinal));
+    let mut out = Writer::new();
+    encode_external_ids_32(&sorted, &mut out);
+    assert!(out.len() < sorted.len() * 5, "32-bit index is {} bytes", out.len());
+    let bytes = out.into_bytes();
+    let mut forged = bytes.clone();
+    forged.splice(0..4, u32::MAX.to_le_bytes());
+    assert!(decode_external_ids_32(&forged).is_err());
+    for len in 0..64 {
+        assert!(decode_external_ids_32(bytes.get(..len).unwrap_or_default()).is_err());
+    }
+    assert!(decode_external_ids_32(bytes.get(..bytes.len() - 1).unwrap_or_default()).is_err());
+    let mut trailing = bytes.clone();
+    trailing.push(0);
+    assert!(decode_external_ids_32(&trailing).is_err());
+    let mut wide = vec![2, 0, 0, 0, 0, 0, 0, 0, 0, 33];
+    wide.extend_from_slice(&[0; 5]);
+    assert!(decode_external_ids_32(&wide).is_err());
+    assert!(decode_external_ids_32(&[1, 0, 0, 0, 65, 0, 0, 0, 0]).is_err());
+    let overflow = [2, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 1, 1];
+    assert!(decode_external_ids_32(&overflow).is_err());
+}
+
+#[test]
+fn full_hash_indexes_keep_the_64_bit_section_and_the_32_bit_section_wins() {
+    let mut footer = minimal_footer();
+    footer.external_ids = vec![entry(3, 0), entry(9, 4)];
+    let sections = encode_sections(&footer);
+    assert!(
+        sections
+            .directory
+            .iter()
+            .any(|(id, _)| *id == sections::EXTERNAL_IDS_PACKED)
+    );
+    assert!(
+        !sections
+            .directory
+            .iter()
+            .any(|(id, _)| *id == sections::EXTERNAL_IDS_32)
+    );
+    let mut both = SectionArea {
+        bytes: Writer::new(),
+        directory: Vec::new(),
+    };
+    for (id, range) in &sections.directory {
+        let bytes = sections.bytes.bytes().get(range.clone()).unwrap_or_default().to_vec();
+        both.push(*id, |out| out.put_slice(&bytes));
+    }
+    let truncated = vec![key_entry(1, 0), key_entry(2, 4)];
+    both.push(sections::EXTERNAL_IDS_32, |out| encode_external_ids_32(&truncated, out));
+    let decoded = decode_footer(&assemble_footer(&footer, both)).expect("footer decodes");
+    assert_eq!(decoded.external_ids, truncated);
+}
+
+#[test]
+#[ignore = "release-mode external-id index decode timing"]
+fn external_id_index_decode_timing() {
+    let n = 1_000_000u64;
+    let mut full: Vec<_> = (0..n)
+        .map(|i| entry(crate::indexes::stable_hash(&i.to_le_bytes()), i))
+        .collect();
+    full.sort_unstable_by_key(|e| (e.id_hash, e.row_ordinal));
+    let mut short: Vec<_> = full
+        .iter()
+        .map(|e| entry(ExternalIdEntry::truncated_hash(e.id_hash), e.row_ordinal))
+        .collect();
+    short.sort_unstable_by_key(|e| (e.id_hash, e.row_ordinal));
+    let mut packed = Writer::new();
+    encode_external_ids_packed(&full, &mut packed);
+    let mut narrow = Writer::new();
+    encode_external_ids_32(&short, &mut narrow);
+    for _ in 0..3 {
+        let t = std::time::Instant::now();
+        let a = decode_external_ids_packed(packed.bytes()).unwrap();
+        let t43 = t.elapsed();
+        let t = std::time::Instant::now();
+        let b = decode_external_ids_32(narrow.bytes()).unwrap();
+        let t44 = t.elapsed();
+        assert_eq!((a.len(), b.len()), (full.len(), short.len()));
+        println!(
+            "section 43: {} B ({:.2} B/entry) {:?}; section 44: {} B ({:.2} B/entry) {:?}",
+            packed.len(),
+            packed.len() as f64 / n as f64,
+            t43,
+            narrow.len(),
+            narrow.len() as f64 / n as f64,
+            t44
+        );
+    }
+}
+
+#[test]
+fn a_packed_shared_dictionary_round_trips_and_refuses_forgeries_when_expanded() {
+    let values: Vec<String> = (0..300).map(|id| format!("!room{id:06}:example.org")).collect();
+    let packed = PackedSharedDictionary::pack(15, &values).expect("an alphabet of short values packs");
+    assert!(packed.compressed.len() < values.iter().map(String::len).sum::<usize>() / 4);
+    let mut footer = minimal_footer();
+    footer.packed_shared_dictionaries = vec![packed.clone()];
+    assert!(decode_footer(&encode_footer(&footer)).is_err());
+    footer.required_feature_flags |= crate::layout::required_features::PACKED_SHARED_DICTIONARIES;
+    let decoded = decode_footer(&encode_footer(&footer)).expect("a packed alphabet decodes");
+    assert_eq!(decoded.packed_shared_dictionaries, footer.packed_shared_dictionaries);
+    assert_eq!(decoded.packed_shared_dictionaries[0].values().unwrap(), values);
+    assert_eq!(
+        packed.text().unwrap().entries(),
+        values.iter().map(String::as_str).collect::<Vec<_>>()
+    );
+
+    let mut wrong_len = packed.clone();
+    wrong_len.plain_len += 1;
+    assert!(wrong_len.values().is_err());
+    let mut huge = packed.clone();
+    huge.plain_len = PACKED_SHARED_DICTIONARY_MAX_PLAIN_BYTES + 1;
+    assert!(huge.values().is_err());
+    let mut forged = packed.clone();
+    forged.compressed = vec![0xFF; 16];
+    assert!(forged.values().is_err());
+    let mut miscounted = packed.clone();
+    miscounted.value_count -= 1;
+    assert!(miscounted.values().is_err());
+    let unsorted = PackedSharedDictionary::pack(15, &["b".to_owned(), "a".to_owned()]).unwrap();
+    assert!(unsorted.values().is_err());
+    let duplicated = PackedSharedDictionary::pack(15, &["a".to_owned(), "a".to_owned()]).unwrap();
+    assert!(duplicated.values().is_err());
+    let mut split = PackedSharedDictionary::pack(15, &["é".to_owned()]).unwrap();
+    let mut plain = vec![1u8, 0];
+    plain.extend_from_slice("é".as_bytes());
+    plain.push(b'x');
+    split.compressed = zstd::bulk::compress(&plain, 3).unwrap();
+    split.plain_len = plain.len() as u32;
+    assert!(split.values().is_err());
+    assert!(PackedSharedDictionary::pack(15, &["x".repeat(usize::from(u16::MAX) + 1)]).is_none());
+
+    footer.shared_dictionaries = vec![SharedDictionaryEntry {
+        column_id: 15,
+        values: vec!["a".to_owned()],
+    }];
+    assert!(decode_footer(&encode_footer(&footer)).is_err());
+    footer.shared_dictionaries.clear();
+    footer.packed_shared_dictionaries = vec![packed.clone(), packed];
+    assert!(decode_footer(&encode_footer(&footer)).is_err());
+}

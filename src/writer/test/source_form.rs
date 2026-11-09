@@ -1,0 +1,188 @@
+use super::*;
+use crate::artifacts::batch::{EventInput, PayloadInput};
+use crate::columns::{FreetextDeclaration, PromotionPlan};
+use crate::events::provenance::hex_lower;
+use crate::events::transcode::{SourceFormat, transcode};
+use crate::events::variant::VariantValue;
+use crate::events::{EventEnvelope, EventFlags, EventId, StreamId, TenantId, TimestampValue};
+use crate::layout::LayoutTargets;
+use crate::layout::reader::{OeFile, PayloadRead};
+use crate::security::FooterEncryption;
+use crate::typed_id::TypedIdTestExt;
+use crate::writer::build::{BuildLifecycle, OeBuildConfig, OeRow, SharedStrings, build_oe_file};
+use std::collections::BTreeMap;
+
+pub(crate) fn source_form_config(rows_per_granule: usize) -> OeBuildConfig {
+    OeBuildConfig {
+        analytical_columns: Vec::new(),
+        audit: None,
+        created_at_physical: 42,
+        footer_dek: None,
+        footer_encryption: FooterEncryption::Plaintext,
+        freetext: FreetextDeclaration { fields: Vec::new() },
+        freetext_row_offset_index: false,
+        generation_id: 1,
+        graph: None,
+        io_alignment_bytes: 0,
+        lifecycle: BuildLifecycle::FreshPublication,
+        page_size_rows: 0,
+        profile: crate::layout::Profile::Event,
+        promotion: PromotionPlan { columns: Vec::new() },
+        targets: LayoutTargets {
+            index_granularity: rows_per_granule,
+            index_granularity_bytes: 1 << 20,
+            max_stripe_bytes: 512 * 1024 * 1024,
+            min_bytes_for_wide: 10 * 1024 * 1024,
+            stripe_target_bytes: 4096,
+        },
+        tenant_id: TenantId::new_test_id(7),
+        time_series_bucket_nanos: None,
+        delivery_lineage: false,
+    }
+}
+
+pub(crate) fn source_form_row(i: u64, payload: VariantValue) -> BuildRow {
+    SharedStrings::default().build_row(OeRow {
+        epoch: 1,
+        event: EventInput {
+            connector_delivery_hash_high: 0,
+            connector_delivery_hash_low: 0,
+            envelope: EventEnvelope {
+                account_id: None,
+                account_id_hash_low: 0,
+                actor_id: None,
+                actor_id_hash_low: 0,
+                dedupe_hash_high: 0,
+                dedupe_hash_low: i,
+                entity_id: None,
+                entity_id_hash_high: 0,
+                entity_id_hash_low: i,
+                entity_type: "room".to_owned(),
+                event_id: EventId::new_test_id(0xA000 + u128::from(i)),
+                event_type: "m.room.message".to_owned(),
+                flags: EventFlags(0),
+                ingested_at: TimestampValue::from_physical_nanos(2_000 + i as i64),
+                occurred_at: TimestampValue::from_physical_nanos(1_000 + i as i64),
+                schema_version: 1,
+                source: "messaging".to_owned(),
+                stream_id: StreamId(1),
+                stream_sequence: i,
+                tenant_id: TenantId::new_test_id(7),
+                trace_id_hash_low: 0,
+            },
+            payload: PayloadInput::Variant(payload),
+            provenance: None,
+            relationships: None,
+            source_delivery: None,
+            source_schema: None,
+        },
+        sequence: i + 1,
+    })
+}
+
+pub(crate) fn json_row(i: u64, raw: &[u8]) -> BuildRow {
+    let mut row = source_form_row(i, transcode(SourceFormat::Json, raw).unwrap());
+    row.raw_payload = Some(raw.to_vec());
+    row
+}
+
+pub(crate) fn plain_row(i: u64) -> BuildRow {
+    source_form_row(
+        i,
+        VariantValue::Object(BTreeMap::from([("n".to_owned(), VariantValue::Int(i as i64))])),
+    )
+}
+
+#[test]
+fn canonical_json_payloads_round_trip_byte_for_byte() {
+    let pdus: Vec<Vec<u8>> = vec![
+        br#"{"content":{"body":"caf\u00e9 \ud83d\ude00 tab\tquote\"","big":9007199254740991,"small":-9007199254740991},"type":"m.room.message"}"#.to_vec(),
+        b"{ \"type\" : \"m.room.message\",\n  \"content\" : { \"n\" : 9007199254740990 } }".to_vec(),
+    ];
+    let rows: Vec<BuildRow> = pdus
+        .iter()
+        .enumerate()
+        .map(|(i, raw)| json_row(i as u64, raw))
+        .collect();
+    let built = build_oe_file(rows, &source_form_config(2)).unwrap();
+    let file = OeFile::open(built.bytes, Some(&built.file_seal)).unwrap();
+    for (row, raw) in pdus.iter().enumerate() {
+        let stored = file.raw_payload(row as u64).unwrap().expect("the raw payload was kept");
+        assert_eq!(&*stored, raw.as_slice(), "row {row} comes back byte for byte");
+        assert!(matches!(
+            file.payload(row as u64).unwrap(),
+            PayloadRead::Value(VariantValue::Object(_))
+        ));
+    }
+}
+
+#[test]
+fn a_stream_without_original_forms_pays_nothing() {
+    let built = build_oe_file((0..4).map(plain_row).collect::<Vec<_>>(), &source_form_config(2)).unwrap();
+    assert!(
+        !built.footer.columns.iter().any(|column| SOURCE_FORM_COLUMNS
+            .iter()
+            .any(|spec| spec.column_id == column.column_id)),
+        "no source-form column is declared"
+    );
+    assert!(built.footer.external_ids.is_empty());
+    assert_eq!(built.footer.reference_filters, None);
+    let file = OeFile::open(built.bytes, None).unwrap();
+    assert_eq!(file.raw_payload(0).unwrap(), None);
+    assert_eq!(file.row_by_external_id(b"$anything").unwrap(), None);
+}
+
+#[test]
+fn malformed_original_forms_are_refused_at_build() {
+    let mut binary = plain_row(0);
+    binary.raw_payload = Some(vec![0xff, 0xfe]);
+    assert_eq!(
+        build_oe_file(vec![binary], &source_form_config(2)).err(),
+        Some(FormatError::InvalidUtf8 { what: "raw payload" })
+    );
+    let mut too_long = plain_row(0);
+    too_long.external_id = Some(vec![b'x'; 256]);
+    assert!(build_oe_file(vec![too_long], &source_form_config(2)).is_err());
+}
+
+#[test]
+fn the_external_id_index_is_sorted_and_points_at_rows() {
+    let mut rows: Vec<BuildRow> = (0..6).map(plain_row).collect();
+    for (i, row) in rows.iter_mut().enumerate() {
+        if i != 3 {
+            row.external_id = Some(format!("$event-{i}").into_bytes());
+        }
+    }
+    let built = build_oe_file(rows, &source_form_config(2)).unwrap();
+    let index = &built.footer.external_ids;
+    assert_eq!(index.len(), 5);
+    assert!(
+        index
+            .windows(2)
+            .all(|pair| (pair[0].id_hash, pair[0].row_ordinal) <= (pair[1].id_hash, pair[1].row_ordinal))
+    );
+    assert!(index.iter().all(|entry| entry.row_ordinal != 3));
+}
+
+#[test]
+fn external_id_blocks_store_each_row_as_lowercase_hex() {
+    let ids: [Option<Vec<u8>>; 5] = [
+        None,
+        Some(vec![0xab]),
+        Some(vec![0x5c; 32]),
+        None,
+        Some(vec![0xf0; 255]),
+    ];
+    let mut rows: Vec<BuildRow> = (0..5).map(plain_row).collect();
+    for (row, id) in rows.iter_mut().zip(&ids) {
+        row.external_id = id.clone();
+    }
+    let (column_id, presence, data) = column_block(&rows, column_ids::EXTERNAL_ID).unwrap();
+    assert_eq!(column_id, column_ids::EXTERNAL_ID);
+    assert_eq!(presence, vec![0b10110]);
+    let ColumnData::Strings(values) = data else {
+        panic!("external ids are stored as strings");
+    };
+    let expected: Vec<String> = ids.iter().flatten().map(|id| hex_lower(id)).collect();
+    assert_eq!(values.iter_present().collect::<Vec<_>>(), expected);
+}

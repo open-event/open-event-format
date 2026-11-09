@@ -1,0 +1,69 @@
+[package]
+name = "oe-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "oej_frame"
+path = "fuzz_targets/oej_frame.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "compact_batch"
+path = "fuzz_targets/compact_batch.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "variant_value"
+path = "fuzz_targets/variant_value.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "oe_footer"
+path = "fuzz_targets/oe_footer.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "oe_file"
+path = "fuzz_targets/oe_file.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "column_block"
+path = "fuzz_targets/column_block.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "graph_block"
+path = "fuzz_targets/graph_block.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "xor_float_block"
+path = "fuzz_targets/xor_float_block.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "state_chunk"
+path = "fuzz_targets/state_chunk.rs"
+test = false
+doc = false
+
+[dependencies]
+oe = { path = "..", features = ["write"] }
+libfuzzer-sys = "0.4"

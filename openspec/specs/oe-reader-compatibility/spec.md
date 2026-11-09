@@ -1,0 +1,102 @@
+## Purpose
+
+Defines how OE stays compatible as the file format evolves:
+
+- Forward-compatible extension blocks and version metadata in the footer.
+- The reader rule: ignore optional things you don't understand, but refuse on required things you don't.
+
+The concrete reader-compatibility and versioning detail are embedded in [reader-compatibility-detail.md](reader-compatibility-detail.md).
+## Requirements
+### Requirement: Forward-compatible versioned footer
+OE SHALL support forward-compatible extension blocks and the footer SHALL carry `format_version`, required and optional feature flags, `schema_fingerprint`, logical/physical schema, the directory set, encryption metadata, and a checksum directory. Feature flags SHALL indicate use of optional blocks (context projections, vector blocks, sparse cubes, encrypted footers, projections, layout class, OE-native deletion vectors, `variant_shredded_field_blocks`, `variant_path_mphf_blocks`, `path_presence_indexes`, Ribbon/binary-fuse/range filters, split-block Bloom filters).
+
+#### Scenario: Older reader, newer optional block
+- **WHEN** a reader opens a file declaring an optional feature it predates
+- **THEN** it can still read the file by ignoring that optional block
+
+### Requirement: Refuse required, ignore-optional, validate-known
+A reader SHALL fail the file on an unknown required feature, and SHALL validate checksums before using any known feature. For an **optional** feature block it does not understand, a reader SHALL either ignore the block, or — when the block carries a forward-compatibility escape hatch (a `min_reader_version` the reader meets and a `portable_decoder_ref` the fleet resolves to a conformance-passing portable decoder, per "Optional-block forward-compatibility escape hatch") — read the block through that portable decoder. Whether it ignores the block or decodes it through a portable decoder, the reader SHALL fall back to a scan path or another block that still returns correct, complete results, and SHALL NEVER surface unverified or misdecoded bytes. This optional-block relaxation SHALL NOT extend to required features: an unknown required feature SHALL always fail the file.
+
+#### Scenario: Unknown required feature fails file
+- **WHEN** a reader encounters an unknown required feature flag
+- **THEN** it fails the file rather than producing partial results
+
+#### Scenario: Graph file refused by a reader that predates graph features
+- **WHEN** a reader whose known required set ends at bit 22 opens a graph-profile file declaring any of the graph feature bits 23 to 28
+- **THEN** it fails the file, while a current reader accepts it and every event file (which declares none of those bits) stays readable by both
+
+#### Scenario: Unknown optional block ignored or read via portable decoder
+- **WHEN** a reader encounters an optional feature block it does not natively understand
+- **THEN** it ignores the block and falls back to a correct scan, unless the block carries a `min_reader_version` the reader meets and a conformance-passing `portable_decoder_ref` the fleet resolves, in which case it MAY read the block through that portable decoder, and in either case it returns correct results and never surfaces unverified bytes
+
+#### Scenario: Checksum validated before use
+- **WHEN** a reader uses a known optional feature block
+- **THEN** it validates the block checksum first and does not use the block if validation fails
+
+### Requirement: Optional-block forward-compatibility escape hatch
+OE SHALL provide a narrow forward-compatibility path so a new encoding used in an **optional** block can ship before every reader in the fleet has gained the native code to decode it. This path applies to optional blocks only; it SHALL NOT apply to required features, which remain refuse per the "Refuse required, ignore-optional, validate-known" requirement.
+
+For an optional block, the footer MAY declare, alongside that block's optional feature flag, a `min_reader_version` and a `portable_decoder_ref`. The `portable_decoder_ref` is a versioned, fleet-resolvable decoder identity (a decoder id the fleet resolves to a portable decoder — for example a sandboxed module the fleet ships out of band — NOT necessarily WASM and NOT bytes the file dictates the reader to execute). When both are present they describe how a reader that lacks the native encoding can still obtain correct rows from that optional block. The footer fields that carry this escape hatch SHALL be ordered `min_reader_version`, then `portable_decoder_ref`, then the block's existing optional feature flag (alphabetical), and SHALL be covered by the checksum directory like any other footer field.
+
+A reader that opens an optional block whose encoding it does not natively understand SHALL take exactly one of two paths, and SHALL NEVER surface unverified or misdecoded bytes:
+
+- **Resolve a portable decoder.** If the block carries a `portable_decoder_ref` that the reader's fleet can resolve to a conformance-passing portable decoder at or above the block's `min_reader_version`, the reader MAY decode the block through that portable decoder. The reader SHALL validate the block checksum before decoding and SHALL admit the decoded rows only if the portable decoder passes the same conformance and software-parity gate required of any OE decoder, so the rows are byte-for-byte what a native decoder would have produced.
+- **Skip to a correct fallback.** Otherwise the reader SHALL cleanly skip the optional block as if it were absent and answer the query from a scan path (or another available block) that still returns correct, complete results. Skipping an optional acceleration block SHALL only cost performance, never correctness, consistent with the droppable-acceleration invariant in `oe-core-invariants`.
+
+The escape hatch is conformance-gated: a `portable_decoder_ref` SHALL NOT be used to read rows unless the portable decoder it resolves to has passed the OE conformance suite and software-parity check for that encoding; a reader that cannot confirm this SHALL fall back to skip-and-scan rather than trust the decoder. The presence of a `portable_decoder_ref` SHALL NOT change query results, ordering, visibility, checksums, security policy, or public output relative to a fleet that decodes the same block natively.
+
+#### Scenario: Old reader reads a new optional encoding via a portable decoder
+- **WHEN** a reader that lacks the native code for an optional block's encoding opens a file whose footer declares a `min_reader_version` the reader meets and a `portable_decoder_ref` its fleet resolves to a conformance-passing portable decoder
+- **THEN** the reader validates the block checksum, decodes the block through the portable decoder, and admits rows only because they are byte-for-byte identical to what a native decoder would produce
+
+#### Scenario: Old reader skips the optional block to a correct scan
+- **WHEN** a reader meets neither the block's `min_reader_version` nor a resolvable conformance-passing `portable_decoder_ref` for an optional block it cannot natively decode
+- **THEN** it skips that optional block as if absent and answers the query from a scan path or another block, returning correct, complete results and never surfacing unverified or misdecoded bytes
+
+#### Scenario: Escape hatch never touches required features
+- **WHEN** a file declares an unknown **required** feature flag, with or without a `portable_decoder_ref` present anywhere in the footer
+- **THEN** the reader fails the file rather than reading it, because the escape hatch applies to optional blocks only and required features stay refuse
+
+#### Scenario: Unconformant portable decoder is not trusted
+- **WHEN** a `portable_decoder_ref` resolves to a decoder that has not passed the OE conformance suite and software-parity check for that encoding
+- **THEN** the reader declines the portable decoder and falls back to skipping the optional block to a correct scan, rather than surfacing its output
+
+
+### Requirement: Packed-lengths FSST blocks are gated by a required feature
+Pipeline transform 15 (FSST with bitpacked value lengths) SHALL have an availability window opening at format version 1.0 and SHALL be refused, like every unknown transform, by a reader that does not implement it. A file holding such a block SHALL declare required feature bit 33 (`packed_string_offsets`); a reader whose known required set lacks bit 33 SHALL refuse the file at open.
+
+#### Scenario: Unknown transform refused cleanly
+- **WHEN** a reader without transform 15 is handed a block whose pipeline id names it
+- **THEN** it returns a structural "unknown transform" error and decodes nothing
+
+### Requirement: String-zstd blocks are gated by a required feature
+Pipeline trailing compression 6 (`string_zstd`, a string block relaid and compressed whole with LZ4, or Zstandard in files from earlier writers) SHALL be refused, like every unknown compression, by a reader that does not implement it: decoding the pipeline id SHALL return a structural "unknown compression" error and decode nothing. A file holding such a block SHALL declare required feature bit 37 (`string_zstd_blocks`); a reader whose known required set lacks bit 37 SHALL refuse the file at open. A file whose compression-6 blocks carry LZ4 (relayout tag bit `0x80`) SHALL also declare required feature bit 39 (`string_lz4_blocks`), and a reader whose known required set lacks bit 39 SHALL refuse it at open.
+
+#### Scenario: Unknown compression refused cleanly
+- **WHEN** a reader without compression 6 is handed a block whose pipeline id names it
+- **THEN** it returns a structural "unknown compression" error and decodes nothing
+
+#### Scenario: A file declaring bit 37 is refused by an older reader
+- **WHEN** a file stores a compression-6 block and is opened by a reader whose known required set predates bit 37
+- **THEN** the file declares bit 37 and that reader refuses it at open
+
+### Requirement: Packed shared dictionaries are gated by a required feature
+A file that stores footer section `PACKED_SHARED_DICTIONARIES` (45, compressed union alphabets for file-scope dictionary blocks) SHALL declare required feature bit 38 (`packed_shared_dictionaries`): a reader that predates the section would skip it as unknown and then fail on the first shared-scope block of such a column, after answering from the file's other columns. A reader whose known required set lacks bit 38 SHALL refuse the file at open; this reader knows bits 0 through 38.
+
+#### Scenario: A file declaring bit 38 is refused by an older reader
+- **WHEN** a file carries a compressed union alphabet and is opened by a reader whose known required set predates bit 38
+- **THEN** the file declares bit 38 and that reader refuses it at open
+
+### Requirement: Occurred-relative ingested-at blocks are gated by a required feature
+Pipeline transform 16 (`ingested_at` stored relative to `occurred_at`) SHALL have an availability window opening at format version 1.0 and SHALL be refused, like every unknown transform, by a reader that does not implement it. Its body SHALL NOT decode on its own: a decode handed the bare block without the granule's `occurred_at` SHALL return a structural error rather than values. A file holding such a block SHALL declare required feature bit 34 (`occurred_relative_ingested_at`); a reader whose known required set lacks bit 34 SHALL refuse the file at open.
+
+#### Scenario: Occurred-relative transform refused without its window
+- **WHEN** a reader without transform 16 is handed a block whose pipeline id names it
+- **THEN** it refuses the pipeline before decoding a byte, and a bare decode of the block without `occurred_at` returns a structural error
+
+### Requirement: Entity hash columns may be elided behind a required feature
+A writer MAY omit the `entity_id_hash_low` and `entity_id_hash_high` blocks from a primary-order file of any profile but `inbox` when every row's entity hashes equal the frozen derivation from its `entity_id`: the low half is `stable_hash` of the id's UTF-8 bytes and the high half is zero, and an absent id derives `(0, 0)`. Such a file SHALL drop both columns from its column directory and SHALL declare required feature bit 35 (`entity_hash_columns_elided`); a file with any row whose hashes are not the derivation SHALL store the columns and SHALL NOT declare the bit. The per-granule entity hash filters and the entity summary SHALL still be built from the same hashes. A reader of such a file SHALL recompute a row's entity hashes from `entity_id` wherever it needs them, so envelopes, entity scans and merge reads return exactly the hashes that were written; a reader whose known required set lacks bit 35 SHALL refuse the file at open. Files that store the columns SHALL keep reading unchanged.
+
+#### Scenario: Elided entity hashes read back as written
+- **WHEN** a file is built from rows whose entity hashes are the derivation from their `entity_id`
+- **THEN** it stores no entity hash blocks, declares bit 35, and returns every envelope with the hashes it was written with, while a reader that does not know bit 35 refuses it at open

@@ -1,0 +1,530 @@
+use super::error::FormatError;
+use super::layout::HEADER_BLOCK_LEN;
+use super::layout::footer::{IntegrityGapEntry, StripeEntry};
+
+const FILE_ID_CONTEXT: &str = "open-event OE v1 deterministic file identity";
+const FILE_SEAL_CONTEXT: &str = "open-event OE v1 authoritative segment seal";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SegmentKind {
+    Gap = 0,
+    Stripe = 1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DataCommitment {
+    digest: [u8; 32],
+    kind: SegmentKind,
+    len: u64,
+    offset: u64,
+    stripe_id: u32,
+}
+
+pub(crate) fn integrity_gaps(commitments: &[DataCommitment]) -> Vec<IntegrityGapEntry> {
+    commitments
+        .iter()
+        .filter(|commitment| commitment.kind == SegmentKind::Gap)
+        .map(|commitment| IntegrityGapEntry {
+            blake3: commitment.digest,
+            byte_len: commitment.len,
+            file_offset: commitment.offset,
+        })
+        .collect()
+}
+
+pub(crate) fn declared_data_commitments(
+    data_end: usize,
+    stripes: &[StripeEntry],
+    stripe_checksums: &[[u8; 32]],
+    gaps: &[IntegrityGapEntry],
+) -> Result<Vec<DataCommitment>, FormatError> {
+    if stripe_checksums.len() != stripes.len() {
+        return Err(FormatError::Structural {
+            rule: "stripe checksum count must match the stripe directory",
+        });
+    }
+    if data_end < HEADER_BLOCK_LEN {
+        return Err(FormatError::Structural {
+            rule: "OE data commitment range ends before the header",
+        });
+    }
+
+    let mut commitments = Vec::with_capacity(stripes.len().saturating_add(gaps.len()));
+    commitments.extend(
+        stripes
+            .iter()
+            .zip(stripe_checksums)
+            .map(|(stripe, checksum)| DataCommitment {
+                digest: *checksum,
+                kind: SegmentKind::Stripe,
+                len: stripe.byte_len,
+                offset: stripe.file_offset,
+                stripe_id: stripe.stripe_id,
+            }),
+    );
+    commitments.extend(gaps.iter().map(|gap| DataCommitment {
+        digest: gap.blake3,
+        kind: SegmentKind::Gap,
+        len: gap.byte_len,
+        offset: gap.file_offset,
+        stripe_id: 0,
+    }));
+    commitments.sort_unstable_by_key(|commitment| commitment.offset);
+
+    let mut cursor = HEADER_BLOCK_LEN as u64;
+    for commitment in &commitments {
+        if commitment.len == 0 || commitment.offset != cursor {
+            return Err(FormatError::Structural {
+                rule: "stripe and gap commitments must form one exact ordered data partition",
+            });
+        }
+        cursor = cursor.checked_add(commitment.len).ok_or(FormatError::Structural {
+            rule: "data commitment range overflows",
+        })?;
+    }
+    if cursor != data_end as u64 {
+        return Err(FormatError::Structural {
+            rule: "stripe and gap commitments must end at the footer",
+        });
+    }
+    Ok(commitments)
+}
+
+fn update_u8(hasher: &mut blake3::Hasher, value: u8) {
+    hasher.update(&[value]);
+}
+
+fn update_u32(hasher: &mut blake3::Hasher, value: u32) {
+    hasher.update(&value.to_le_bytes());
+}
+
+fn update_u64(hasher: &mut blake3::Hasher, value: u64) {
+    hasher.update(&value.to_le_bytes());
+}
+
+fn update_commitments(hasher: &mut blake3::Hasher, commitments: &[DataCommitment]) {
+    update_u64(hasher, commitments.len() as u64);
+    for commitment in commitments {
+        update_u8(hasher, commitment.kind as u8);
+        update_u32(hasher, commitment.stripe_id);
+        update_u64(hasher, commitment.offset);
+        update_u64(hasher, commitment.len);
+        hasher.update(&commitment.digest);
+    }
+}
+
+pub(crate) fn data_commitments(
+    bytes: &[u8],
+    data_end: usize,
+    stripes: &[StripeEntry],
+    stripe_checksums: &[[u8; 32]],
+) -> Result<Vec<DataCommitment>, FormatError> {
+    if data_end > bytes.len() {
+        return Err(FormatError::Structural {
+            rule: "OE data commitment range is outside the file",
+        });
+    }
+    data_commitments_with(data_end, stripes, stripe_checksums, |range| bytes.get(range))
+}
+
+pub(crate) fn data_commitments_with<'a>(
+    data_end: usize,
+    stripes: &[StripeEntry],
+    stripe_checksums: &[[u8; 32]],
+    gap: impl Fn(std::ops::Range<usize>) -> Option<&'a [u8]>,
+) -> Result<Vec<DataCommitment>, FormatError> {
+    if stripe_checksums.len() != stripes.len() {
+        return Err(FormatError::Structural {
+            rule: "stripe checksum count must match the stripe directory",
+        });
+    }
+    if data_end < HEADER_BLOCK_LEN {
+        return Err(FormatError::Structural {
+            rule: "OE data commitment range is outside the file",
+        });
+    }
+
+    let strictly_increasing = stripes
+        .iter()
+        .zip(stripes.iter().skip(1))
+        .all(|(left, right)| left.file_offset < right.file_offset);
+    if strictly_increasing {
+        return emit_data_commitments(data_end, stripes.iter().zip(stripe_checksums), gap);
+    }
+    let mut ordered: Vec<_> = stripes.iter().zip(stripe_checksums).collect();
+    ordered.sort_unstable_by_key(|(stripe, _)| stripe.file_offset);
+    emit_data_commitments(data_end, ordered.into_iter(), gap)
+}
+
+fn emit_data_commitments<'a, 's>(
+    data_end: usize,
+    ordered: impl ExactSizeIterator<Item = (&'s StripeEntry, &'s [u8; 32])>,
+    gap: impl Fn(std::ops::Range<usize>) -> Option<&'a [u8]>,
+) -> Result<Vec<DataCommitment>, FormatError> {
+    let mut cursor = HEADER_BLOCK_LEN;
+    let mut commitments = Vec::with_capacity(ordered.len().saturating_mul(2).saturating_add(1));
+
+    for (stripe, checksum) in ordered {
+        let start = usize::try_from(stripe.file_offset).map_err(|_| FormatError::Structural {
+            rule: "stripe offset does not fit in memory",
+        })?;
+        let len = usize::try_from(stripe.byte_len).map_err(|_| FormatError::Structural {
+            rule: "stripe length does not fit in memory",
+        })?;
+        let end = start.checked_add(len).ok_or(FormatError::Structural {
+            rule: "stripe range overflows",
+        })?;
+        if start < cursor || end > data_end {
+            return Err(FormatError::Structural {
+                rule: "stripe ranges must be ordered, disjoint, and inside the data area",
+            });
+        }
+        if start > cursor {
+            let gap = gap(cursor..start).ok_or(FormatError::Truncated { what: "data gap" })?;
+            commitments.push(DataCommitment {
+                digest: *crate::file::integrity::hash_tree(gap).as_bytes(),
+                kind: SegmentKind::Gap,
+                len: gap.len() as u64,
+                offset: cursor as u64,
+                stripe_id: 0,
+            });
+        }
+        commitments.push(DataCommitment {
+            digest: *checksum,
+            kind: SegmentKind::Stripe,
+            len: stripe.byte_len,
+            offset: stripe.file_offset,
+            stripe_id: stripe.stripe_id,
+        });
+        cursor = end;
+    }
+
+    if cursor < data_end {
+        let gap = gap(cursor..data_end).ok_or(FormatError::Truncated { what: "data gap" })?;
+        commitments.push(DataCommitment {
+            digest: *crate::file::integrity::hash_tree(gap).as_bytes(),
+            kind: SegmentKind::Gap,
+            len: gap.len() as u64,
+            offset: cursor as u64,
+            stripe_id: 0,
+        });
+    }
+    Ok(commitments)
+}
+
+pub(crate) fn verify_declared_data_commitments(
+    bytes: &[u8],
+    data_end: usize,
+    stripes: &[StripeEntry],
+    stripe_checksums: &[[u8; 32]],
+    gaps: &[IntegrityGapEntry],
+) -> Result<Vec<DataCommitment>, FormatError> {
+    if data_end <= bytes.len()
+        && let Ok(declared) = declared_data_commitments(data_end, stripes, stripe_checksums, gaps)
+        && declared_gaps_match_bytes(bytes, &declared)
+    {
+        return Ok(declared);
+    }
+    verify_by_recomputing(bytes, data_end, stripes, stripe_checksums, gaps)
+}
+
+fn declared_gaps_match_bytes(bytes: &[u8], commitments: &[DataCommitment]) -> bool {
+    let mut previous_was_gap = false;
+    commitments.iter().all(|commitment| {
+        let is_gap = commitment.kind == SegmentKind::Gap;
+        let adjacent_gaps = is_gap && previous_was_gap;
+        previous_was_gap = is_gap;
+        if !is_gap {
+            return true;
+        }
+        let (Ok(start), Ok(len)) = (usize::try_from(commitment.offset), usize::try_from(commitment.len)) else {
+            return false;
+        };
+        !adjacent_gaps
+            && start
+                .checked_add(len)
+                .and_then(|end| bytes.get(start..end))
+                .is_some_and(|gap| crate::file::integrity::hash_tree(gap).as_bytes() == &commitment.digest)
+    })
+}
+
+fn verify_by_recomputing(
+    bytes: &[u8],
+    data_end: usize,
+    stripes: &[StripeEntry],
+    stripe_checksums: &[[u8; 32]],
+    gaps: &[IntegrityGapEntry],
+) -> Result<Vec<DataCommitment>, FormatError> {
+    let computed = data_commitments(bytes, data_end, stripes, stripe_checksums)?;
+    let declared = declared_data_commitments(data_end, stripes, stripe_checksums, gaps)?;
+    if computed != declared {
+        return Err(FormatError::Blake3Mismatch { scope: "data gap" });
+    }
+    Ok(declared)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn derive_file_id(
+    tenant: [u8; 16],
+    min_epoch: u64,
+    max_epoch: u64,
+    min_sequence: u64,
+    max_sequence: u64,
+    row_count: u64,
+    schema_fingerprint: &[u8; 32],
+    layout_class: u8,
+    commitments: &[DataCommitment],
+) -> u128 {
+    let mut hasher = blake3::Hasher::new_derive_key(FILE_ID_CONTEXT);
+    hasher.update(&tenant);
+    update_u64(&mut hasher, min_epoch);
+    update_u64(&mut hasher, max_epoch);
+    update_u64(&mut hasher, min_sequence);
+    update_u64(&mut hasher, max_sequence);
+    update_u64(&mut hasher, row_count);
+    hasher.update(schema_fingerprint);
+    update_u8(&mut hasher, layout_class);
+    update_commitments(&mut hasher, commitments);
+    let digest = hasher.finalize();
+    u128::from_le_bytes(digest.as_bytes()[..16].try_into().unwrap_or([0; 16]))
+}
+
+pub(crate) fn derive_file_seal(
+    header: &[u8],
+    footer_region: &[u8],
+    trailer: &[u8],
+    total_len: u64,
+    commitments: &[DataCommitment],
+) -> [u8; 32] {
+    derive_file_seal_from_header_hash(
+        header.len() as u64,
+        crate::file::integrity::hash_tree(header).as_bytes(),
+        footer_region,
+        trailer,
+        total_len,
+        commitments,
+    )
+}
+
+pub(crate) fn derive_file_seal_from_header_hash(
+    header_len: u64,
+    header_hash: &[u8; 32],
+    footer_region: &[u8],
+    trailer: &[u8],
+    total_len: u64,
+    commitments: &[DataCommitment],
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(FILE_SEAL_CONTEXT);
+    update_u64(&mut hasher, total_len);
+    update_u64(&mut hasher, header_len);
+    hasher.update(header_hash);
+    update_commitments(&mut hasher, commitments);
+    update_u64(&mut hasher, footer_region.len().saturating_add(trailer.len()) as u64);
+    let mut footer_hasher = blake3::Hasher::new();
+    footer_hasher.update_rayon(footer_region);
+    footer_hasher.update(trailer);
+    hasher.update(footer_hasher.finalize().as_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_region_and_domain_changes_its_root() {
+        let mut bytes = vec![0; HEADER_BLOCK_LEN + 6];
+        bytes[HEADER_BLOCK_LEN..].copy_from_slice(b"abcdef");
+        let stripes = [StripeEntry {
+            stripe_id: 7,
+            file_offset: (HEADER_BLOCK_LEN + 1) as u64,
+            byte_len: 4,
+            first_row_ordinal: 0,
+            row_count: 1,
+        }];
+        let checksum = [*crate::file::integrity::hash_tree(b"bcde").as_bytes()];
+        let commitments = data_commitments(&bytes, bytes.len(), &stripes, &checksum).unwrap();
+        let id = derive_file_id([1; 16], 2, 2, 3, 3, 1, &[4; 32], 0, &commitments);
+        let seal = derive_file_seal(&bytes[..HEADER_BLOCK_LEN], b"footer", b"tail", 12, &commitments);
+        assert_ne!(id.to_le_bytes().as_slice(), &seal[..16]);
+
+        bytes[HEADER_BLOCK_LEN] ^= 1;
+        let changed = data_commitments(&bytes, bytes.len(), &stripes, &checksum).unwrap();
+        assert_ne!(commitments, changed, "the leading alignment gap is authoritative");
+    }
+
+    fn stripe(stripe_id: u32, file_offset: usize, byte_len: u64) -> StripeEntry {
+        StripeEntry {
+            byte_len,
+            file_offset: file_offset as u64,
+            first_row_ordinal: 0,
+            row_count: 1,
+            stripe_id,
+        }
+    }
+
+    fn gapped_bytes() -> Vec<u8> {
+        (0..HEADER_BLOCK_LEN + 20).map(|index| index as u8).collect()
+    }
+
+    #[test]
+    fn sorted_and_shuffled_stripes_commit_identically_with_the_same_gap_reads() {
+        let bytes = gapped_bytes();
+        let base = HEADER_BLOCK_LEN;
+        let sorted = [stripe(1, base + 2, 3), stripe(2, base + 5, 4), stripe(3, base + 12, 5)];
+        let sorted_checksums = [[1; 32], [2; 32], [3; 32]];
+        let shuffled = [sorted[2], sorted[0], sorted[1]];
+        let shuffled_checksums = [sorted_checksums[2], sorted_checksums[0], sorted_checksums[1]];
+
+        let reads = std::cell::RefCell::new(Vec::new());
+        let direct = data_commitments_with(bytes.len(), &sorted, &sorted_checksums, |range| {
+            reads.borrow_mut().push(range.clone());
+            bytes.get(range)
+        })
+        .unwrap();
+        let direct_reads = reads.replace(Vec::new());
+        let fallback = data_commitments_with(bytes.len(), &shuffled, &shuffled_checksums, |range| {
+            reads.borrow_mut().push(range.clone());
+            bytes.get(range)
+        })
+        .unwrap();
+
+        assert_eq!(direct, fallback);
+        assert_eq!(direct_reads, reads.into_inner());
+        assert_eq!(
+            direct_reads,
+            vec![base..base + 2, base + 9..base + 12, base + 17..base + 20]
+        );
+        assert_eq!(direct.len(), 6);
+    }
+
+    #[test]
+    fn empty_and_single_stripe_inputs_cover_the_whole_data_area() {
+        let bytes = gapped_bytes();
+        let empty = data_commitments(&bytes, bytes.len(), &[], &[]).unwrap();
+        assert_eq!(empty.len(), 1);
+        assert_eq!(empty[0].kind, SegmentKind::Gap);
+        assert_eq!(empty[0].len, 20);
+
+        let single = data_commitments(&bytes, bytes.len(), &[stripe(4, HEADER_BLOCK_LEN, 20)], &[[4; 32]]).unwrap();
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0].kind, SegmentKind::Stripe);
+    }
+
+    #[test]
+    fn overlapping_or_tied_stripes_are_rejected_on_both_paths() {
+        let bytes = gapped_bytes();
+        let base = HEADER_BLOCK_LEN;
+        let geometry = Err(FormatError::Structural {
+            rule: "stripe ranges must be ordered, disjoint, and inside the data area",
+        });
+        let increasing_overlap = [stripe(1, base, 5), stripe(2, base + 4, 2)];
+        assert_eq!(
+            data_commitments(&bytes, bytes.len(), &increasing_overlap, &[[1; 32], [2; 32]]),
+            geometry
+        );
+        let tied = [stripe(1, base, 2), stripe(2, base, 2)];
+        assert_eq!(
+            data_commitments(&bytes, bytes.len(), &tied, &[[1; 32], [2; 32]]),
+            geometry
+        );
+        let past_end = [stripe(1, base + 18, 4)];
+        assert_eq!(data_commitments(&bytes, bytes.len(), &past_end, &[[1; 32]]), geometry);
+        assert_eq!(
+            data_commitments(&bytes, bytes.len(), &past_end, &[]),
+            Err(FormatError::Structural {
+                rule: "stripe checksum count must match the stripe directory",
+            })
+        );
+        assert_eq!(
+            data_commitments_with(bytes.len(), &[stripe(1, base + 2, 3)], &[[1; 32]], |_| None),
+            Err(FormatError::Truncated { what: "data gap" })
+        );
+    }
+
+    fn declared_gap(bytes: &[u8], range: std::ops::Range<usize>) -> IntegrityGapEntry {
+        IntegrityGapEntry {
+            blake3: *crate::file::integrity::hash_tree(&bytes[range.clone()]).as_bytes(),
+            byte_len: range.len() as u64,
+            file_offset: range.start as u64,
+        }
+    }
+
+    fn assert_same_as_recomputing(
+        bytes: &[u8],
+        data_end: usize,
+        stripes: &[StripeEntry],
+        checksums: &[[u8; 32]],
+        gaps: &[IntegrityGapEntry],
+    ) -> Result<Vec<DataCommitment>, FormatError> {
+        let verified = verify_declared_data_commitments(bytes, data_end, stripes, checksums, gaps);
+        assert_eq!(
+            verified,
+            verify_by_recomputing(bytes, data_end, stripes, checksums, gaps)
+        );
+        verified
+    }
+
+    #[test]
+    fn declared_gaps_verify_exactly_like_the_recomputed_partition() {
+        let bytes = gapped_bytes();
+        let end = bytes.len();
+        let base = HEADER_BLOCK_LEN;
+        let stripes = [stripe(3, base + 12, 5), stripe(1, base + 2, 3), stripe(2, base + 5, 4)];
+        let checksums = [[3; 32], [1; 32], [2; 32]];
+        let leading = declared_gap(&bytes, base..base + 2);
+        let interior = declared_gap(&bytes, base + 9..base + 12);
+        let trailing = declared_gap(&bytes, base + 17..end);
+        let gaps = [trailing, leading, interior];
+
+        let verified = assert_same_as_recomputing(&bytes, end, &stripes, &checksums, &gaps).unwrap();
+        assert_eq!(verified, data_commitments(&bytes, end, &stripes, &checksums).unwrap());
+
+        let whole = [stripe(1, base, 20)];
+        assert!(assert_same_as_recomputing(&bytes, end, &whole, &[[1; 32]], &[]).is_ok());
+        let only_gap = [declared_gap(&bytes, base..end)];
+        assert!(assert_same_as_recomputing(&bytes, end, &[], &[], &only_gap).is_ok());
+        assert!(assert_same_as_recomputing(&bytes, base, &[], &[], &[]).is_ok());
+    }
+
+    #[test]
+    fn malformed_declared_gaps_fail_with_the_recomputed_partitions_error() {
+        let bytes = gapped_bytes();
+        let end = bytes.len();
+        let base = HEADER_BLOCK_LEN;
+        let stripes = [stripe(1, base + 2, 3), stripe(2, base + 5, 4), stripe(3, base + 12, 5)];
+        let checksums = [[1; 32], [2; 32], [3; 32]];
+        let leading = declared_gap(&bytes, base..base + 2);
+        let interior = declared_gap(&bytes, base + 9..base + 12);
+        let trailing = declared_gap(&bytes, base + 17..end);
+        let split = [
+            leading,
+            declared_gap(&bytes, base + 9..base + 10),
+            declared_gap(&bytes, base + 10..base + 12),
+            trailing,
+        ];
+        let mut wrong_digest = [leading, interior, trailing];
+        wrong_digest[1].blake3[0] ^= 1;
+        let zero_length = [leading, interior, trailing, declared_gap(&bytes, end..end)];
+        let cases: [(&[IntegrityGapEntry], usize); 6] = [
+            (&split, end),
+            (&wrong_digest, end),
+            (&[leading, trailing], end),
+            (&zero_length, end),
+            (&[leading, interior, trailing], end + 1),
+            (&[], base - 1),
+        ];
+        for (gaps, data_end) in cases {
+            assert!(assert_same_as_recomputing(&bytes, data_end, &stripes, &checksums, gaps).is_err());
+        }
+        assert!(assert_same_as_recomputing(&bytes, end, &stripes, &checksums[..2], &[]).is_err());
+
+        let mut changed = bytes.clone();
+        changed[base + 10] ^= 1;
+        let gaps = [leading, interior, trailing];
+        assert_eq!(
+            assert_same_as_recomputing(&changed, end, &stripes, &checksums, &gaps),
+            Err(FormatError::Blake3Mismatch { scope: "data gap" })
+        );
+    }
+}

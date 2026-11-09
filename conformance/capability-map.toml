@@ -1,0 +1,19 @@
+
+[capabilities]
+oe-apis = { crate = "oe", module = "oe", required_evidence = "spec" }
+oe-benchmarks-and-acceptance-gates = { crate = "oe", module = "benchmarks", required_evidence = "spec" }
+oe-column-design = { crate = "oe", module = "columns", required_evidence = "spec" }
+oe-core-invariants = { crate = "oe", module = "invariants", required_evidence = "spec" }
+oe-deletes-and-corrections = { crate = "oe", module = "deletes", required_evidence = "spec" }
+oe-encodings-and-compression = { crate = "oe", module = "encoding", required_evidence = "spec" }
+oe-file-layout = { crate = "oe", module = "layout", required_evidence = "spec" }
+oe-file-lifecycle = { crate = "oe", module = "lifecycle", required_evidence = "spec" }
+oe-hardware-deployment = { crate = "oe", module = "hardware", required_evidence = "spec" }
+oe-layout-and-clustering = { crate = "oe", module = "clustering", required_evidence = "spec" }
+oe-logical-event-model = { crate = "oe", module = "events", required_evidence = "spec" }
+oe-manifest-integration = { crate = "oe", module = "manifest", required_evidence = "spec" }
+oe-physical-artifacts = { crate = "oe", module = "artifacts", required_evidence = "spec" }
+oe-query-metadata-and-indexes = { crate = "oe", module = "indexes", required_evidence = "spec" }
+oe-reader-compatibility = { crate = "oe", module = "compat", required_evidence = "spec" }
+oe-security-and-isolation = { crate = "oe", module = "security", required_evidence = "spec" }
+oe-write-path = { crate = "oe", module = "writer", required_evidence = "spec" }

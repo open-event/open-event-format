@@ -1,0 +1,621 @@
+use super::super::batch::tests::{sample_events, sample_frame};
+use super::super::batch::{EventInput, PayloadInput, build_batch, decode_batch};
+use super::super::frame::{FrameBuildInput, build_frame, decode_frame};
+use super::super::segment::ReplayTail;
+use super::*;
+use crate::events::provenance::{SignatureScheme, SignedEventProvenance, hex_lower};
+use crate::events::{EventEnvelope, TimestampValue};
+use crate::lifecycle::{FileType, ManifestGeneration, OeFileEntry, PartState};
+use crate::typed_id::TypedIdTestExt;
+
+fn convert_events(events: &[EventInput]) -> LiveOverlaySegment {
+    let payload = build_batch(events, 1, 0).unwrap();
+    let frame_bytes = build_frame(
+        &FrameBuildInput {
+            flags: 0,
+            tenant_id: TenantId::new_test_id(7),
+            writer_id: 3,
+            epoch: 1,
+            first_sequence: 1,
+            last_sequence: events.len() as u64,
+            event_count: events.len() as u32,
+            durable_batch_id: 1,
+            writer_local_batch_id: 1,
+            schema_generation: 1,
+            dictionary_generation_hint: 0,
+            created_at_physical: 1,
+            committed_at_physical: 2,
+        },
+        &payload,
+    )
+    .unwrap();
+    let (header, payload) = decode_frame(&frame_bytes).unwrap();
+    let decoded = decode_batch(payload, header.event_count).unwrap();
+    convert_frame(&header, &decoded, 1, 1, None, |_, _| false)
+        .unwrap()
+        .expect("not covered")
+}
+
+fn payload_refs_of(events: &[EventInput]) -> Vec<u64> {
+    convert_events(events)
+        .batch
+        .column(21)
+        .as_any()
+        .downcast_ref::<arrow_array::UInt64Array>()
+        .unwrap()
+        .values()
+        .to_vec()
+}
+
+#[test]
+fn the_conversion_schemas_are_built_once_and_shared_by_every_frame() {
+    assert!(Arc::ptr_eq(&live_overlay_schema(), &live_overlay_schema()));
+    assert!(Arc::ptr_eq(
+        &live_overlay_schema_with_provenance(),
+        &live_overlay_schema_with_provenance()
+    ));
+    assert_ne!(
+        live_overlay_schema(),
+        live_overlay_schema_with_provenance(),
+        "the provenance schema stays a distinct contract"
+    );
+    let segment = overlay_segment(1, 1, 2);
+    assert!(Arc::ptr_eq(&segment.batch.schema(), &live_overlay_schema()));
+}
+
+#[test]
+fn payload_ref_distinguishes_no_payload_from_a_payload_at_arena_offset_zero() {
+    let mut none_then_payload = sample_events(2);
+    none_then_payload[0].payload = PayloadInput::None;
+    let mut payload_then_none = sample_events(2);
+    payload_then_none[1].payload = PayloadInput::None;
+
+    let first = payload_refs_of(&none_then_payload);
+    let second = payload_refs_of(&payload_then_none);
+    assert_ne!(first, second, "the two frames must stay distinguishable");
+
+    assert_eq!(first[0], 0);
+    assert!(first[1] >> 32 > 0);
+    assert_eq!(first[1] & 0xFFFF_FFFF, 0);
+    assert!(second[0] >> 32 > 0);
+    assert_eq!(second[0] & 0xFFFF_FFFF, 0);
+    assert_eq!(second[1], 0);
+}
+
+#[test]
+fn text_columns_keep_every_value_null_and_empty_string() {
+    let long = "x".repeat(10_000);
+    let texts = [None, Some(""), Some("caf\u{e9} \u{1F600}"), Some(long.as_str())];
+    let mut events = sample_events(8);
+    for (row, event) in events.iter_mut().enumerate() {
+        let text = |offset: usize| texts[(row + offset) % texts.len()].map(str::to_owned);
+        event.envelope.source = text(1).unwrap_or_default();
+        event.envelope.event_type = text(2).unwrap_or_default();
+        event.envelope.entity_type = text(3).unwrap_or_default();
+        event.envelope.entity_id = text(0);
+        event.envelope.actor_id = text(1);
+        event.envelope.account_id = text(2);
+    }
+    let segment = convert_events(&events);
+    let required = |text: fn(&EventEnvelope) -> &str| -> ArrayRef {
+        Arc::new(StringArray::from(
+            events.iter().map(|event| text(&event.envelope)).collect::<Vec<_>>(),
+        ))
+    };
+    let optional = |text: fn(&EventEnvelope) -> Option<&str>| -> ArrayRef {
+        Arc::new(StringArray::from(
+            events.iter().map(|event| text(&event.envelope)).collect::<Vec<_>>(),
+        ))
+    };
+    let expected = [
+        ("source", required(|envelope| envelope.source.as_str())),
+        ("event_type", required(|envelope| envelope.event_type.as_str())),
+        ("entity_type", required(|envelope| envelope.entity_type.as_str())),
+        ("entity_id", optional(|envelope| envelope.entity_id.as_deref())),
+        ("actor_id", optional(|envelope| envelope.actor_id.as_deref())),
+        ("account_id", optional(|envelope| envelope.account_id.as_deref())),
+    ];
+    assert!(Arc::ptr_eq(&segment.batch.schema(), &live_overlay_schema()));
+    for (name, column) in expected {
+        assert_eq!(segment.batch.column_by_name(name).unwrap(), &column, "{name}");
+    }
+}
+
+#[test]
+fn provenance_columns_hold_each_signed_rows_values_and_nulls_elsewhere() {
+    let signed = |row: u8, scheme: SignatureScheme| SignedEventProvenance {
+        author_pubkey: [row; 32],
+        claimed_at: TimestampValue::from_physical_nanos(1_000_000_000 * i64::from(row)),
+        protocol_event_id: [0xA0 | row; 32],
+        protocol_kind: u32::from(row) + 1,
+        scheme,
+        signature: [0xF0 | row; 64],
+    };
+    let unsigned = [false; 5];
+    let all_signed = [true; 5];
+    let mixed = [true, false, false, true, false];
+    let ends = [false, true, false, false, true];
+    for pattern in [unsigned, all_signed, mixed, ends] {
+        let mut events = sample_events(pattern.len());
+        for (row, (event, is_signed)) in events.iter_mut().zip(pattern).enumerate() {
+            let scheme = if row % 2 == 0 {
+                SignatureScheme::Ed25519
+            } else {
+                SignatureScheme::Bip340SchnorrSecp256k1
+            };
+            event.provenance = is_signed.then(|| signed(row as u8, scheme));
+        }
+        let segment = convert_events(&events);
+        if !pattern.contains(&true) {
+            assert!(Arc::ptr_eq(&segment.batch.schema(), &live_overlay_schema()));
+            continue;
+        }
+        assert!(Arc::ptr_eq(
+            &segment.batch.schema(),
+            &live_overlay_schema_with_provenance()
+        ));
+        let provenance: Vec<Option<&SignedEventProvenance>> =
+            events.iter().map(|event| event.provenance.as_ref()).collect();
+        let hex_of = |bytes: fn(&SignedEventProvenance) -> &[u8]| -> ArrayRef {
+            Arc::new(StringArray::from(
+                provenance
+                    .iter()
+                    .map(|signed| signed.map(|signed| hex_lower(bytes(signed))))
+                    .collect::<Vec<_>>(),
+            ))
+        };
+        let expected: [(&str, ArrayRef); 6] = [
+            ("author_pubkey", hex_of(|signed| &signed.author_pubkey)),
+            ("signature", hex_of(|signed| &signed.signature)),
+            (
+                "signature_scheme",
+                Arc::new(StringArray::from(
+                    provenance
+                        .iter()
+                        .map(|signed| signed.map(|signed| signed.scheme.as_str()))
+                        .collect::<Vec<_>>(),
+                )),
+            ),
+            ("protocol_event_id", hex_of(|signed| &signed.protocol_event_id)),
+            (
+                "protocol_kind",
+                Arc::new(Int64Array::from(
+                    provenance
+                        .iter()
+                        .map(|signed| signed.map(|signed| i64::from(signed.protocol_kind)))
+                        .collect::<Vec<_>>(),
+                )),
+            ),
+            (
+                "claimed_at",
+                Arc::new(
+                    TimestampNanosecondArray::from(
+                        provenance
+                            .iter()
+                            .map(|signed| signed.map(|signed| signed.claimed_at.physical_nanos()))
+                            .collect::<Vec<_>>(),
+                    )
+                    .with_timezone("UTC"),
+                ),
+            ),
+        ];
+        for (name, column) in expected {
+            assert_eq!(segment.batch.column_by_name(name).unwrap(), &column, "{name}");
+        }
+    }
+}
+
+fn overlay_segment(epoch: u64, first_sequence: u64, count: usize) -> LiveOverlaySegment {
+    let frame_bytes = sample_frame(count, epoch, first_sequence);
+    let (header, payload) = decode_frame(&frame_bytes).unwrap();
+    let decoded = decode_batch(payload, header.event_count).unwrap();
+    convert_frame(&header, &decoded, 1, 1, None, |_, _| false)
+        .unwrap()
+        .expect("an event frame converts to a segment")
+}
+
+fn replayed_frame(frame_bytes: Vec<u8>, offset: u64) -> ReplayedFrame {
+    let (header, _) = decode_frame(&frame_bytes).unwrap();
+    ReplayedFrame {
+        frame_bytes,
+        header,
+        offset,
+    }
+}
+
+fn covering_manifest(segment: &LiveOverlaySegment) -> ManifestGeneration {
+    ManifestGeneration {
+        files: vec![OeFileEntry {
+            coverage: segment.range(),
+            feature_metadata: None,
+            field_deletion_vectors: Vec::new(),
+            file_seal: [0u8; 32],
+            file_id: 0,
+            file_type: FileType::OeFile,
+            footer_len: None,
+            entity_summary: None,
+            graph_event_id_filter: None,
+            graph_summary: None,
+            deletion_vector: None,
+            optional_feature_flags: 0,
+            part_index: 0,
+            part_state: PartState::Active,
+            profile: crate::layout::Profile::Event,
+            required_feature_flags: 0,
+            size_bytes: 0,
+            tenant_id: segment.meta.tenant_id,
+            tree_len: None,
+        }],
+        footer_mirror: None,
+        generation: 1,
+        index_artifacts: Vec::new(),
+        vector_segments: Vec::new(),
+        retirements: Vec::new(),
+    }
+}
+
+fn seq_range(epoch: u64, first_sequence: u64, last_sequence: u64) -> SequenceRange {
+    SequenceRange {
+        epoch,
+        first_sequence,
+        last_sequence,
+    }
+}
+
+#[test]
+fn fresh_read_serves_a_covered_range_and_reports_the_gap_otherwise() {
+    let mut store = LiveOverlayStore::new();
+    store.publish(overlay_segment(1, 1, 4));
+    store.publish(overlay_segment(1, 5, 4));
+
+    match store.fresh_read(TenantId::new_test_id(7), seq_range(1, 1, 8)) {
+        FreshRead::Ready(hits) => assert_eq!(hits.len(), 2),
+        FreshRead::Behind { missing } => panic!("expected Ready, got Behind {missing:?}"),
+    }
+
+    match store.fresh_read(TenantId::new_test_id(7), seq_range(1, 1, 12)) {
+        FreshRead::Behind { missing } => assert_eq!(missing, seq_range(1, 9, 12)),
+        FreshRead::Ready(_) => panic!("expected Behind past the covered tail"),
+    }
+
+    match store.fresh_read(TenantId::new_test_id(7), seq_range(2, 1, 3)) {
+        FreshRead::Behind { missing } => assert_eq!(missing, seq_range(2, 1, 3)),
+        FreshRead::Ready(_) => panic!("a different epoch must be Behind"),
+    }
+}
+
+#[test]
+fn rebuild_from_replay_publishes_event_frames_and_skips_covered_ranges() {
+    let frame_a = sample_frame(3, 1, 1);
+    let frame_b = sample_frame(3, 1, 4);
+    let replay = ReplayOutcome {
+        frames: vec![
+            replayed_frame(frame_a.clone(), 0),
+            replayed_frame(frame_b, frame_a.len() as u64),
+        ],
+        segment_chain_blake3: None,
+        tail: ReplayTail::Clean,
+    };
+
+    let mut store = LiveOverlayStore::new();
+    store.rebuild_from_replay(&replay, 1, 1, |_, _| false).unwrap();
+    assert_eq!(store.segment_count(), 2, "both event frames rebuild into segments");
+
+    let mut covered = LiveOverlayStore::new();
+    covered
+        .rebuild_from_replay(&replay, 1, 1, |_, range| range.first_sequence == 4)
+        .unwrap();
+    assert_eq!(covered.segment_count(), 1, "an OE-covered range is skipped");
+}
+
+fn void_frame(epoch: u64, first_sequence: u64, last_sequence: u64) -> Vec<u8> {
+    build_frame(
+        &FrameBuildInput {
+            flags: super::super::frame::FLAG_VOID_RECORD,
+            tenant_id: TenantId::new_test_id(7),
+            writer_id: 3,
+            epoch,
+            first_sequence,
+            last_sequence,
+            event_count: 0,
+            durable_batch_id: 901,
+            writer_local_batch_id: 2,
+            schema_generation: 1,
+            dictionary_generation_hint: 0,
+            created_at_physical: 1,
+            committed_at_physical: 2,
+        },
+        &[],
+    )
+    .unwrap()
+}
+
+#[test]
+fn a_fresh_read_crosses_a_void_range_to_reach_the_events_behind_it() {
+    let events_before = sample_frame(3, 1, 1);
+    let void = void_frame(1, 4, 5);
+    let events_after = sample_frame(3, 1, 6);
+    let replay = ReplayOutcome {
+        frames: vec![
+            replayed_frame(events_before.clone(), 0),
+            replayed_frame(void.clone(), events_before.len() as u64),
+            replayed_frame(events_after, (events_before.len() + void.len()) as u64),
+        ],
+        segment_chain_blake3: None,
+        tail: ReplayTail::Clean,
+    };
+
+    let mut store = LiveOverlayStore::new();
+    store.rebuild_from_replay(&replay, 1, 1, |_, _| false).unwrap();
+    assert_eq!(store.segment_count(), 2, "a void record produces no segment");
+
+    match store.fresh_read(TenantId::new_test_id(7), seq_range(1, 1, 8)) {
+        FreshRead::Ready(hits) => assert_eq!(hits.len(), 2, "both event segments serve the read"),
+        FreshRead::Behind { missing } => panic!("expected Ready across the void, got Behind {missing:?}"),
+    }
+
+    match store.fresh_read(TenantId::new_test_id(7), seq_range(1, 4, 5)) {
+        FreshRead::Ready(hits) => assert!(hits.is_empty()),
+        FreshRead::Behind { missing } => panic!("expected Ready over the void, got Behind {missing:?}"),
+    }
+
+    match store.fresh_read(TenantId::new_test_id(7), seq_range(1, 1, 12)) {
+        FreshRead::Behind { missing } => assert_eq!(missing, seq_range(1, 9, 12)),
+        FreshRead::Ready(_) => panic!("expected Behind past the covered tail"),
+    }
+}
+
+#[test]
+fn evict_covered_drops_only_published_ranges() {
+    let mut store = LiveOverlayStore::new();
+    let segment = overlay_segment(1, 1, 4);
+    store.publish(segment.clone());
+    store.publish(overlay_segment(1, 5, 4));
+
+    let evicted = store.evict_covered(&ManifestGeneration::default());
+    assert_eq!(evicted, 0);
+    assert_eq!(store.segment_count(), 2);
+
+    let evicted = store.evict_covered(&covering_manifest(&segment));
+    assert_eq!(evicted, 1);
+    assert_eq!(store.segment_count(), 1);
+}
+
+#[test]
+fn two_tenants_using_the_same_epoch_and_sequences_keep_their_own_segments() {
+    let mut store = LiveOverlayStore::new();
+    let mine = overlay_segment(1, 1, 4);
+    let tenant = mine.meta.tenant_id;
+    let other_tenant = TenantId::new_test_id(8);
+    let mut theirs = overlay_segment(1, 1, 4);
+    theirs.meta.tenant_id = other_tenant;
+
+    store.publish(mine);
+    store.publish(theirs);
+    assert_eq!(
+        store.segment_count(),
+        2,
+        "one tenant's segment must not displace another's"
+    );
+
+    match store.fresh_read(tenant, seq_range(1, 1, 4)) {
+        FreshRead::Ready(hits) => {
+            assert_eq!(hits.len(), 1);
+            assert_eq!(
+                hits[0].meta.tenant_id, tenant,
+                "a read is served from its own tenant's rows"
+            );
+        }
+        FreshRead::Behind { missing } => panic!("expected Ready, got Behind {missing:?}"),
+    }
+
+    match store.fresh_read(TenantId::new_test_id(99), seq_range(1, 1, 4)) {
+        FreshRead::Behind { missing } => assert_eq!(missing, seq_range(1, 1, 4)),
+        FreshRead::Ready(_) => panic!("another tenant's segment must not satisfy this read"),
+    }
+
+    let mut voids = LiveOverlayStore::new();
+    voids.publish_void(other_tenant, seq_range(1, 1, 4));
+    match voids.fresh_read(tenant, seq_range(1, 1, 4)) {
+        FreshRead::Behind { missing } => assert_eq!(missing, seq_range(1, 1, 4)),
+        FreshRead::Ready(_) => panic!("another tenant's void must not satisfy this read"),
+    }
+}
+
+fn tenant_frame(tenant_id: TenantId, count: usize, epoch: u64, first_sequence: u64) -> Vec<u8> {
+    let events = sample_events(count);
+    let payload = build_batch(&events, 1, 0).unwrap();
+    build_frame(
+        &FrameBuildInput {
+            flags: 0,
+            tenant_id,
+            writer_id: 3,
+            epoch,
+            first_sequence,
+            last_sequence: first_sequence + count as u64 - 1,
+            event_count: count as u32,
+            durable_batch_id: 900,
+            writer_local_batch_id: 1,
+            schema_generation: 1,
+            dictionary_generation_hint: 0,
+            created_at_physical: 1,
+            committed_at_physical: 2,
+        },
+        &payload,
+    )
+    .unwrap()
+}
+
+#[test]
+fn published_coverage_is_asked_about_each_frames_own_tenant() {
+    let published = TenantId::new_test_id(7);
+    let unpublished = TenantId::new_test_id(8);
+    let frame_a = tenant_frame(published, 3, 1, 1);
+    let frame_b = tenant_frame(unpublished, 3, 1, 1);
+    let replay = ReplayOutcome {
+        frames: vec![
+            replayed_frame(frame_a.clone(), 0),
+            replayed_frame(frame_b, frame_a.len() as u64),
+        ],
+        segment_chain_blake3: None,
+        tail: ReplayTail::Clean,
+    };
+
+    let mut store = LiveOverlayStore::new();
+    store
+        .rebuild_from_replay(&replay, 1, 1, |tenant_id, _| tenant_id == published)
+        .unwrap();
+    assert_eq!(
+        store.segment_count(),
+        1,
+        "only the tenant whose range is published is skipped",
+    );
+    assert!(matches!(
+        store.fresh_read(unpublished, seq_range(1, 1, 3)),
+        FreshRead::Ready(_),
+    ));
+    assert!(matches!(
+        store.fresh_read(published, seq_range(1, 1, 3)),
+        FreshRead::Behind { .. },
+    ));
+}
+
+#[test]
+fn a_rebuilt_overlay_rejects_an_event_frame_a_void_already_covered() {
+    let void = void_frame(1, 1, 3);
+    let late_event = sample_frame(3, 1, 1);
+    let replay = ReplayOutcome {
+        frames: vec![
+            replayed_frame(void.clone(), 0),
+            replayed_frame(late_event, void.len() as u64),
+        ],
+        segment_chain_blake3: None,
+        tail: ReplayTail::Clean,
+    };
+
+    let mut store = LiveOverlayStore::new();
+    store.rebuild_from_replay(&replay, 1, 1, |_, _| false).unwrap();
+    assert_eq!(
+        store.segment_count(),
+        0,
+        "the void won the range, so no segment is built"
+    );
+    match store.fresh_read(TenantId::new_test_id(7), seq_range(1, 1, 3)) {
+        FreshRead::Ready(hits) => assert!(hits.is_empty(), "the voided range serves no rows"),
+        FreshRead::Behind { missing } => panic!("expected Ready over the void, got Behind {missing:?}"),
+    }
+}
+
+#[test]
+fn a_rebuilt_overlay_rejects_a_void_that_overlaps_an_earlier_event_frame() {
+    let event = sample_frame(3, 1, 1);
+    let late_void = void_frame(1, 1, 3);
+    let replay = ReplayOutcome {
+        frames: vec![
+            replayed_frame(event.clone(), 0),
+            replayed_frame(late_void, event.len() as u64),
+        ],
+        segment_chain_blake3: None,
+        tail: ReplayTail::Clean,
+    };
+
+    let mut store = LiveOverlayStore::new();
+    store.rebuild_from_replay(&replay, 1, 1, |_, _| false).unwrap();
+    assert_eq!(store.segment_count(), 1);
+    match store.fresh_read(TenantId::new_test_id(7), seq_range(1, 1, 3)) {
+        FreshRead::Ready(hits) => assert_eq!(hits.len(), 1, "the first-durable event frame still serves its rows"),
+        FreshRead::Behind { missing } => panic!("expected Ready, got Behind {missing:?}"),
+    }
+}
+
+fn claim_range_by_scanning(
+    covered: &mut Vec<(TenantId, SequenceRange)>,
+    tenant_id: TenantId,
+    range: SequenceRange,
+) -> bool {
+    if covered
+        .iter()
+        .any(|(claimed_tenant, existing)| *claimed_tenant == tenant_id && existing.overlaps(&range))
+    {
+        return false;
+    }
+    covered.push((tenant_id, range));
+    true
+}
+
+#[test]
+fn claiming_ranges_matches_scanning_every_accepted_range() {
+    let mut state = 0x0E1A_u64;
+    let mut random = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let fixed = [
+        (7, seq_range(1, 10, 20)),
+        (7, seq_range(1, 10, 20)),
+        (7, seq_range(1, 15, 25)),
+        (7, seq_range(1, 5, 10)),
+        (7, seq_range(1, 20, 30)),
+        (7, seq_range(1, 21, 30)),
+        (7, seq_range(1, 0, 9)),
+        (7, seq_range(1, 1, 40)),
+        (8, seq_range(1, 10, 20)),
+        (7, seq_range(2, 10, 20)),
+        (7, seq_range(1, u64::MAX - 1, u64::MAX)),
+        (7, seq_range(1, u64::MAX, u64::MAX)),
+        (7, seq_range(1, 31, u64::MAX - 2)),
+        (7, seq_range(1, 31, u64::MAX - 1)),
+    ];
+    let mut histories: Vec<Vec<(u128, SequenceRange)>> = vec![fixed.to_vec()];
+    for _ in 0..200 {
+        histories.push(
+            (0..random() % 60)
+                .map(|_| {
+                    let first = random() % 100;
+                    let last = first + random() % 12;
+                    (7 + u128::from(random() % 2), seq_range(random() % 2, first, last))
+                })
+                .collect(),
+        );
+    }
+    for history in histories {
+        let mut indexed = BTreeMap::new();
+        let mut scanned = Vec::new();
+        for (tenant, range) in history {
+            let tenant_id = TenantId::new_test_id(tenant);
+            assert_eq!(
+                claim_range(&mut indexed, tenant_id, range),
+                claim_range_by_scanning(&mut scanned, tenant_id, range),
+                "{range:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_rebuilt_overlay_rejects_frames_overlapping_one_already_published() {
+    let published = sample_frame(3, 1, 1);
+    let late_void = void_frame(1, 2, 4);
+    let late_event = sample_frame(3, 1, 3);
+    let replay = ReplayOutcome {
+        frames: vec![
+            replayed_frame(published.clone(), 0),
+            replayed_frame(late_void.clone(), published.len() as u64),
+            replayed_frame(late_event, (published.len() + late_void.len()) as u64),
+        ],
+        segment_chain_blake3: None,
+        tail: ReplayTail::Clean,
+    };
+
+    let mut store = LiveOverlayStore::new();
+    store
+        .rebuild_from_replay(&replay, 1, 1, |_, range| range.first_sequence == 1)
+        .unwrap();
+    assert_eq!(store.segment_count(), 0, "the late event frame is rejected");
+    match store.fresh_read(TenantId::new_test_id(7), seq_range(1, 2, 4)) {
+        FreshRead::Behind { missing } => assert_eq!(missing, seq_range(1, 2, 4), "the late void is rejected"),
+        FreshRead::Ready(_) => panic!("the late void must not claim the published range"),
+    }
+}

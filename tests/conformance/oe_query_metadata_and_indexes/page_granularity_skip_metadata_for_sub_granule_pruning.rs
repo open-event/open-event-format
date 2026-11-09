@@ -1,0 +1,111 @@
+use oe::indexes::pruning::*;
+
+#[test]
+fn reject_pages_inside_a_surviving_granule() {
+    let filter = Filter {
+        memberships: Vec::new(),
+        clauses: vec![FilterClause {
+            column_id: 1,
+            predicate: PredicateKind::Range,
+            value_hi: i128::MAX,
+            value_lo: 300,
+        }],
+    };
+
+    let page_statistics: Vec<(u32, GranuleStatistics)> = vec![
+        (
+            0,
+            GranuleStatistics {
+                statistics: vec![Statistic::MinMaxBound {
+                    column_id: 1,
+                    max: 99,
+                    min: 0,
+                }],
+            },
+        ),
+        (
+            1,
+            GranuleStatistics {
+                statistics: vec![Statistic::MinMaxBound {
+                    column_id: 1,
+                    max: 199,
+                    min: 100,
+                }],
+            },
+        ),
+        (
+            2,
+            GranuleStatistics {
+                statistics: vec![Statistic::MinMaxBound {
+                    column_id: 1,
+                    max: 299,
+                    min: 200,
+                }],
+            },
+        ),
+        (
+            3,
+            GranuleStatistics {
+                statistics: vec![Statistic::MinMaxBound {
+                    column_id: 1,
+                    max: 399,
+                    min: 300,
+                }],
+            },
+        ),
+        (
+            4,
+            GranuleStatistics {
+                statistics: vec![Statistic::MinMaxBound {
+                    column_id: 1,
+                    max: 499,
+                    min: 400,
+                }],
+            },
+        ),
+    ];
+
+    let surviving = prune_pages_in_granule(&filter, &page_statistics, 5);
+
+    assert_eq!(
+        surviving,
+        vec![3, 4],
+        "only the two pages overlapping [300, MAX] survive"
+    );
+    assert!(
+        !surviving.contains(&0) && !surviving.contains(&1) && !surviving.contains(&2),
+        "pages 0-2 are entirely below lo=300 and must be rejected"
+    );
+
+    let sparse: Vec<(u32, GranuleStatistics)> = vec![
+        (
+            0,
+            GranuleStatistics {
+                statistics: vec![Statistic::MinMaxBound {
+                    column_id: 1,
+                    max: 99,
+                    min: 0,
+                }],
+            },
+        ),
+        (
+            3,
+            GranuleStatistics {
+                statistics: vec![Statistic::MinMaxBound {
+                    column_id: 1,
+                    max: 499,
+                    min: 300,
+                }],
+            },
+        ),
+    ];
+    let sparse_surviving = prune_pages_in_granule(&filter, &sparse, 4);
+    assert!(
+        sparse_surviving.contains(&1) && sparse_surviving.contains(&2),
+        "pages without statistics are always kept"
+    );
+    assert!(
+        !sparse_surviving.contains(&0),
+        "page 0 with max=99 < 300 is still pruned"
+    );
+}

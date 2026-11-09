@@ -1,0 +1,1 @@
+pub const RECOMPUTE_QUEUE_COMPACTION_FLOOR: usize = 64;
