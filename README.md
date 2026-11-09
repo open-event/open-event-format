@@ -2,7 +2,7 @@
   <h1>Open Event Format</h1>
   <h3>A columnar file format and append-only journal built for event streams.<br/>Written once, queried fast, instant deletes.</h3>
   <p>
-    0.05 ms 1% time windows, 0.10 ms event-by-id lookups, and instant redactions over 1,000,000 chat events
+    0.04 ms 1% time windows, 0.10 ms event-by-id lookups, and instant redactions over 1,000,000 chat events
   </p>
   <p>
     <a href="#getting-started">Quickstart</a> •
@@ -18,7 +18,7 @@
 OE is a file format for events. Events first land in **OEJ**, an append-only journal that is the durable record, then get packed into **OE** files: immutable, self-describing column files for analytical queries. Everything is checksummed end to end, so corruption is always caught and never served.
 
 - **Built for events, not generic tables**: Every file carries a full event envelope (ids, streams, tenants, sequence numbers, timestamps, relationships) next to a schemaless variant payload, with vector columns for embeddings stored alongside events.
-- **Durable journal**: OEJ writes append-only frames, each acknowledged only after sync. 208k events/s @ 1.093 ms p99.
+- **Durable journal**: OEJ writes append-only frames, each acknowledged only after sync. 236k events/s @ 1.106 ms p99.
 - **Columnar files**: Stripes, granules and projections with per-column encodings chosen per block. Column data maps onto Arrow arrays for the query engine that embeds OE.
 - **Point lookups without a database**: Time-window and entity-hash granule filters, an external-id index, thread (root reference) lookups, IN-list pruning and boolean (AND/OR) filter planning on encoded blocks answer "latest 50 in this room" or "this event by id" without scanning.
 - **Redaction without rewrites**: Removing an event records a deletion vector of a few bytes instead of rewriting the file. Corrections and splice rewrites reuse untouched granules.
@@ -47,14 +47,14 @@ For comparison across a million chat events, single thread, file held in memory:
 
 | Operation | OE | Parquet | Vortex |
 | --- | --- | --- | --- |
-| 1% time window | **0.05 ms** | 2.31 ms | 0.54 ms |
-| Every reply in a thread | **0.32 ms** | 21.86 ms | 2.99 ms |
-| One event by id | **0.10 ms** | 5.69 ms | 0.71 ms |
-| Latest 50 messages in a room | **2.11 ms** | 42.82 ms | 2.24 ms |
-| Redact 1 event | **0.00 ms** | 1,931.69 ms | 2,619.13 ms |
-| Redact 1% of events | **12.94 ms** | 2,019.07 ms | 2,887.93 ms |
-| Size per event | 66.3 bytes | **37.7 bytes** | 48.1 bytes |
-| Write | 4,258 ms | **1,047 ms** | 1,985 ms |
+| 1% time window | **0.04 ms** | 2.23 ms | 0.76 ms |
+| Every reply in a thread | **0.27 ms** | 22.08 ms | 2.57 ms |
+| One event by id | **0.10 ms** | 5.98 ms | 0.66 ms |
+| Latest 50 messages in a room | **1.55 ms** | 47.89 ms | 1.99 ms |
+| Redact 1 event | **0.00 ms** | 1,930.83 ms | 2,774.18 ms |
+| Redact 1% of events | **15.37 ms** | 2,103.64 ms | 2,819.82 ms |
+| Size per event | 44.3 bytes | **37.7 bytes** | 48.1 bytes |
+| Write | 5,054 ms | **1,263 ms** | 2,193 ms |
 
 <br/>
 
@@ -78,7 +78,7 @@ cd benchmark && cargo run --release -- --sizes 10000,100000,1000000 --reps 5 --w
 <details>
 <summary><b>Why are OE files larger than Parquet?</b></summary>
 
-OE stores more: all envelope columns (hashes, sequence numbers, ingest time), skip indexes, an external-id index and integrity checksums. On 1,000,000 chat events that is 66.3 bytes per event against Parquet's 37.7 bytes, and it buys the lookup and redaction times above.
+OE stores more: all envelope columns (hashes, sequence numbers, ingest time), skip indexes, an external-id index and integrity checksums. On 1,000,000 chat events that is 44.3 bytes per event against Parquet's 37.7 bytes, and it buys the lookup and redaction times above.
 
 </details>
 
