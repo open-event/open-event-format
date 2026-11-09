@@ -3759,6 +3759,93 @@ fn decode_raw_string(reader: &mut Reader<'_>) -> Result<StringColumn, FormatErro
     })
 }
 
+/// A [`Compression::StringZstd`] block's column built straight from its relaid body: each raw value's text is copied
+/// once, found by the zero byte after it, and a dictionary threads its codes through its entries in place — no classic
+/// offset table is laid out only to be parsed again.
+fn relaid_string_column(relaid: string_zstd::Relaid<'_>) -> Result<StringColumn, FormatError> {
+    let (nulls, count, values) = match relaid {
+        string_zstd::Relaid::Dictionary { nulls, entries, codes } => {
+            return merge_nulls_dictionary(&nulls, &codes, &entries);
+        }
+        string_zstd::Relaid::Raw { nulls, count, values } => (nulls, count, values),
+    };
+    if nulls.present_count() != count {
+        return Err(FormatError::Structural {
+            rule: "null bitmap disagrees with present count",
+        });
+    }
+    let rows = nulls.row_count();
+    let mut text = String::with_capacity(values.len().saturating_sub(count));
+    let mut offsets = Vec::with_capacity(rows + 1);
+    offsets.push(0u64);
+    let mut present = Vec::with_capacity(rows);
+    let mut walk = string_zstd::TerminatedValues::new(values);
+    if matches!(nulls.form, NullStreamForm::AllPresent) {
+        present.resize(rows, true);
+        for _ in 0..count {
+            text.push_str(walk.next_value()?);
+            offsets.push(text.len() as u64);
+        }
+    } else {
+        nulls.each_row(|set| {
+            if set {
+                text.push_str(walk.next_value()?);
+            }
+            offsets.push(text.len() as u64);
+            present.push(set);
+            Ok(())
+        })?;
+    }
+    walk.finish()?;
+    Ok(StringColumn::from_parts(offsets, present, text))
+}
+
+/// [`relaid_string_column`] as an Arrow `StringView` array: the same values and nulls the classic body's view decode
+/// returns.
+fn relaid_string_views(relaid: string_zstd::Relaid<'_>) -> Result<StringViewArray, FormatError> {
+    let (nulls, arena, views) = match relaid {
+        string_zstd::Relaid::Dictionary { nulls, entries, codes } => {
+            let (arena, bounds) = concatenate(&entries);
+            let entry_views = views_over(&arena, &bounds)?;
+            let views = dictionary_views_by_row(&nulls, &entry_views, &codes)?;
+            (nulls, arena, views)
+        }
+        string_zstd::Relaid::Raw { nulls, count, values } => {
+            let mut arena = Vec::with_capacity(values.len().saturating_sub(count));
+            let mut stored = Vec::with_capacity(count);
+            let mut walk = string_zstd::TerminatedValues::new(values);
+            for _ in 0..count {
+                let value = walk.next_value()?.as_bytes();
+                let start = u32::try_from(arena.len()).map_err(|_| FormatError::Structural {
+                    rule: "string arena exceeds the u32 range a view addresses",
+                })?;
+                stored.push(make_view(value, 0, start));
+                arena.extend_from_slice(value);
+            }
+            walk.finish()?;
+            if u32::try_from(arena.len()).is_err() {
+                return Err(FormatError::Structural {
+                    rule: "string arena exceeds the u32 range a view addresses",
+                });
+            }
+            let views = views_by_row(&nulls, stored.into_iter())?;
+            (nulls, arena, views)
+        }
+    };
+    // SAFETY: every view addresses bytes inside `arena` and describes valid UTF-8. The dictionary arm's entry views
+    // come from `views_over` over entries that arrived as `&str`, and `dictionary_views_by_row` refuses a code past
+    // them. The raw arm's views are each made over the exact bytes of one `&str` value appended to `arena` at the
+    // view's offset, whose length was proved to fit a `u32`. Absent rows carry the all-zero, empty inline view.
+    let array = unsafe {
+        StringViewArray::new_unchecked(
+            ScalarBuffer::from(views),
+            vec![Buffer::from(arena)],
+            null_buffer(&nulls),
+        )
+    };
+    Ok(array)
+}
+
 /// Decodes a string block straight into an Arrow `StringView` array: the same values and nulls `decode_block` returns
 /// as `ColumnData::Strings`, but each value lands in the view builder's own buffer with no per-value `String` on the
 /// way — so short strings sit inline in the finished array and equality or prefix predicates compare them without a
@@ -3836,6 +3923,11 @@ pub(crate) fn decode_string_block_views_shared_prepared(
         Transform::DictionaryString | Transform::FsstString | Transform::FsstPackedString | Transform::RawString
     ) {
         return Ok(None);
+    }
+    if pipeline.compression()? == Compression::StringZstd
+        && let Some(array) = string_zstd::with_relaid(transform, pipeline.side_stream()?, bytes, relaid_string_views)?
+    {
+        return Ok(Some(array));
     }
     with_trailing_removed(pipeline.compression()?, bytes, |body| {
         if let Some((classic, body)) = classic_fsst_view(pipeline, body)? {
@@ -6203,6 +6295,12 @@ pub fn decode_block_shared(
             seekable_zstd::decompress_prefix_into(bytes, scratch, |head| string_values_end(transform, head))?;
             decode_block_shared_with_body(pipeline, scratch, shared)
         });
+    }
+    if pipeline.compression()? == Compression::StringZstd
+        && pipeline.value_kind()? == ValueKind::String
+        && let Some(column) = string_zstd::with_relaid(transform, pipeline.side_stream()?, bytes, relaid_string_column)?
+    {
+        return Ok(ColumnData::Strings(column));
     }
     with_trailing_removed(pipeline.compression()?, bytes, |body| {
         decode_block_shared_with_body(pipeline, body, shared)

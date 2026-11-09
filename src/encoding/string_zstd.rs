@@ -22,7 +22,10 @@
 //! [`Compression::Zstd3`] instead. A file holding any such block declares the `STRING_ZSTD_BLOCKS` required feature.
 
 use super::decompressor::Decompressor;
-use super::{Compression, NullStream, SideStream, Transform, bitpack, bitunpack, compress_zstd_framed, read_offsets};
+use super::{
+    Compression, FASTLANES_LANES, FASTLANES_VECTOR, NullStream, SideStream, Transform, bitpack, bitunpack,
+    compress_zstd_framed, read_offsets,
+};
 use crate::error::FormatError;
 use crate::file::bytes::{Reader, Writer};
 
@@ -249,6 +252,12 @@ pub(crate) fn decompress_into(
     plain: &mut Vec<u8>,
     inflate: &dyn Decompressor,
 ) -> Result<(), FormatError> {
+    let (classic_len, tag, inner) = read_header(bytes)?;
+    with_inflated(inner, inflate, |relaid| unrelay(tag, relaid, classic_len, plain))
+}
+
+/// A stored block's header: the classic body length it claims, its relayout tag, and the inner Zstandard block.
+fn read_header(bytes: &[u8]) -> Result<(usize, u8, &[u8]), FormatError> {
     let mut reader = Reader::new(bytes);
     let classic_len = reader.u32("string zstd classic length")? as usize;
     if classic_len > MAX_CLASSIC_BYTES {
@@ -258,15 +267,222 @@ pub(crate) fn decompress_into(
     }
     let tag = reader.u8("string zstd relayout tag")?;
     let inner = reader.take(reader.remaining(), "string zstd body")?;
+    Ok((classic_len, tag, inner))
+}
+
+/// Inflates `inner` into this thread's reused relaid scratch buffer and runs `consume` over it.
+fn with_inflated<R>(
+    inner: &[u8],
+    inflate: &dyn Decompressor,
+    consume: impl FnOnce(&[u8]) -> Result<R, FormatError>,
+) -> Result<R, FormatError> {
     RELAID_SCRATCH.with(|cell| {
         let mut relaid = cell.take();
-        let inflated = inflate.decompress_into(Compression::Zstd3, inner, &mut relaid);
-        let restored = inflated.and_then(|()| unrelay(tag, &relaid, classic_len, plain));
+        let consumed = inflate
+            .decompress_into(Compression::Zstd3, inner, &mut relaid)
+            .and_then(|()| consume(&relaid));
         if relaid.capacity() <= MAX_CLASSIC_BYTES / 16 {
             cell.replace(relaid);
         }
-        restored
+        consumed
     })
+}
+
+/// A relaid body parsed in place, for a whole-block decode that builds its output straight from it rather than from
+/// the classic body [`unrelay`] would lay out first.
+pub(crate) enum Relaid<'a> {
+    /// A [`Transform::RawString`] body: `values` holds `count` values, each followed by a zero byte. It was validated
+    /// as UTF-8 whole, so every value between two terminators (ASCII bytes) is UTF-8 too. Walk it with
+    /// [`TerminatedValues`], which refuses a missing terminator or trailing bytes.
+    Raw {
+        nulls: NullStream<'a>,
+        count: usize,
+        values: &'a str,
+    },
+    /// A local [`Transform::DictionaryString`] body with plain entries: the entries and the codes, each code checked
+    /// against the declared width (not yet against the entry count).
+    Dictionary {
+        nulls: NullStream<'a>,
+        entries: Vec<&'a str>,
+        codes: Vec<u64>,
+    },
+}
+
+/// Zero-terminated values in order, each found by the zero byte that ends it.
+pub(crate) struct TerminatedValues<'a> {
+    rest: &'a str,
+}
+
+impl<'a> TerminatedValues<'a> {
+    pub(crate) fn new(values: &'a str) -> Self {
+        Self { rest: values }
+    }
+
+    /// The next value, or an error when no terminator is left.
+    pub(crate) fn next_value(&mut self) -> Result<&'a str, FormatError> {
+        let len = memchr::memchr(0, self.rest.as_bytes()).ok_or(FormatError::Structural {
+            rule: "relaid string value without its terminator",
+        })?;
+        // A zero byte is ASCII, so `len` and `len + 1` are both character boundaries of the validated text.
+        let value = self.rest.get(..len).unwrap_or_default();
+        self.rest = self.rest.get(len + 1..).unwrap_or_default();
+        Ok(value)
+    }
+
+    /// Refuses bytes left after the last value a caller took.
+    pub(crate) fn finish(self) -> Result<(), FormatError> {
+        if self.rest.is_empty() {
+            Ok(())
+        } else {
+            Err(FormatError::Structural {
+                rule: "relaid string body has trailing bytes",
+            })
+        }
+    }
+}
+
+/// Where the `count` zero-terminated values at the head of `bytes` end, just past the last terminator.
+fn terminated_end(bytes: &[u8], count: usize) -> Result<usize, FormatError> {
+    let missing = FormatError::Structural {
+        rule: "relaid string value without its terminator",
+    };
+    if count > bytes.len() {
+        return Err(missing);
+    }
+    let mut end = 0usize;
+    let mut zeros = memchr::memchr_iter(0, bytes);
+    for _ in 0..count {
+        end = zeros.next().ok_or(missing.clone())? + 1;
+    }
+    Ok(end)
+}
+
+/// The classic length of a `u32` count, `count + 1` `u32` offsets, then `text` bytes of arena.
+fn classic_strings_len(count: usize, text: usize) -> Option<usize> {
+    count.checked_add(2)?.checked_mul(4)?.checked_add(text)
+}
+
+/// `count` codes gathered from their byte planes, least significant plane first.
+fn gather_planes(bytes: &[u8], count: usize, planes: usize) -> Vec<u64> {
+    let mut codes: Vec<u64> = match bytes.get(..count) {
+        Some(low) if planes > 0 => low.iter().map(|&byte| u64::from(byte)).collect(),
+        _ => vec![0; count],
+    };
+    for plane in 1..planes {
+        let plane_bytes = bytes.get(plane * count..(plane + 1) * count).unwrap_or_default();
+        for (code, &byte) in codes.iter_mut().zip(plane_bytes) {
+            *code |= u64::from(byte) << (plane * 8);
+        }
+    }
+    codes
+}
+
+/// Parses a relaid `tag` body in place, refusing what [`unrelay`] refuses: a malformed layout, a code wider than its
+/// width, trailing bytes, or a classic length other than the stored one. (A raw body's terminators are counted as its
+/// consumer walks them.)
+fn parse(tag: u8, relaid: &[u8], classic_len: usize) -> Result<Relaid<'_>, FormatError> {
+    let mut reader = Reader::new(relaid);
+    let nulls = NullStream::read(&mut reader)?;
+    let nulls_end = reader.position();
+    let (parsed, body_len) = match tag {
+        TAG_RAW => {
+            let count = reader.u32("raw present count")? as usize;
+            let rest = reader.take(reader.remaining(), "terminated values")?;
+            let values = simdutf8::basic::from_utf8(rest).map_err(|_| FormatError::InvalidUtf8 {
+                what: "raw string value",
+            })?;
+            let text = rest.len().checked_sub(count).ok_or(FormatError::Structural {
+                rule: "relaid string value without its terminator",
+            })?;
+            (Relaid::Raw { nulls, count, values }, classic_strings_len(count, text))
+        }
+        TAG_DICTIONARY => {
+            let dict_count = reader.u32("dictionary count")? as usize;
+            let rest = reader.take(reader.remaining(), "terminated values")?;
+            let end = terminated_end(rest, dict_count)?;
+            let region = simdutf8::basic::from_utf8(rest.get(..end).unwrap_or_default()).map_err(|_| {
+                FormatError::InvalidUtf8 {
+                    what: "dictionary entry",
+                }
+            })?;
+            let mut entries = Vec::with_capacity(dict_count);
+            let mut walk = TerminatedValues::new(region);
+            for _ in 0..dict_count {
+                entries.push(walk.next_value()?);
+            }
+            walk.finish()?;
+            let mut reader = Reader::new(rest.get(end..).unwrap_or_default());
+            let count = reader.u32("dictionary code count")? as usize;
+            let width = reader.u8("dictionary code width")?;
+            if width > 64 {
+                return Err(FormatError::Structural {
+                    rule: "bit width beyond 64",
+                });
+            }
+            let planes = usize::from(width).div_ceil(8);
+            let bytes = reader.take(count.saturating_mul(planes), "dictionary code planes")?;
+            if reader.remaining() != 0 {
+                return Err(FormatError::Structural {
+                    rule: "relaid string body has trailing bytes",
+                });
+            }
+            let codes = gather_planes(bytes, count, planes);
+            if width < 64 && codes.iter().any(|&code| code >> width != 0) {
+                return Err(FormatError::Structural {
+                    rule: "relaid dictionary code wider than its width",
+                });
+            }
+            // The classic codes are a FastLanes stream: count and width, then whole 1024-value vectors of `width`
+            // words per lane.
+            let packed = if width == 0 {
+                Some(0)
+            } else {
+                count
+                    .div_ceil(FASTLANES_VECTOR)
+                    .checked_mul(FASTLANES_LANES * usize::from(width) * 8)
+            };
+            let len = classic_strings_len(dict_count, end - dict_count)
+                .and_then(|len| len.checked_add(5)?.checked_add(packed?));
+            (Relaid::Dictionary { nulls, entries, codes }, len)
+        }
+        _ => {
+            return Err(FormatError::Structural {
+                rule: "unknown string relayout tag",
+            });
+        }
+    };
+    if body_len.and_then(|len| len.checked_add(nulls_end)) != Some(classic_len) {
+        return Err(FormatError::Structural {
+            rule: "relaid string body disagrees with its classic length",
+        });
+    }
+    Ok(parsed)
+}
+
+/// Undoes a [`Compression::StringZstd`] stage and hands `decode` the relaid body parsed in place, so a whole-block
+/// decode builds its output straight from it, skipping the classic body. `Ok(None)` when the block's relayout is not
+/// the one `transform` and `side` record; the caller then takes the classic path, which refuses or decodes it as it
+/// always has.
+pub(crate) fn with_relaid<R>(
+    transform: Transform,
+    side: SideStream,
+    bytes: &[u8],
+    decode: impl FnOnce(Relaid<'_>) -> Result<R, FormatError>,
+) -> Result<Option<R>, FormatError> {
+    let (classic_len, tag, inner) = read_header(bytes)?;
+    let expected = match (transform, side) {
+        (Transform::RawString, SideStream::None) => TAG_RAW,
+        (Transform::DictionaryString, SideStream::None) => TAG_DICTIONARY,
+        _ => return Ok(None),
+    };
+    if tag != expected {
+        return Ok(None);
+    }
+    let inflate = super::decompressor::active_decompressor();
+    with_inflated(inner, inflate.as_ref(), |relaid| {
+        decode(parse(tag, relaid, classic_len)?)
+    })
+    .map(Some)
 }
 
 #[cfg(test)]
