@@ -70,7 +70,7 @@ Pipeline transform 15 (FSST with bitpacked value lengths) SHALL have an availabi
 - **THEN** it returns a structural "unknown transform" error and decodes nothing
 
 ### Requirement: String-zstd blocks are gated by a required feature
-Pipeline trailing compression 6 (`string_zstd`, a string block relaid and compressed whole with Zstandard) SHALL be refused, like every unknown compression, by a reader that does not implement it: decoding the pipeline id SHALL return a structural "unknown compression" error and decode nothing. A file holding such a block SHALL declare required feature bit 37 (`string_zstd_blocks`); a reader whose known required set lacks bit 37 SHALL refuse the file at open.
+Pipeline trailing compression 6 (`string_zstd`, a string block relaid and compressed whole with LZ4, or Zstandard in files from earlier writers) SHALL be refused, like every unknown compression, by a reader that does not implement it: decoding the pipeline id SHALL return a structural "unknown compression" error and decode nothing. A file holding such a block SHALL declare required feature bit 37 (`string_zstd_blocks`); a reader whose known required set lacks bit 37 SHALL refuse the file at open. A file whose compression-6 blocks carry LZ4 (relayout tag bit `0x80`) SHALL also declare required feature bit 39 (`string_lz4_blocks`), and a reader whose known required set lacks bit 39 SHALL refuse it at open.
 
 #### Scenario: Unknown compression refused cleanly
 - **WHEN** a reader without compression 6 is handed a block whose pipeline id names it

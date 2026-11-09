@@ -629,8 +629,14 @@ pub mod required_features {
     /// other columns. Declared exactly when the section is present.
     pub const PACKED_SHARED_DICTIONARIES: u64 = 1 << 38;
 
+    /// At least one relaid string block (pipeline compression 6) stores its relaid body under LZ4 (relayout tag bit
+    /// `0x80`) rather than Zstandard. Always declared beside [`STRING_ZSTD_BLOCKS`] by writers that store LZ4.
+    /// Required and refusing on purpose: a reader that knows the Zstandard form but not this one would refuse each
+    /// such block only when it came to decode it, after answering from the file's other columns.
+    pub const STRING_LZ4_BLOCKS: u64 = 1 << 39;
+
     /// Every required feature this reader implements.
-    pub const KNOWN: u64 = (1 << 39) - 1;
+    pub const KNOWN: u64 = (1 << 40) - 1;
 
     /// The full required set every v1 file declares, `COLUMNAR_MARKS` included — the writer emits the columnar,
     /// per-stripe marks form. Excludes `FOOTER_ENCRYPTED` (opt-in per build, set only when the caller requests footer
@@ -655,7 +661,8 @@ pub mod required_features {
         & !EXTERNAL_ID_INDEX_32
         & !ENTITY_HASH_COLUMNS_ELIDED
         & !STRING_ZSTD_BLOCKS
-        & !PACKED_SHARED_DICTIONARIES;
+        & !PACKED_SHARED_DICTIONARIES
+        & !STRING_LZ4_BLOCKS;
 }
 
 /// Optional feature flags: unknown optional features are ignored; known ones are validated and used.

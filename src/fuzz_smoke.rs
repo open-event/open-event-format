@@ -398,7 +398,12 @@ fn mutated_string_zstd_block_never_panics() {
         for i in 0..8_192u64 {
             values.push(
                 (i % 11 != 0)
-                    .then(|| format!("!room{}:example.org", i * 37 % distinct))
+                    .then(|| {
+                        format!(
+                            "!room{}:example.org joined by @someone:matrix.example.org",
+                            i * 37 % distinct
+                        )
+                    })
                     .as_deref(),
             );
         }

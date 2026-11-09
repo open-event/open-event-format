@@ -17,5 +17,5 @@ mod qpl_deflate_as_an_iaa_accelerated_software_parity_compression_family;
 mod recursive_cascade_selection;
 mod self_describing_per_page_encoding_descriptor;
 mod shredded_blocks_use_the_adaptive_encoder;
-mod string_blocks_may_be_compressed_whole_with_zstandard;
+mod string_blocks_may_be_compressed_whole_with_lz4;
 mod strings_preserve_random_access_decode;

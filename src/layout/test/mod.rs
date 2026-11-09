@@ -336,9 +336,9 @@ fn the_packed_string_offsets_bit_is_known_but_declared_only_by_files_that_use_it
     assert_eq!(required_features::PACKED_STRING_OFFSETS, 1 << 33);
     assert_eq!(required_features::PACKED_STRING_OFFSETS & required_features::ALL, 0);
     assert_eq!(required_features::PACKED_STRING_OFFSETS & !required_features::KNOWN, 0);
-    // Bit 39 belongs to a feature this reader does not implement, so a file declaring it is refused.
-    assert_eq!((1u64 << 39) & required_features::KNOWN, 0);
-    assert!(crate::compat::check_features(1 << 39, 0).is_err());
+    // Bit 40 belongs to a feature this reader does not implement, so a file declaring it is refused.
+    assert_eq!((1u64 << 40) & required_features::KNOWN, 0);
+    assert!(crate::compat::check_features(1 << 40, 0).is_err());
     assert!(crate::compat::check_features(required_features::PACKED_STRING_OFFSETS, 0).is_ok());
 }
 
@@ -354,9 +354,20 @@ fn the_string_zstd_blocks_bit_is_known_but_declared_only_by_files_that_use_it() 
 }
 
 #[test]
+fn the_string_lz4_blocks_bit_is_known_but_declared_only_by_files_that_use_it() {
+    assert_eq!(required_features::STRING_LZ4_BLOCKS, 1 << 39);
+    assert_eq!(required_features::STRING_LZ4_BLOCKS & required_features::ALL, 0);
+    assert_eq!(required_features::STRING_LZ4_BLOCKS & !required_features::KNOWN, 0);
+    assert!(crate::compat::check_features(required_features::STRING_LZ4_BLOCKS, 0).is_ok());
+    // A reader that knows the Zstandard form (bit 37) but predates bit 39 refuses a file declaring it.
+    let old_known = required_features::KNOWN & !required_features::STRING_LZ4_BLOCKS;
+    assert_ne!(required_features::STRING_LZ4_BLOCKS & !old_known, 0);
+}
+
+#[test]
 fn the_packed_shared_dictionaries_bit_is_known_but_declared_only_by_files_that_use_it() {
     assert_eq!(required_features::PACKED_SHARED_DICTIONARIES, 1 << 38);
-    assert_eq!(required_features::KNOWN, (1 << 39) - 1);
+    assert_eq!(required_features::KNOWN, (1 << 40) - 1);
     assert_eq!(
         required_features::PACKED_SHARED_DICTIONARIES & required_features::ALL,
         0

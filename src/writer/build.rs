@@ -5489,7 +5489,7 @@ fn build_oe_file_sealed_in_order(
         required_feature_flags |= required_features::OCCURRED_RELATIVE_INGESTED_AT;
     }
     if string_zstd_blocks {
-        required_feature_flags |= required_features::STRING_ZSTD_BLOCKS;
+        required_feature_flags |= required_features::STRING_ZSTD_BLOCKS | required_features::STRING_LZ4_BLOCKS;
     }
     if !state_roots.is_empty() {
         required_feature_flags |= required_features::GRAPH_STATE_ROOTS;

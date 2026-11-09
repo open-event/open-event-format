@@ -32,7 +32,7 @@ use constant::{
     FSST_LOSSY_PHT_HASH_SHIFT, FSST_MAX_AVERAGE_VALUE_LEN, FSST_MAX_SYMBOL_COUNT, FSST_MIN_SAMPLE_COUNT,
     FSST_PER_FRAME_BAR_MIN_BLOCK_BYTES, FSST_TRAILING_MAX_RATIO_DEN, FSST_TRAILING_MAX_RATIO_NUM,
     FSST_VALUE_KEYS_MAX_PLAINTEXT_DIVISOR, MAX_RLE_EXPANSION_VALUES, PREFIX_KEY_BYTES, PREFIX_SUM_CHUNK,
-    REPLAY_TRIP_DEN, REPLAY_TRIP_NUM, SIZE_OPTIMIZED_SAVINGS_DIVISOR, STRING_ZSTD_LEVEL, STRING_ZSTD_MIN_SAVINGS_DEN,
+    REPLAY_TRIP_DEN, REPLAY_TRIP_NUM, SIZE_OPTIMIZED_SAVINGS_DIVISOR, STRING_ZSTD_MIN_SAVINGS_DEN,
     STRING_ZSTD_MIN_SAVINGS_NUM, TRANSFORM_SAMPLE_RUNS, TRANSFORM_SAMPLE_SIZE, ZSTD_LENGTH_PREFIX_BYTES,
 };
 use multiversion::multiversion;
@@ -5086,11 +5086,11 @@ fn encode_chosen_form(
     block
 }
 
-/// The whole-block Zstandard form of a string block, when it stores fewer than [`STRING_ZSTD_MIN_SAVINGS_NUM`] /
+/// The whole-block LZ4 form of a string block, when it stores fewer than [`STRING_ZSTD_MIN_SAVINGS_NUM`] /
 /// [`STRING_ZSTD_MIN_SAVINGS_DEN`] of `current_len`: the raw arena, and — for a block that repeats its values
 /// ([`dictionary_trial_worthwhile`]) — the dictionary form with plain entries and bitpacked codes, each compressed
-/// whole with Zstandard at [`STRING_ZSTD_LEVEL`], the smaller kept. Both are pipelines every reader already decodes
-/// ([`Transform::RawString`] or [`Transform::DictionaryString`] behind a [`Compression::Zstd3`] trailing stage): a
+/// whole with LZ4, the smaller kept. Both are pipelines every reader already decodes
+/// ([`Transform::RawString`] or [`Transform::DictionaryString`] behind a [`Compression::Lz4`] trailing stage): a
 /// point read or a filter inflates the block once and then reads it exactly as the uncompressed form, dictionary
 /// equality still resolving one entry and comparing codes. It is the one whole-block stage a random-access column may
 /// take: the block is one granule's values, so a single inflate answers any row of it, and the reader's decoded-block
@@ -5114,9 +5114,9 @@ fn string_zstd_candidate(
     let mut best: Option<(Transform, SideStream, Compression, Vec<u8>, u64)> = None;
     let mut consider = |transform: Transform, side: SideStream, body: &[u8]| {
         // The relaid stage where the body has one; plain Zstandard over the classic body otherwise.
-        let (compression, stored) = match string_zstd::compress(transform, side, body, STRING_ZSTD_LEVEL) {
+        let (compression, stored) = match string_zstd::compress(transform, side, body) {
             Some(stored) => (Compression::StringZstd, stored),
-            None => (Compression::Zstd3, compress_zstd_framed(body, STRING_ZSTD_LEVEL)),
+            None => (Compression::Lz4, lz4_flex::compress_prepend_size(body)),
         };
         if !stored.is_empty()
             && stored.len() < bar

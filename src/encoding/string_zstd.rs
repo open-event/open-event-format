@@ -1,5 +1,5 @@
 //! The [`Compression::StringZstd`] trailing stage: a string block relaid for an entropy coder, then compressed whole
-//! with Zstandard — what a Parquet column chunk of repeated identifiers or free text stores, adapted to OE's block
+//! with LZ4 (Zstandard in files from earlier writers) — close to what a Parquet column chunk of repeated identifiers or free text stores, adapted to OE's block
 //! layouts.
 //!
 //! A classic string body is laid out for compressed-form kernels, not for Zstandard: its four-byte offset tables are
@@ -11,7 +11,8 @@
 //! ordinary bytes and decodes, filters and point-reads them as it always has.
 //!
 //! Stored form: the classic body's byte length (`u32`), a relayout tag (`u8`), then the relaid body as an ordinary
-//! [`Compression::Zstd3`] stored block (its own `u32` length prefix and one Zstandard frame).
+//! [`Compression::Lz4`] stored block (its own `u32` length prefix and one LZ4 block) when the tag carries
+//! [`TAG_LZ4`], else a [`Compression::Zstd3`] stored block (one Zstandard frame), as earlier writers stored it.
 //!
 //! | tag | classic body | relaid body |
 //! |-----|--------------|-------------|
@@ -19,12 +20,11 @@
 //! | 1 | [`Transform::DictionaryString`] with plain entries | null stream, entry count, each entry followed by `0x00`, code count, code width, `ceil(width / 8)` byte planes of the codes (least significant first) |
 //!
 //! A body whose values (or entries) contain a zero byte is not relaid; the encoder stores it under plain
-//! [`Compression::Zstd3`] instead. A file holding any such block declares the `STRING_ZSTD_BLOCKS` required feature.
+//! [`Compression::Lz4`] instead. A file holding any such block declares the `STRING_ZSTD_BLOCKS` required feature.
 
 use super::decompressor::Decompressor;
 use super::{
-    Compression, FASTLANES_LANES, FASTLANES_VECTOR, NullStream, SideStream, Transform, bitpack, bitunpack,
-    compress_zstd_framed, read_offsets,
+    Compression, FASTLANES_LANES, FASTLANES_VECTOR, NullStream, SideStream, Transform, bitpack, bitunpack, read_offsets,
 };
 use crate::error::FormatError;
 use crate::file::bytes::{Reader, Writer};
@@ -34,6 +34,11 @@ const TAG_RAW: u8 = 0;
 
 /// Relayout tag of a local [`Transform::DictionaryString`] body with plain entries.
 const TAG_DICTIONARY: u8 = 1;
+
+/// Set on the relayout tag when the relaid body is an [`Compression::Lz4`] stored block (`u32` length prefix and one
+/// LZ4 block) rather than [`Compression::Zstd3`]. The writer stores LZ4: it inflates several times faster, which keeps
+/// a full scan of the column close to its uncompressed speed. Zstandard-tagged blocks from earlier writers still read.
+pub(crate) const TAG_LZ4: u8 = 0x80;
 
 thread_local! {
     /// One inflated relaid body per thread, reused block after block instead of a fresh allocation per inflate.
@@ -224,39 +229,38 @@ fn unrelay(tag: u8, relaid: &[u8], classic_len: usize, plain: &mut Vec<u8>) -> R
     Ok(())
 }
 
-/// The [`Compression::StringZstd`] stored form of a classic `transform` body, compressed at Zstandard `level`, or
-/// `None` when the body has no relayout or Zstandard failed. The relayout is undone and compared against `classic`
+/// The [`Compression::StringZstd`] stored form of a classic `transform` body, its relaid body compressed with LZ4, or
+/// `None` when the body has no relayout. The relayout is undone and compared against `classic`
 /// before it is kept, so a stored block always restores the exact body it was made from.
-pub(crate) fn compress(transform: Transform, side: SideStream, classic: &[u8], level: i32) -> Option<Vec<u8>> {
+pub(crate) fn compress(transform: Transform, side: SideStream, classic: &[u8]) -> Option<Vec<u8>> {
     let (tag, relaid) = relay(transform, side, classic)?;
     let mut restored = Vec::new();
     unrelay(tag, &relaid, classic.len(), &mut restored).ok()?;
     if restored != classic {
         return None;
     }
-    let framed = compress_zstd_framed(&relaid, level);
-    if framed.is_empty() {
-        return None;
-    }
+    let framed = lz4_flex::compress_prepend_size(&relaid);
     let mut out = Vec::with_capacity(5 + framed.len());
     out.extend_from_slice(&u32::try_from(classic.len()).ok()?.to_le_bytes());
-    out.push(tag);
+    out.push(tag | TAG_LZ4);
     out.extend_from_slice(&framed);
     Some(out)
 }
 
-/// Undoes a [`Compression::StringZstd`] stage into `plain` (emptied first): `inflate` undoes the inner
-/// [`Compression::Zstd3`] stage, then the relaid body is laid back out as the classic body.
+/// Undoes a [`Compression::StringZstd`] stage into `plain` (emptied first): `inflate` undoes the inner LZ4 or
+/// Zstandard stage the tag records, then the relaid body is laid back out as the classic body.
 pub(crate) fn decompress_into(
     bytes: &[u8],
     plain: &mut Vec<u8>,
     inflate: &dyn Decompressor,
 ) -> Result<(), FormatError> {
     let (classic_len, tag, inner) = read_header(bytes)?;
-    with_inflated(inner, inflate, |relaid| unrelay(tag, relaid, classic_len, plain))
+    with_inflated(tag, inner, inflate, |relaid| {
+        unrelay(tag & !TAG_LZ4, relaid, classic_len, plain)
+    })
 }
 
-/// A stored block's header: the classic body length it claims, its relayout tag, and the inner Zstandard block.
+/// A stored block's header: the classic body length it claims, its relayout tag, and the inner LZ4 or Zstandard block.
 fn read_header(bytes: &[u8]) -> Result<(usize, u8, &[u8]), FormatError> {
     let mut reader = Reader::new(bytes);
     let classic_len = reader.u32("string zstd classic length")? as usize;
@@ -272,6 +276,7 @@ fn read_header(bytes: &[u8]) -> Result<(usize, u8, &[u8]), FormatError> {
 
 /// Inflates `inner` into this thread's reused relaid scratch buffer and runs `consume` over it.
 fn with_inflated<R>(
+    tag: u8,
     inner: &[u8],
     inflate: &dyn Decompressor,
     consume: impl FnOnce(&[u8]) -> Result<R, FormatError>,
@@ -279,13 +284,22 @@ fn with_inflated<R>(
     RELAID_SCRATCH.with(|cell| {
         let mut relaid = cell.take();
         let consumed = inflate
-            .decompress_into(Compression::Zstd3, inner, &mut relaid)
+            .decompress_into(inner_codec(tag), inner, &mut relaid)
             .and_then(|()| consume(&relaid));
         if relaid.capacity() <= MAX_CLASSIC_BYTES / 16 {
             cell.replace(relaid);
         }
         consumed
     })
+}
+
+/// The inner stage a stored block's relayout `tag` records.
+fn inner_codec(tag: u8) -> Compression {
+    if tag & TAG_LZ4 != 0 {
+        Compression::Lz4
+    } else {
+        Compression::Zstd3
+    }
 }
 
 /// A relaid body parsed in place, for a whole-block decode that builds its output straight from it rather than from
@@ -475,12 +489,12 @@ pub(crate) fn with_relaid<R>(
         (Transform::DictionaryString, SideStream::None) => TAG_DICTIONARY,
         _ => return Ok(None),
     };
-    if tag != expected {
+    if tag & !TAG_LZ4 != expected {
         return Ok(None);
     }
     let inflate = super::decompressor::active_decompressor();
-    with_inflated(inner, inflate.as_ref(), |relaid| {
-        decode(parse(tag, relaid, classic_len)?)
+    with_inflated(tag, inner, inflate.as_ref(), |relaid| {
+        decode(parse(tag & !TAG_LZ4, relaid, classic_len)?)
     })
     .map(Some)
 }
