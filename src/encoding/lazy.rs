@@ -462,18 +462,21 @@ fn take_dictionary(
     let mut reader = Reader::new(body);
     let nulls = NullStream::read(&mut reader)?;
     let values;
+    // A file-scope alphabet is read in place: a union alphabet can be far wider than the rows a take names.
+    let mut alphabet: Option<&[String]> = None;
     let entries: Vec<&str> = if side == SideStream::FileScopeDictionary {
-        shared
-            .ok_or(FormatError::Structural {
-                rule: "shared-scope dictionary block without its file alphabet",
-            })?
-            .iter()
-            .map(String::as_str)
-            .collect()
+        alphabet = Some(shared.ok_or(FormatError::Structural {
+            rule: "shared-scope dictionary block without its file alphabet",
+        })?);
+        Vec::new()
     } else {
         let dict_count = reader.u32("dictionary count")? as usize;
         values = DictionaryValues::read(&mut reader, dict_count, side)?;
         values.entries()?
+    };
+    let entry_at = |code: usize| match alphabet {
+        Some(alphabet) => alphabet.get(code).map(String::as_str),
+        None => entries.get(code).copied(),
     };
     // Only the requested rows' codes are read, each straight out of its FastLanes lane.
     let packed = read_packed_stream(&mut reader)?;
@@ -489,7 +492,7 @@ fn take_dictionary(
             continue;
         };
         let code = fastlanes_value_at(packed.packed, packed.width, position) as usize;
-        out.push(Some(entries.get(code).copied().ok_or(FormatError::RefOutOfRange {
+        out.push(Some(entry_at(code).ok_or(FormatError::RefOutOfRange {
             what: "dictionary code",
         })?));
     }

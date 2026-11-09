@@ -18,8 +18,8 @@
 use super::constant::{FOOTER_TAIL_TRAILER_LEN, OE_MAGIC};
 use super::footer::{
     ColumnMark, EmbeddingRowOffsets, Footer, FreetextRowOffsets, GranuleEntry, MarksPageEntry, PageDirectoryEntry,
-    PageStats, PayloadGranule, ResidualCompression, StripeEntry, TextTokenOffsetsEntry, decode_footer,
-    decode_marks_page, decode_marks_page_directory, decode_marks_page_extents,
+    PageStats, PayloadGranule, ResidualCompression, SharedAlphabetText, StripeEntry, TextTokenOffsetsEntry,
+    decode_footer, decode_marks_page, decode_marks_page_directory, decode_marks_page_extents,
 };
 use super::graph::GranuleEdges;
 use super::remote::{FileBytes, RemoteFile};
@@ -28,6 +28,7 @@ use crate::artifacts::batch::decode_variant_dictionary;
 use crate::columns::column_ids;
 use crate::compat;
 use crate::encoding::decompressor::active_decompressor;
+use crate::encoding::predicate::{SharedDictionaryPredicate, StringPredicate, translate_for_shared_dictionary};
 use crate::encoding::{
     ColumnData, Compression, PipelineId, PresenceRank, SharedStringViewDictionary, SideStream, Transform, ValueKind,
     count_set_bits, decode_block_range_shared, decode_block_shared, decode_string_block_views_shared_prepared,
@@ -218,6 +219,15 @@ impl CachedColumn {
         }
         OeFile::typed_variant_at(&self.data, before as usize)
     }
+}
+
+/// One compressed (union) file-scope alphabet's lazily expanded forms: the validated text arena, decompressed for the
+/// first predicate translation or decode, and the per-value strings split from it for the first block decode. `None`
+/// in either is an alphabet that failed to expand.
+#[derive(Debug, Default)]
+struct PackedAlphabetSlot {
+    text: OnceLock<Option<SharedAlphabetText>>,
+    values: OnceLock<Option<Vec<String>>>,
 }
 
 /// One decoded block held in the reader's search cache, with the accounting eviction needs: its stable decoded byte
@@ -1803,6 +1813,11 @@ pub struct OeFile {
     /// One file-scope dictionary alphabet per column that shares one, from the footer — what a shared-scope
     /// dictionary block resolves its codes against.
     shared_alphabets: HashMap<u32, Arc<Vec<String>>>,
+    /// One slot per column whose alphabet the footer keeps compressed (`footer.packed_shared_dictionaries`), filled
+    /// the first time a block of the column is resolved — so opening a file never expands an alphabet, and a reader
+    /// that never touches the column never pays for it. A slot holding `None` is an alphabet that failed to expand;
+    /// every shared-scope block of its column then refuses as one without its file alphabet.
+    packed_shared_alphabets: HashMap<u32, PackedAlphabetSlot>,
     /// Arrow backing buffers and entry views prepared lazily from `shared_alphabets`. Opening a file or projecting an
     /// unrelated column does not build them; the first shared-scope view decode does, and later granules reuse the
     /// immutable arena.
@@ -2186,6 +2201,11 @@ impl OeFile {
             .iter()
             .map(|entry| (entry.column_id, Arc::new(entry.values.clone())))
             .collect();
+        let packed_shared_alphabets: HashMap<u32, PackedAlphabetSlot> = footer
+            .packed_shared_dictionaries
+            .iter()
+            .map(|entry| (entry.column_id, PackedAlphabetSlot::default()))
+            .collect();
         Ok(Self {
             aliased_extent_cache: DashMap::default(),
             aliased_extent_cache_bytes: AtomicU64::new(0),
@@ -2217,6 +2237,7 @@ impl OeFile {
             point_probe_counts: DashMap::default(),
             residual_seek_tables: DashMap::default(),
             shared_alphabets,
+            packed_shared_alphabets,
             shared_string_views: DashMap::default(),
             snapshot_first_keys_in_order,
             stripe_position_by_id,
@@ -2701,8 +2722,53 @@ impl OeFile {
     /// The file-scope dictionary alphabet for `column_id`, when the footer declares one — what a shared-scope
     /// dictionary block resolves its codes against. Pass it to the `_shared` decode and predicate entries when
     /// working from this file's raw block bytes.
+    ///
+    /// A compressed (union) alphabet is expanded on the first call for its column and kept for the file's lifetime.
     pub fn shared_alphabet(&self, column_id: u32) -> Option<&[String]> {
-        self.shared_alphabets.get(&column_id).map(|values| values.as_slice())
+        if let Some(values) = self.shared_alphabets.get(&column_id) {
+            return Some(values.as_slice());
+        }
+        let slot = self.packed_shared_alphabets.get(&column_id)?;
+        slot.values
+            .get_or_init(|| self.packed_alphabet_text(column_id).map(SharedAlphabetText::to_values))
+            .as_deref()
+    }
+
+    /// A compressed alphabet's validated text arena, decompressed on first use and kept: what a predicate translation
+    /// needs, without the per-value strings a block decode needs.
+    fn packed_alphabet_text(&self, column_id: u32) -> Option<&SharedAlphabetText> {
+        self.packed_shared_alphabets
+            .get(&column_id)?
+            .text
+            .get_or_init(|| {
+                self.footer
+                    .packed_shared_dictionaries
+                    .iter()
+                    .find(|entry| entry.column_id == column_id)
+                    .and_then(|entry| entry.text().ok())
+            })
+            .as_ref()
+    }
+
+    /// `predicate` translated into code space against `column_id`'s file-scope alphabet, for
+    /// [`filter_string_block_shared`](crate::encoding::predicate::filter_string_block_shared) and
+    /// [`count_string_block_shared`](crate::encoding::predicate::count_string_block_shared) over every shared-scope
+    /// block of the column. `None` when the column shares no alphabet (or its alphabet fails to expand). An entity
+    /// lookup calls this once per file: a compressed alphabet is only decompressed for it, never split into strings.
+    pub fn shared_dictionary_predicate(
+        &self,
+        column_id: u32,
+        predicate: &StringPredicate,
+    ) -> Option<SharedDictionaryPredicate> {
+        if let Some(values) = self.shared_alphabets.get(&column_id) {
+            return Some(translate_for_shared_dictionary(predicate, values.as_slice()));
+        }
+        let slot = self.packed_shared_alphabets.get(&column_id)?;
+        if let Some(Some(values)) = slot.values.get() {
+            return Some(translate_for_shared_dictionary(predicate, values.as_slice()));
+        }
+        let text = self.packed_alphabet_text(column_id)?;
+        Some(translate_for_shared_dictionary(predicate, &text.entries()))
     }
 
     /// Decodes raw string block bytes into Arrow views using this file's prepared shared dictionary, when the pipeline

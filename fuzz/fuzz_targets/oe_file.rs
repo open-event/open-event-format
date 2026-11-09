@@ -9,5 +9,12 @@ fuzz_target!(|data: &[u8]| {
         for granule_id in granules {
             let _ = file.granule_envelopes(granule_id);
         }
+        // A compressed shared alphabet expands on first use: once for a predicate translation, once into strings.
+        let packed: Vec<u32> = file.footer().packed_shared_dictionaries.iter().map(|entry| entry.column_id).collect();
+        for column_id in packed {
+            let equals = oe::encoding::predicate::StringPredicate::Equals("x".to_owned());
+            let _ = file.shared_dictionary_predicate(column_id, &equals);
+            let _ = file.shared_alphabet(column_id);
+        }
     }
 });

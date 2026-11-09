@@ -80,6 +80,13 @@ Pipeline trailing compression 6 (`string_zstd`, a string block relaid and compre
 - **WHEN** a file stores a compression-6 block and is opened by a reader whose known required set predates bit 37
 - **THEN** the file declares bit 37 and that reader refuses it at open
 
+### Requirement: Packed shared dictionaries are gated by a required feature
+A file that stores footer section `PACKED_SHARED_DICTIONARIES` (45, compressed union alphabets for file-scope dictionary blocks) SHALL declare required feature bit 38 (`packed_shared_dictionaries`): a reader that predates the section would skip it as unknown and then fail on the first shared-scope block of such a column, after answering from the file's other columns. A reader whose known required set lacks bit 38 SHALL refuse the file at open; this reader knows bits 0 through 38.
+
+#### Scenario: A file declaring bit 38 is refused by an older reader
+- **WHEN** a file carries a compressed union alphabet and is opened by a reader whose known required set predates bit 38
+- **THEN** the file declares bit 38 and that reader refuses it at open
+
 ### Requirement: Occurred-relative ingested-at blocks are gated by a required feature
 Pipeline transform 16 (`ingested_at` stored relative to `occurred_at`) SHALL have an availability window opening at format version 1.0 and SHALL be refused, like every unknown transform, by a reader that does not implement it. Its body SHALL NOT decode on its own: a decode handed the bare block without the granule's `occurred_at` SHALL return a structural error rather than values. A file holding such a block SHALL declare required feature bit 34 (`occurred_relative_ingested_at`); a reader whose known required set lacks bit 34 SHALL refuse the file at open.
 

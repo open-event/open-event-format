@@ -9,8 +9,17 @@ use oe::layout::footer::decode_footer;
 // among them) reach that section's decoder instead of stopping at its checksum. The preamble is the format version,
 // both feature words, the schema fingerprint and the section count (56 bytes); each directory entry is the id, offset,
 // length and checksum (52 bytes).
+// A footer that decodes has each compressed shared alphabet expanded too, as a reader does on first use.
+fn expand_alphabets(data: &[u8]) {
+    if let Ok(footer) = decode_footer(data) {
+        for entry in &footer.packed_shared_dictionaries {
+            let _ = entry.values();
+        }
+    }
+}
+
 fuzz_target!(|data: &[u8]| {
-    let _ = decode_footer(data);
+    expand_alphabets(data);
     let Some(count) = data
         .get(52..56)
         .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap_or([0; 4])) as usize)
@@ -29,5 +38,5 @@ fuzz_target!(|data: &[u8]| {
             resealed[at..at + 32].copy_from_slice(hash_tree(section).as_bytes());
         }
     }
-    let _ = decode_footer(&resealed);
+    expand_alphabets(&resealed);
 });

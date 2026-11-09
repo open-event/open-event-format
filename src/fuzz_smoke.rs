@@ -497,3 +497,43 @@ fn mutated_entity_hash_elided_file_never_panics() {
         position += 13;
     }
 }
+
+/// Flips bytes across a compressed union alphabet (footer section `PACKED_SHARED_DICTIONARIES`) and truncates it, with
+/// the checksum recomputed: the footer decoder refuses or answers, and expanding every alphabet it accepts — what a
+/// reader does on first use — refuses or answers, never panics. Every truncation is refused by the footer decoder.
+#[cfg(feature = "write")]
+#[test]
+fn mutated_packed_shared_dictionary_section_never_panics() {
+    use super::layout::footer::PackedSharedDictionary;
+    let rows: Vec<_> = (0..16u64).map(plain_row).collect();
+    let mut footer = build_oe_file(rows, &source_form_config(8)).unwrap().footer;
+    let values: Vec<String> = (0..200).map(|id| format!("!room{id:06}:example.org")).collect();
+    footer.packed_shared_dictionaries = vec![
+        PackedSharedDictionary::pack(15, &values).unwrap(),
+        PackedSharedDictionary::pack(16, &["a".to_owned(), "é".to_owned()]).unwrap(),
+    ];
+    footer.required_feature_flags |= super::layout::required_features::PACKED_SHARED_DICTIONARIES;
+    let blob = encode_footer(&footer);
+    let decoded = decode_footer(&blob).unwrap();
+    assert_eq!(decoded.packed_shared_dictionaries[0].values().unwrap(), values);
+    let (entries, area) = footer_sections(&blob);
+    let id = sections::PACKED_SHARED_DICTIONARIES;
+    let (_, offset, len) = entries.iter().copied().find(|entry| entry.0 == id).unwrap();
+    let body = &area[offset..offset + len];
+    let mut rng = XorShift(59);
+    for position in 0..body.len() {
+        let mut mutated = body.to_vec();
+        mutated[position] ^= (rng.next() as u8) | 1;
+        if let Ok(footer) = decode_footer(&with_section(&blob, id, &mutated)) {
+            for entry in &footer.packed_shared_dictionaries {
+                let _ = entry.values();
+            }
+        }
+    }
+    for cut in 0..body.len() {
+        assert!(
+            decode_footer(&with_section(&blob, id, &body[..cut])).is_err(),
+            "cut at {cut}"
+        );
+    }
+}

@@ -4400,3 +4400,202 @@ fn a_built_file_carries_its_entity_summary_for_a_reader_holding_only_the_file() 
     let file = OeFile::open(built.bytes.clone(), Some(&built.file_seal)).unwrap();
     assert_eq!(file.entity_summary(), Some(&built.entity_summary));
 }
+
+/// Rows whose entity ids repeat across granules without any granule repeating one set: `distinct` ids, each granule
+/// drawing a shifting slice of them.
+fn rows_with_shared_entities(count: u64, distinct: u64) -> Vec<OeRow> {
+    (0..count)
+        .map(|i| {
+            let mut entity_row = row(i);
+            entity_row.event.envelope.entity_id = Some(format!("entity-{:04}", (i * 37) % distinct));
+            entity_row
+        })
+        .collect()
+}
+
+/// Entity ids that recur across granules share one union alphabet, stored compressed in the footer under the
+/// `packed_shared_dictionaries` required bit; every block records the file scope and stores only codes, and every
+/// read path — decode, range, take, Arrow views, and code-space predicates — answers exactly what the ids were.
+/// Implements `oe-encodings-and-compression` — "Entity ids may share a compressed union alphabet".
+#[test]
+fn recurring_entity_ids_share_one_compressed_union_alphabet() {
+    use crate::encoding::predicate::{StringPredicate, count_string_block_shared, filter_string_block_shared};
+    use crate::encoding::{decode_block_range_shared, take_block_rows_shared};
+    // Granules wide enough that a block's codes outweigh FastLanes padding. 1500 ids — more than a repeated-set
+    // alphabet may hold — and each granule draws a different 1024 of them.
+    let config = || {
+        let mut config = config();
+        config.targets.index_granularity = 1024;
+        config
+    };
+    let rows = rows_with_shared_entities(4096, 1500);
+    let built = build_oe_file(rows.clone(), &config()).unwrap();
+    let entity_col = crate::columns::column_ids::ENTITY_ID;
+    assert_ne!(
+        built.footer.required_feature_flags & crate::layout::required_features::PACKED_SHARED_DICTIONARIES,
+        0,
+        "a compressed alphabet is governed by its required bit"
+    );
+    assert!(
+        built
+            .footer
+            .shared_dictionaries
+            .iter()
+            .all(|entry| entry.column_id != entity_col)
+    );
+    let packed = built
+        .footer
+        .packed_shared_dictionaries
+        .iter()
+        .find(|entry| entry.column_id == entity_col)
+        .expect("recurring entity ids share a union alphabet");
+    let mut expected_alphabet: Vec<String> = (0..1500).map(|id| format!("entity-{id:04}")).collect();
+    expected_alphabet.sort();
+    assert_eq!(packed.values().unwrap(), expected_alphabet);
+    assert!(packed.compressed.len() < expected_alphabet.iter().map(String::len).sum::<usize>());
+    let entity_marks: Vec<_> = built
+        .footer
+        .marks
+        .iter()
+        .filter(|mark| mark.column_id == entity_col)
+        .collect();
+    assert!(entity_marks.len() > 1);
+    assert!(
+        entity_marks
+            .iter()
+            .all(|mark| mark.codec_pipeline_id.side_stream() == Ok(crate::encoding::SideStream::FileScopeDictionary)),
+        "every entity block stores codes against the file alphabet"
+    );
+
+    let file = OeFile::open(built.bytes.clone(), Some(&built.file_seal)).unwrap();
+    let wanted = "entity-0042".to_owned();
+    let predicate = StringPredicate::Equals(wanted.clone());
+    // Translating a predicate decompresses the alphabet but never splits it into strings.
+    let translated = file.shared_dictionary_predicate(entity_col, &predicate).unwrap();
+    let mut found = 0usize;
+    for granule in &file.footer().granules {
+        let first = granule.first_row_ordinal as usize;
+        let ids: Vec<&str> = rows[first..first + granule.row_count as usize]
+            .iter()
+            .map(|r| r.event.envelope.entity_id.as_deref().unwrap())
+            .collect();
+        let read = file.read_column(entity_col, granule.granule_id).unwrap();
+        let ColumnData::Strings(values) = &read.data else {
+            panic!("entity ids decode as strings")
+        };
+        assert_eq!(values.iter().map(Option::unwrap).collect::<Vec<_>>(), ids);
+        let (_, views) = file
+            .read_column_string_views(entity_col, granule.granule_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(views.iter().map(Option::unwrap).collect::<Vec<_>>(), ids);
+
+        let raw = file.read_column_raw(entity_col, granule.granule_id).unwrap();
+        let alphabet = file.shared_alphabet(entity_col);
+        let ColumnData::Strings(range) = decode_block_range_shared(raw.pipeline, &raw.body, alphabet, 3, 9).unwrap()
+        else {
+            panic!("a range of entity ids decodes as strings")
+        };
+        assert_eq!(range.iter().map(Option::unwrap).collect::<Vec<_>>(), ids[3..9]);
+        let ColumnData::Strings(taken) =
+            take_block_rows_shared(raw.pipeline, &raw.body, alphabet, &[0, 5, 15]).unwrap()
+        else {
+            panic!("taken entity ids are strings")
+        };
+        assert_eq!(
+            taken.iter().map(Option::unwrap).collect::<Vec<_>>(),
+            [ids[0], ids[5], ids[15]]
+        );
+
+        let mask = filter_string_block_shared(raw.pipeline, &raw.body, &predicate, Some(&translated))
+            .unwrap()
+            .expect("a shared-scope block answers equality from its codes");
+        assert_eq!(mask, ids.iter().map(|id| *id == wanted).collect::<Vec<_>>());
+        let count = count_string_block_shared(raw.pipeline, &raw.body, &predicate, Some(&translated))
+            .unwrap()
+            .unwrap();
+        assert_eq!(count, mask.iter().filter(|hit| **hit).count());
+        found += count;
+    }
+    assert_eq!(
+        found,
+        rows.iter()
+            .filter(|r| r.event.envelope.entity_id.as_deref() == Some("entity-0042"))
+            .count()
+    );
+    // An id outside the alphabet matches nothing, without decoding a block.
+    let absent = StringPredicate::Equals("entity-9999".to_owned());
+    let translated = file.shared_dictionary_predicate(entity_col, &absent).unwrap();
+    let raw = file.read_column_raw(entity_col, 0).unwrap();
+    let mask = filter_string_block_shared(raw.pipeline, &raw.body, &absent, Some(&translated))
+        .unwrap()
+        .unwrap();
+    assert!(mask.iter().all(|hit| !hit));
+
+    // Deterministic: the same rows build the same bytes.
+    assert_eq!(build_oe_file(rows, &config()).unwrap().bytes, built.bytes);
+}
+
+/// The union alphabet is chosen only when it pays: ids that never recur (one per row) would cost more as a file
+/// alphabet plus wider codes than as each granule's own encoding, so the column keeps block-local forms and the file
+/// declares no compressed alphabet.
+#[test]
+fn entity_ids_that_never_recur_keep_block_local_encodings() {
+    let rows: Vec<OeRow> = (0..512).map(row).collect();
+    let built = build_oe_file(rows, &config()).unwrap();
+    assert!(built.footer.packed_shared_dictionaries.is_empty());
+    assert_eq!(
+        built.footer.required_feature_flags & crate::layout::required_features::PACKED_SHARED_DICTIONARIES,
+        0
+    );
+}
+
+/// An update over a file with a compressed entity alphabet reuses untouched blocks while the alphabet is unchanged,
+/// and rewrites in full — never mixing codes from two alphabets — once an edit adds an id the alphabet lacks. Either
+/// way every entity id reads back exactly as a fresh build of the new rows stores it.
+#[test]
+fn updates_over_a_compressed_entity_alphabet_reuse_only_while_it_is_unchanged() {
+    let config = || {
+        let mut config = config();
+        config.targets.index_granularity = 1024;
+        config
+    };
+    let before = rows_with_shared_entities(4096, 1500);
+    let source = build_oe_file(before.clone(), &config()).unwrap();
+    assert!(!source.footer.packed_shared_dictionaries.is_empty());
+    let entity_col = crate::columns::column_ids::ENTITY_ID;
+    let check = |updated: &BuiltOe, after: &[OeRow]| {
+        let full = build_oe_file(after.to_vec(), &config()).unwrap();
+        assert_eq!(
+            updated.footer.packed_shared_dictionaries,
+            full.footer.packed_shared_dictionaries
+        );
+        let actual = OeFile::open(updated.bytes.clone(), Some(&updated.file_seal)).unwrap();
+        for granule in &actual.footer().granules {
+            let ColumnData::Strings(values) = actual.read_column(entity_col, granule.granule_id).unwrap().data else {
+                panic!("entity ids decode as strings")
+            };
+            let first = granule.first_row_ordinal as usize;
+            let expected: Vec<&str> = after[first..first + granule.row_count as usize]
+                .iter()
+                .map(|r| r.event.envelope.entity_id.as_deref().unwrap())
+                .collect();
+            assert_eq!(values.iter().map(Option::unwrap).collect::<Vec<_>>(), expected);
+        }
+    };
+
+    // An edit that keeps every id: the alphabet is unchanged and untouched blocks are reused.
+    let mut after = before.clone();
+    after[5].event.envelope.entity_id = before[6].event.envelope.entity_id.clone();
+    let updated =
+        update_oe_file_with_executor(&source, &before, after.clone(), &config(), &SerialEncodeExecutor).unwrap();
+    assert!(updated.reused_source_blocks > 0);
+    check(&updated, &after);
+
+    // An edit that introduces a new id changes the alphabet's codes, so nothing encoded against the old one is kept.
+    let mut after = before.clone();
+    after[5].event.envelope.entity_id = Some("entity-zzzz".to_owned());
+    let updated =
+        update_oe_file_with_executor(&source, &before, after.clone(), &config(), &SerialEncodeExecutor).unwrap();
+    check(&updated, &after);
+}

@@ -622,8 +622,15 @@ pub mod required_features {
     /// [`XOR_FLOAT_BLOCKS`]. Declared only when some block is stored that way.
     pub const STRING_ZSTD_BLOCKS: u64 = 1 << 37;
 
+    /// At least one column's file-scope dictionary alphabet lives Zstandard-compressed in the footer section
+    /// `PACKED_SHARED_DICTIONARIES` (45) — a union alphabet over every granule's values, against which that column's
+    /// shared-scope blocks store only their codes. Required and refusing on purpose: a reader that predates it would
+    /// skip the section and then fail on every such block for want of its alphabet, after answering from the file's
+    /// other columns. Declared exactly when the section is present.
+    pub const PACKED_SHARED_DICTIONARIES: u64 = 1 << 38;
+
     /// Every required feature this reader implements.
-    pub const KNOWN: u64 = (1 << 38) - 1;
+    pub const KNOWN: u64 = (1 << 39) - 1;
 
     /// The full required set every v1 file declares, `COLUMNAR_MARKS` included — the writer emits the columnar,
     /// per-stripe marks form. Excludes `FOOTER_ENCRYPTED` (opt-in per build, set only when the caller requests footer
@@ -633,7 +640,8 @@ pub mod required_features {
     /// external id), `PACKED_STRING_OFFSETS` (set only on a file that stores a packed-lengths FSST block) and
     /// `OCCURRED_RELATIVE_INGESTED_AT` (set only on a file that stores an occurred-relative `ingested_at` block) and
     /// `EXTERNAL_ID_INDEX_32` (set only on a file with an external-id index) and `STRING_ZSTD_BLOCKS` (set only on a
-    /// file that stores a relaid whole-block Zstandard string block); declaring a bit before it applies would
+    /// file that stores a relaid whole-block Zstandard string block) and `PACKED_SHARED_DICTIONARIES` (set only on a file
+    /// carrying a compressed union alphabet); declaring a bit before it applies would
     /// misrepresent the file.
     pub const ALL: u64 = KNOWN
         & !FOOTER_ENCRYPTED
@@ -646,7 +654,8 @@ pub mod required_features {
         & !OCCURRED_RELATIVE_INGESTED_AT
         & !EXTERNAL_ID_INDEX_32
         & !ENTITY_HASH_COLUMNS_ELIDED
-        & !STRING_ZSTD_BLOCKS;
+        & !STRING_ZSTD_BLOCKS
+        & !PACKED_SHARED_DICTIONARIES;
 }
 
 /// Optional feature flags: unknown optional features are ignored; known ones are validated and used.

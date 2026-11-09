@@ -550,9 +550,8 @@ impl<'a> OeFormat<'a> {
         let unfiltered = std::env::var_os("OE_BENCH_NO_ENTITY_HASH_FILTERS").is_some();
         let started = Instant::now();
         let predicate = StringPredicate::Equals(wanted.to_owned());
-        let translated = file
-            .shared_alphabet(column_ids::ENTITY_ID)
-            .map(|entries| translate_for_shared_dictionary(&predicate, entries));
+        // A compressed entity alphabet is only decompressed for the translation, never split into strings.
+        let translated = file.shared_dictionary_predicate(column_ids::ENTITY_ID, &predicate);
         let mut bytes = 0;
         let mut found = 0u64;
         let candidate_granules = if unfiltered {

@@ -2999,8 +2999,9 @@ fn decode_dictionary_string(
             rule: "shared-scope dictionary block without its file alphabet",
         })?;
         let codes = bitunpack(reader)?;
-        let entries: Vec<&str> = alphabet.iter().map(String::as_str).collect();
-        return merge_nulls_dictionary(&nulls, &codes, &entries);
+        // The alphabet is read in place: a union alphabet can be far wider than any one block's distinct values, so
+        // the block pays only for the codes it holds.
+        return merge_nulls_dictionary(&nulls, &codes, alphabet);
     }
     let dict_count = reader.u32("dictionary count")? as usize;
     let dictionary = DictionaryValues::read(reader, dict_count, side)?;
@@ -3012,10 +3013,10 @@ fn decode_dictionary_string(
 /// Threads a dictionary block's codes back through its null stream into a column, each row's text copied from its
 /// entry. Every code is checked against the dictionary once, up front, so the copy loop that follows does no lookup
 /// that can fail and sizes the column's text exactly before writing any of it.
-fn merge_nulls_dictionary(
+fn merge_nulls_dictionary<T: AsRef<str>>(
     nulls: &NullStream<'_>,
     codes: &[u64],
-    entries: &[&str],
+    entries: &[T],
 ) -> Result<StringColumn, FormatError> {
     if codes.iter().any(|&code| code >= entries.len() as u64) {
         return Err(FormatError::RefOutOfRange {
@@ -3027,11 +3028,8 @@ fn merge_nulls_dictionary(
             rule: "null bitmap disagrees with present count",
         });
     }
-    let lengths: Vec<u64> = entries.iter().map(|entry| entry.len() as u64).collect();
-    let text_bytes: u64 = codes
-        .iter()
-        .map(|&code| lengths.get(code as usize).copied().unwrap_or(0))
-        .sum();
+    let entry_at = |code: u64| entries.get(code as usize).map_or("", AsRef::as_ref);
+    let text_bytes: u64 = codes.iter().map(|&code| entry_at(code).len() as u64).sum();
     let row_count = nulls.row_count();
     let mut text = String::with_capacity(text_bytes as usize);
     let mut offsets = Vec::with_capacity(row_count + 1);
@@ -3040,7 +3038,7 @@ fn merge_nulls_dictionary(
     if matches!(nulls.form, NullStreamForm::AllPresent) {
         present.resize(row_count, true);
         for &code in codes {
-            text.push_str(entries.get(code as usize).copied().unwrap_or_default());
+            text.push_str(entry_at(code));
             offsets.push(text.len() as u64);
         }
     } else {
@@ -3048,7 +3046,7 @@ fn merge_nulls_dictionary(
         nulls.each_row(|set| {
             if set {
                 let code = next.next().copied().unwrap_or(0);
-                text.push_str(entries.get(code as usize).copied().unwrap_or_default());
+                text.push_str(entry_at(code));
             }
             offsets.push(text.len() as u64);
             present.push(set);
@@ -4161,6 +4159,18 @@ fn null_buffer(nulls: &NullStream) -> Option<NullBuffer> {
 /// Whether a block [`choose_string_transform`] sent to FSST repeats its values enough (at most three distinct values per
 /// four present rows, see [`DICTIONARY_TRIAL_MAX_DISTINCT_NUM`]) for a dictionary trial encode to have a chance of
 /// being smaller.
+/// Whether `shared` holds every present value — a block a file-scope (union) alphabet covers is trial-encoded as a
+/// dictionary however many distinct values it has, since its shared-scope form stores only the codes.
+fn shared_alphabet_covers(shared: Option<&[String]>, present: &[&str]) -> bool {
+    let Some(alphabet) = shared else {
+        return false;
+    };
+    let mut seen: AHashSet<&str> = AHashSet::new();
+    present
+        .iter()
+        .all(|value| !seen.insert(value) || alphabet.binary_search_by(|entry| entry.as_str().cmp(value)).is_ok())
+}
+
 fn dictionary_trial_worthwhile(present: &[&str]) -> bool {
     let limit = present.len() * DICTIONARY_TRIAL_MAX_DISTINCT_NUM / DICTIONARY_TRIAL_MAX_DISTINCT_DEN;
     let mut distinct = AHashSet::with_capacity(limit + 1);
@@ -5157,7 +5167,7 @@ fn encode_selected_form(
             if (forced.is_none() || replay_trailing.is_some())
                 && matches!(transform, Transform::FsstString | Transform::FsstPackedString)
                 && encoded.is_ok()
-                && dictionary_trial_worthwhile(&present)
+                && (dictionary_trial_worthwhile(&present) || shared_alphabet_covers(shared, &present))
             {
                 let mut trial = Writer::new();
                 if let Ok(side) = encode_dictionary_string(values, &present, strategy, shared, &mut trial)
@@ -5448,13 +5458,15 @@ fn decode_dictionary_string_range(
     // Borrow the entries once instead of copying one per row: the codes outnumber the entries, so a dense range would
     // otherwise allocate the same handful of values over and over.
     let mut entries: Vec<&str> = Vec::new();
+    // A file-scope alphabet is read in place rather than copied into `entries`: a union alphabet can be far wider
+    // than the handful of rows a range names.
+    let mut alphabet: Option<&[String]> = None;
     let owned: Vec<String>;
     match side {
         SideStream::FileScopeDictionary => {
-            let alphabet = shared.ok_or(FormatError::Structural {
+            alphabet = Some(shared.ok_or(FormatError::Structural {
                 rule: "shared-scope dictionary block without its file alphabet",
-            })?;
-            entries.extend(alphabet.iter().map(String::as_str));
+            })?);
         }
         SideStream::FsstDictionaryValues => {
             let dict_count = reader.u32("dictionary count")? as usize;
@@ -5495,6 +5507,10 @@ fn decode_dictionary_string_range(
             rule: "null bitmap disagrees with present count",
         });
     }
+    let entry_at = |code: u64| match alphabet {
+        Some(alphabet) => alphabet.get(code as usize).map(String::as_str),
+        None => entries.get(code as usize).copied(),
+    };
     // Materialize only the entries the extracted codes name, weaving them back through the null stream.
     let materialize = |codes: &[u64]| {
         merge_nulls_range(
@@ -5503,7 +5519,7 @@ fn decode_dictionary_string_range(
             |index| {
                 codes
                     .get(index)
-                    .and_then(|&code| entries.get(code as usize).copied())
+                    .and_then(|&code| entry_at(code))
                     .ok_or(FormatError::RefOutOfRange {
                         what: "dictionary code",
                     })
@@ -5518,7 +5534,7 @@ fn decode_dictionary_string_range(
             &nulls,
             present_end - present_start,
             |_| {
-                entries.first().copied().ok_or(FormatError::RefOutOfRange {
+                entry_at(0).ok_or(FormatError::RefOutOfRange {
                     what: "dictionary code",
                 })
             },

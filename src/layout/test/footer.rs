@@ -64,6 +64,7 @@ fn minimal_footer() -> Footer {
         required_feature_flags: 0,
         schema_fingerprint: [0u8; 32],
         shared_dictionaries: Vec::new(),
+        packed_shared_dictionaries: Vec::new(),
         shredded: Vec::new(),
         snapshot_keys: None,
         sparse_keys: Vec::new(),
@@ -1891,4 +1892,63 @@ fn external_id_index_decode_timing() {
             t44
         );
     }
+}
+
+/// A compressed union alphabet round-trips through the footer still compressed, expands to exactly the values it
+/// packed, and refuses — on expansion, never by panicking — a forged frame, a plaintext-length claim, lengths that do
+/// not split the text, and out-of-order values. Decoding the footer checks only the framing: a column carried twice
+/// is refused there.
+#[test]
+fn a_packed_shared_dictionary_round_trips_and_refuses_forgeries_when_expanded() {
+    let values: Vec<String> = (0..300).map(|id| format!("!room{id:06}:example.org")).collect();
+    let packed = PackedSharedDictionary::pack(15, &values).expect("an alphabet of short values packs");
+    assert!(packed.compressed.len() < values.iter().map(String::len).sum::<usize>() / 4);
+    let mut footer = minimal_footer();
+    footer.packed_shared_dictionaries = vec![packed.clone()];
+    // The section is valid only under its required bit.
+    assert!(decode_footer(&encode_footer(&footer)).is_err());
+    footer.required_feature_flags |= crate::layout::required_features::PACKED_SHARED_DICTIONARIES;
+    let decoded = decode_footer(&encode_footer(&footer)).expect("a packed alphabet decodes");
+    assert_eq!(decoded.packed_shared_dictionaries, footer.packed_shared_dictionaries);
+    assert_eq!(decoded.packed_shared_dictionaries[0].values().unwrap(), values);
+    assert_eq!(
+        packed.text().unwrap().entries(),
+        values.iter().map(String::as_str).collect::<Vec<_>>()
+    );
+
+    let mut wrong_len = packed.clone();
+    wrong_len.plain_len += 1;
+    assert!(wrong_len.values().is_err());
+    let mut huge = packed.clone();
+    huge.plain_len = PACKED_SHARED_DICTIONARY_MAX_PLAIN_BYTES + 1;
+    assert!(huge.values().is_err());
+    let mut forged = packed.clone();
+    forged.compressed = vec![0xFF; 16];
+    assert!(forged.values().is_err());
+    let mut miscounted = packed.clone();
+    miscounted.value_count -= 1;
+    assert!(miscounted.values().is_err());
+    let unsorted = PackedSharedDictionary::pack(15, &["b".to_owned(), "a".to_owned()]).unwrap();
+    assert!(unsorted.values().is_err());
+    let duplicated = PackedSharedDictionary::pack(15, &["a".to_owned(), "a".to_owned()]).unwrap();
+    assert!(duplicated.values().is_err());
+    // A value boundary inside a multi-byte character is refused, not sliced.
+    let mut split = PackedSharedDictionary::pack(15, &["é".to_owned()]).unwrap();
+    let mut plain = vec![1u8, 0];
+    plain.extend_from_slice("é".as_bytes());
+    plain.push(b'x');
+    split.compressed = zstd::bulk::compress(&plain, 3).unwrap();
+    split.plain_len = plain.len() as u32;
+    assert!(split.values().is_err());
+    assert!(PackedSharedDictionary::pack(15, &["x".repeat(usize::from(u16::MAX) + 1)]).is_none());
+
+    // One column cannot carry two alphabets.
+    footer.shared_dictionaries = vec![SharedDictionaryEntry {
+        column_id: 15,
+        values: vec!["a".to_owned()],
+    }];
+    assert!(decode_footer(&encode_footer(&footer)).is_err());
+    footer.shared_dictionaries.clear();
+    footer.packed_shared_dictionaries = vec![packed.clone(), packed];
+    assert!(decode_footer(&encode_footer(&footer)).is_err());
 }
