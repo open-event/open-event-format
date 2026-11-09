@@ -242,7 +242,7 @@ fn trailing_stage_bytes_by_column() {
             );
             let entry = by_pipeline.entry(key).or_default();
             entry.0 += 1;
-            entry.1 += remove_trailing(compression, raw.body).unwrap().len() as u64;
+            entry.1 += remove_trailing(compression, &raw.body).unwrap().len() as u64;
             entry.2 += raw.body.len() as u64;
         }
         for (pipeline, (blocks, before, after)) in by_pipeline {
@@ -306,14 +306,14 @@ fn string_decode_microbenchmarks() {
             continue;
         }
         seen.push((transform, compression));
-        let body = remove_trailing(compression, raw.body).unwrap().into_owned();
+        let body = remove_trailing(compression, &raw.body).unwrap().into_owned();
         if compression != Compression::None {
             time_decode(
                 &format!("{:<20} {compression:?} inflate -> {} B", column.name, body.len()),
                 raw.body.len(),
                 REPEATS,
                 || {
-                    black_box(remove_trailing(compression, raw.body).unwrap());
+                    black_box(remove_trailing(compression, &raw.body).unwrap());
                 },
             );
         }
