@@ -2,7 +2,7 @@
   <h1>Open Event Format</h1>
   <h3>A columnar file format and append-only journal built for event streams.<br/>Written once, queried fast, instant deletes.</h3>
   <p>
-    0.04 ms 1% time windows, 0.10 ms event-by-id lookups, and instant redactions over 1,000,000 chat events
+    0.04 ms 1% time windows, 0.10 ms event-by-id lookups, and instant redactions over 1M chat events
   </p>
   <p>
     <a href="#getting-started">Quickstart</a> •
