@@ -2289,12 +2289,9 @@ fn encode_raw_string(values: &StringColumn, present: &[&str], out: &mut Writer) 
 fn merge_nulls<'a>(
     nulls: &NullStream<'_>,
     count: usize,
+    text_bytes: usize,
     value: impl Fn(usize) -> Result<&'a str, FormatError>,
 ) -> Result<StringColumn, FormatError> {
-    let mut text_bytes = 0usize;
-    for index in 0..count {
-        text_bytes += value(index)?.len();
-    }
     let mut values = StringColumn::with_capacity(nulls.row_count(), text_bytes);
     let mut next = 0usize;
     nulls.each_row(|set| {
@@ -2375,6 +2372,50 @@ impl<'a> DictionaryValues<'a> {
                     })
                 })
                 .collect(),
+        }
+    }
+
+    fn into_view_arena(self) -> Result<(Vec<u8>, Vec<usize>), FormatError> {
+        match self {
+            Self::Fsst(arena) => {
+                for (&start, &end) in arena.bounds.iter().zip(arena.bounds.iter().skip(1)) {
+                    let entry = arena.text.get(start..end).ok_or(FormatError::InvalidUtf8 {
+                        what: "dictionary entry",
+                    })?;
+                    if entry.len() > DICTIONARY_FSST_MAX_VALUE_LEN {
+                        return Err(FormatError::Structural {
+                            rule: "dictionary entry exceeds the FSST value cap",
+                        });
+                    }
+                }
+                Ok((arena.text.into_bytes(), arena.bounds))
+            }
+            Self::Plain { data, offsets } => {
+                if offsets
+                    .windows(2)
+                    .any(|pair| matches!(pair, [start, end] if end < start))
+                {
+                    return Err(FormatError::Structural {
+                        rule: "dictionary offsets must be non-decreasing",
+                    });
+                }
+                let first = offsets.first().copied().unwrap_or(0);
+                let last = offsets.last().copied().unwrap_or(first);
+                let bytes = slice(data, first, last - first, "dictionary entry")?;
+                let text = simdutf8::basic::from_utf8(bytes).map_err(|_| FormatError::InvalidUtf8 {
+                    what: "dictionary entry",
+                })?;
+                let mut bounds = offsets;
+                for bound in &mut bounds {
+                    *bound -= first;
+                    if !text.is_char_boundary(*bound) {
+                        return Err(FormatError::InvalidUtf8 {
+                            what: "dictionary entry",
+                        });
+                    }
+                }
+                Ok((bytes.to_vec(), bounds))
+            }
         }
     }
 }
@@ -2539,7 +2580,8 @@ fn fsst_decompress_values_with_table(
     let base = buffer.len();
     let mut bounds = Vec::with_capacity(offsets.len());
     bounds.push(base);
-    buffer.reserve((data.len() - arena_start) * constant::FSST_MAX_SYMBOL_BYTES);
+    let codes_end = ends.iter().copied().max().unwrap_or(arena_start).min(data.len());
+    buffer.reserve(codes_end.saturating_sub(arena_start) * constant::FSST_MAX_SYMBOL_BYTES);
     let out = buffer.spare_capacity_mut().as_mut_ptr().cast::<u8>();
     let mut written = 0usize;
     let mut value_start = arena_start;
@@ -2550,7 +2592,8 @@ fn fsst_decompress_values_with_table(
         let codes = data
             .get(value_start..value_end)
             .ok_or(FormatError::Truncated { what })?;
-        // SAFETY: `written` is at most eight times the code bytes decoded so far, all of them before `codes` in
+        // SAFETY: `written` is at most eight times the code bytes decoded so far, and those with `codes` all lie in
+        // `data[arena_start..codes_end]`, so `slot` has at least eight bytes per byte of `codes` still spare.
         let slot = unsafe { out.add(written) };
         // SAFETY: `slot` has the room `decode_fsst_codes` asks for, as just shown.
         written += unsafe { table.decode_fsst_codes(codes, slot) }?;
@@ -2970,6 +3013,21 @@ fn decode_fsst_string(reader: &mut Reader<'_>) -> Result<StringColumn, FormatErr
     merge_nulls_arena(&nulls, arena)
 }
 
+fn decode_fsst_packed_string(body: &[u8]) -> Result<StringColumn, FormatError> {
+    let packed = fsst_packed_values(body)?;
+    let mut reader = Reader::new(body);
+    let nulls = NullStream::read(&mut reader)?;
+    let table = FsstDecodeTable::read(&mut reader)?;
+    let arena = fsst_decompress_arena(
+        &table,
+        packed.arena,
+        &packed.offsets,
+        "fsst value",
+        "fsst offsets must be non-decreasing",
+    )?;
+    merge_nulls_arena(&nulls, arena)
+}
+
 fn merge_nulls_arena(nulls: &NullStream<'_>, arena: FsstArena) -> Result<StringColumn, FormatError> {
     let FsstArena { bounds, text } = arena;
     let count = bounds.len().saturating_sub(1);
@@ -3016,9 +3074,13 @@ fn decode_raw_string(reader: &mut Reader<'_>) -> Result<StringColumn, FormatErro
     let offsets = read_offsets(reader, present_count)?;
     let data_len = offsets.last().copied().unwrap_or(0);
     let data = reader.take(data_len, "raw string data")?;
-    merge_nulls(&nulls, offsets.len().saturating_sub(1), |index| {
-        raw_string_value(data, &offsets, index)
-    })
+    let raw = RawValues::validated(data, &offsets)?;
+    merge_nulls(
+        &nulls,
+        offsets.len().saturating_sub(1),
+        offsets_text_len(&offsets, data),
+        |index| raw.value(&offsets, index),
+    )
 }
 
 fn relaid_string_column(relaid: string_zstd::Relaid<'_>) -> Result<StringColumn, FormatError> {
@@ -3164,9 +3226,6 @@ pub(crate) fn decode_string_block_views_shared_prepared(
         return Ok(Some(array));
     }
     with_trailing_removed(pipeline.compression()?, bytes, |body| {
-        if let Some((classic, body)) = classic_fsst_view(pipeline, body)? {
-            return decode_string_block_views_with_body(classic, Transform::FsstString, &body, shared, prepared);
-        }
         decode_string_block_views_with_body(pipeline, transform, body, shared, prepared)
     })
 }
@@ -3178,6 +3237,10 @@ fn decode_string_block_views_with_body(
     shared: Option<&[String]>,
     prepared: Option<&SharedStringViewDictionary>,
 ) -> Result<Option<StringViewArray>, FormatError> {
+    let packed = match transform {
+        Transform::FsstPackedString => Some(fsst_packed_values(body)?),
+        _ => None,
+    };
     let mut reader = Reader::new(body);
     let nulls = NullStream::read(&mut reader)?;
 
@@ -3202,34 +3265,8 @@ fn decode_string_block_views_with_body(
                     dictionary_views_by_row(&nulls, &dictionary.entry_views, &codes)?,
                 )
             } else {
-                let mut entries: Vec<&str> = Vec::new();
-                let owned: Vec<String>;
-                if side == SideStream::FsstDictionaryValues {
-                    let dict_count = reader.u32("dictionary count")? as usize;
-                    owned = read_dictionary_values(&mut reader, dict_count, side)?;
-                    entries.extend(owned.iter().map(String::as_str));
-                } else {
-                    let dict_count = reader.u32("dictionary count")? as usize;
-                    let offsets = read_offsets(&mut reader, dict_count)?;
-                    let data_len = offsets.last().copied().unwrap_or(0);
-                    let data = reader.take(data_len, "dictionary data")?;
-                    for pair in offsets.windows(2) {
-                        let (start, end) = match pair {
-                            [start, end] => (*start, *end),
-                            _ => continue,
-                        };
-                        if end < start {
-                            return Err(FormatError::Structural {
-                                rule: "dictionary offsets must be non-decreasing",
-                            });
-                        }
-                        let bytes = slice(data, start, end - start, "dictionary entry")?;
-                        entries.push(simdutf8::basic::from_utf8(bytes).map_err(|_| FormatError::InvalidUtf8 {
-                            what: "dictionary entry",
-                        })?);
-                    }
-                }
-                let (arena, bounds) = concatenate(&entries);
+                let dict_count = reader.u32("dictionary count")? as usize;
+                let (arena, bounds) = DictionaryValues::read(&mut reader, dict_count, side)?.into_view_arena()?;
                 let entry_views = views_over(&arena, &bounds)?;
                 let codes = bitunpack(&mut reader)?;
                 (
@@ -3238,12 +3275,17 @@ fn decode_string_block_views_with_body(
                 )
             }
         }
-        Transform::FsstString => {
+        Transform::FsstString | Transform::FsstPackedString => {
             let table = FsstDecodeTable::read(&mut reader)?;
-            let present_count = reader.u32("fsst present count")? as usize;
-            let offsets = read_offsets(&mut reader, present_count)?;
-            let data_len = offsets.last().copied().unwrap_or(0);
-            let data = reader.take(data_len, "fsst data")?;
+            let (offsets, data) = match packed {
+                Some(packed) => (packed.offsets, packed.arena),
+                None => {
+                    let present_count = reader.u32("fsst present count")? as usize;
+                    let offsets = read_offsets(&mut reader, present_count)?;
+                    let data_len = offsets.last().copied().unwrap_or(0);
+                    (offsets, reader.take(data_len, "fsst data")?)
+                }
+            };
             let mut arena = Vec::new();
             let bounds = fsst_decompress_values_with_table(
                 &table,
@@ -3478,6 +3520,18 @@ fn min_max_f64(values: &[f64]) -> Option<(f64, f64)> {
     Some(iter.fold((first, first), |(min, max), v| (f64::min(min, v), f64::max(max, v))))
 }
 
+fn i64_stats(values: &[i64]) -> BlockStats {
+    let bounds = min_max(values);
+    BlockStats {
+        row_count: values.len() as u32,
+        null_count: 0,
+        min_i128: bounds.map(|(min, _)| i128::from(min)),
+        max_i128: bounds.map(|(_, max)| i128::from(max)),
+        min_f64: None,
+        max_f64: None,
+    }
+}
+
 fn stats_for(data: &ColumnData) -> BlockStats {
     let mut stats = BlockStats {
         row_count: data.row_count() as u32,
@@ -3494,12 +3548,7 @@ fn stats_for(data: &ColumnData) -> BlockStats {
                 stats.max_i128 = Some(i128::from(max));
             }
         }
-        ColumnData::I64(values) => {
-            if let Some((min, max)) = min_max(values) {
-                stats.min_i128 = Some(i128::from(min));
-                stats.max_i128 = Some(i128::from(max));
-            }
-        }
+        ColumnData::I64(values) => return i64_stats(values),
         ColumnData::U128(values) => {
             if let Some((min, max)) = min_max(values)
                 && let (Ok(min), Ok(max)) = (i128::try_from(min), i128::try_from(max))
@@ -3533,15 +3582,20 @@ const TRAILING_SAMPLE_WINDOWS: usize = 8;
 
 const TRAILING_SAMPLE_WINDOW_BYTES: usize = 2048;
 
+#[cfg(test)]
 fn pick_trailing(bytes: Vec<u8>, threshold: usize, lz4: Vec<u8>, zstd_framed: Vec<u8>) -> (Compression, Vec<u8>) {
+    pick_trailing_candidate(threshold, lz4, zstd_framed).unwrap_or((Compression::None, bytes))
+}
+
+fn pick_trailing_candidate(threshold: usize, lz4: Vec<u8>, zstd_framed: Vec<u8>) -> Option<(Compression, Vec<u8>)> {
     let lz4_wins = !lz4.is_empty() && lz4.len() < threshold;
     let zstd_wins = !zstd_framed.is_empty() && zstd_framed.len() < threshold && zstd_framed.len() < lz4.len();
     if zstd_wins {
-        (Compression::Zstd1, zstd_framed)
+        Some((Compression::Zstd1, zstd_framed))
     } else if lz4_wins {
-        (Compression::Lz4, lz4)
+        Some((Compression::Lz4, lz4))
     } else {
-        (Compression::None, bytes)
+        None
     }
 }
 
@@ -3617,58 +3671,59 @@ fn trailing_threshold(strategy: CascadeStrategy, len: usize) -> Option<usize> {
     }
 }
 
-fn apply_trailing(bytes: Vec<u8>, strategy: CascadeStrategy) -> (Compression, Vec<u8>) {
-    let Some(threshold) = trailing_threshold(strategy, bytes.len()) else {
-        return (Compression::None, bytes);
-    };
+fn trailing_candidate(bytes: &[u8], strategy: CascadeStrategy) -> Option<(Compression, Vec<u8>)> {
+    let threshold = trailing_threshold(strategy, bytes.len())?;
     if bytes.len() <= TRAILING_FULL_TRIAL_MAX_BYTES {
-        let lz4 = lz4_flex::compress_prepend_size(&bytes);
-        let zstd_framed = compress_zstd_framed(&bytes, 1);
-        return pick_trailing(bytes, threshold, lz4, zstd_framed);
+        let lz4 = lz4_flex::compress_prepend_size(bytes);
+        let zstd_framed = compress_zstd_framed(bytes, 1);
+        return pick_trailing_candidate(threshold, lz4, zstd_framed);
     }
-    let (sample_lz4, sample_zstd) = with_trailing_sample(&bytes, |sample| {
+    let (sample_lz4, sample_zstd) = with_trailing_sample(bytes, |sample| {
         (
             lz4_flex::compress_prepend_size(sample).len(),
             compress_zstd(sample, 1).len(),
         )
     });
     if sample_zstd < sample_lz4 {
-        let framed = compress_zstd_framed(&bytes, 1);
-        if !framed.is_empty() && framed.len() < threshold {
-            return (Compression::Zstd1, framed);
-        }
+        let framed = compress_zstd_framed(bytes, 1);
+        (!framed.is_empty() && framed.len() < threshold).then_some((Compression::Zstd1, framed))
     } else {
-        let lz4 = lz4_flex::compress_prepend_size(&bytes);
-        if !lz4.is_empty() && lz4.len() < threshold {
-            return (Compression::Lz4, lz4);
-        }
+        let lz4 = lz4_flex::compress_prepend_size(bytes);
+        (!lz4.is_empty() && lz4.len() < threshold).then_some((Compression::Lz4, lz4))
     }
-    (Compression::None, bytes)
 }
 
-fn apply_captured_trailing(body: Vec<u8>, captured: Compression, strategy: CascadeStrategy) -> (Compression, Vec<u8>) {
-    let Some(threshold) = trailing_threshold(strategy, body.len()) else {
-        return (Compression::None, body);
-    };
+fn apply_trailing(bytes: Vec<u8>, strategy: CascadeStrategy) -> (Compression, Vec<u8>) {
+    match trailing_candidate(&bytes, strategy) {
+        Some(compressed) => compressed,
+        None => (Compression::None, bytes),
+    }
+}
+
+fn captured_trailing_candidate(
+    body: &[u8],
+    captured: Compression,
+    strategy: CascadeStrategy,
+) -> Option<(Compression, Vec<u8>)> {
+    let threshold = trailing_threshold(strategy, body.len())?;
     match captured {
         Compression::Lz4 => {
-            let lz4 = lz4_flex::compress_prepend_size(&body);
-            if !lz4.is_empty() && lz4.len() < threshold {
-                return (Compression::Lz4, lz4);
-            }
-            (Compression::None, body)
+            let lz4 = lz4_flex::compress_prepend_size(body);
+            (!lz4.is_empty() && lz4.len() < threshold).then_some((Compression::Lz4, lz4))
         }
         Compression::Zstd1 | Compression::Zstd3 => {
             let level = if captured == Compression::Zstd3 { 3 } else { 1 };
-            let framed = compress_zstd_framed(&body, level);
-            if !framed.is_empty() && framed.len() < threshold {
-                return (captured, framed);
-            }
-            (Compression::None, body)
+            let framed = compress_zstd_framed(body, level);
+            (!framed.is_empty() && framed.len() < threshold).then_some((captured, framed))
         }
-        Compression::Deflate | Compression::SeekableZstd | Compression::StringZstd | Compression::None => {
-            (Compression::None, body)
-        }
+        Compression::Deflate | Compression::SeekableZstd | Compression::StringZstd | Compression::None => None,
+    }
+}
+
+fn apply_captured_trailing(body: Vec<u8>, captured: Compression, strategy: CascadeStrategy) -> (Compression, Vec<u8>) {
+    match captured_trailing_candidate(&body, captured, strategy) {
+        Some(compressed) => compressed,
+        None => (Compression::None, body),
     }
 }
 
@@ -3757,7 +3812,7 @@ pub fn encode_occurred_residual(ingested: &[i64], occurred: &[i64], strategy: Ca
         bytes: out.into_bytes(),
         fsst: None,
         pipeline: PipelineId::new(Transform::OccurredResidual, Compression::None, ValueKind::I64),
-        stats: stats_for(&ColumnData::I64(ingested.to_vec())),
+        stats: i64_stats(ingested),
         uncompressed_len: 4 + inner.uncompressed_len,
     })
 }
@@ -4264,17 +4319,17 @@ fn encode_selected_form(
             Transform::FsstString | Transform::FsstPackedString | Transform::DeltaBitpack | Transform::ForBitpack
         )
     {
-        let fallback = body.clone();
-        let (compression, bytes) = match replay_trailing {
-            Some(captured) => apply_captured_trailing(body, captured, strategy),
-            None => apply_trailing(body, strategy),
+        let candidate = match replay_trailing {
+            Some(captured) => captured_trailing_candidate(&body, captured, strategy),
+            None => trailing_candidate(&body, strategy),
         };
-        if compression == Compression::None
-            || bytes.len() * FSST_TRAILING_MAX_RATIO_DEN <= fallback.len() * FSST_TRAILING_MAX_RATIO_NUM
-        {
-            (compression, bytes)
-        } else {
-            (Compression::None, fallback)
+        match candidate {
+            Some((compression, bytes))
+                if bytes.len() * FSST_TRAILING_MAX_RATIO_DEN <= body.len() * FSST_TRAILING_MAX_RATIO_NUM =>
+            {
+                (compression, bytes)
+            }
+            _ => (Compression::None, body),
         }
     } else if let Some(captured) = replay_trailing {
         apply_captured_trailing(body, captured, strategy)
@@ -4470,40 +4525,19 @@ fn decode_dictionary_string_range(
     }
     let present_start = nulls.present_before(start);
     let present_end = nulls.present_before(effective_end);
+    let dictionary;
     let mut entries: Vec<&str> = Vec::new();
     let mut alphabet: Option<&[String]> = None;
-    let owned: Vec<String>;
     match side {
         SideStream::FileScopeDictionary => {
             alphabet = Some(shared.ok_or(FormatError::Structural {
                 rule: "shared-scope dictionary block without its file alphabet",
             })?);
         }
-        SideStream::FsstDictionaryValues => {
-            let dict_count = reader.u32("dictionary count")? as usize;
-            owned = read_dictionary_values(&mut reader, dict_count, side)?;
-            entries.extend(owned.iter().map(String::as_str));
-        }
         _ => {
             let dict_count = reader.u32("dictionary count")? as usize;
-            let offsets = read_offsets(&mut reader, dict_count)?;
-            let data_len = offsets.last().copied().unwrap_or(0);
-            let data = reader.take(data_len, "dictionary data")?;
-            for pair in offsets.windows(2) {
-                let (lo, hi) = match pair {
-                    [lo, hi] => (*lo, *hi),
-                    _ => continue,
-                };
-                if hi < lo {
-                    return Err(FormatError::Structural {
-                        rule: "dictionary offsets must be non-decreasing",
-                    });
-                }
-                let bytes = slice(data, lo, hi - lo, "dictionary entry")?;
-                entries.push(simdutf8::basic::from_utf8(bytes).map_err(|_| FormatError::InvalidUtf8 {
-                    what: "dictionary entry",
-                })?);
-            }
+            dictionary = DictionaryValues::read(&mut reader, dict_count, side)?;
+            entries = dictionary.entries()?;
         }
     }
     let count = reader.u32("bitpack count")? as usize;
@@ -4526,6 +4560,10 @@ fn decode_dictionary_string_range(
         merge_nulls_range(
             &nulls,
             codes.len(),
+            codes
+                .iter()
+                .map(|&code| entry_at(code).map_or(0, str::len))
+                .fold(0usize, usize::saturating_add),
             |index| {
                 codes
                     .get(index)
@@ -4542,6 +4580,9 @@ fn decode_dictionary_string_range(
         return merge_nulls_range(
             &nulls,
             present_end - present_start,
+            entry_at(0)
+                .map_or(0, str::len)
+                .saturating_mul(present_end - present_start),
             |_| {
                 entry_at(0).ok_or(FormatError::RefOutOfRange {
                     what: "dictionary code",
@@ -4618,7 +4659,13 @@ fn fsst_shared_prefix(body: &[u8]) -> Result<(usize, usize), FormatError> {
     Ok((reader.position(), count))
 }
 
-pub(crate) fn fsst_packed_as_classic(body: &[u8]) -> Result<Vec<u8>, FormatError> {
+struct FsstPackedValues<'a> {
+    arena: &'a [u8],
+    offsets: Vec<usize>,
+    prefix_len: usize,
+}
+
+fn fsst_packed_values(body: &[u8]) -> Result<FsstPackedValues<'_>, FormatError> {
     let (prefix_len, count) = fsst_shared_prefix(body)?;
     let mut reader = Reader::new(body);
     reader.take(prefix_len, "fsst prefix")?;
@@ -4629,24 +4676,41 @@ pub(crate) fn fsst_packed_as_classic(body: &[u8]) -> Result<Vec<u8>, FormatError
         });
     }
     let arena = reader.take(reader.remaining(), "fsst data")?;
-    let prefix = body.get(..prefix_len).ok_or(FormatError::Structural {
-        rule: "fsst prefix out of range",
-    })?;
-    let mut out = Writer::with_capacity(prefix_len + (count + 1) * 4 + arena.len());
-    out.put_slice(prefix);
-    out.put_u32(0);
+    let mut offsets = Vec::with_capacity(count + 1);
+    offsets.push(0usize);
     let mut offset = 0u64;
     for len in lens {
         offset = offset.saturating_add(len);
         let stored = u32::try_from(offset).map_err(|_| FormatError::Structural {
             rule: "string arena offsets exceed the u32 range the format stores",
         })?;
-        out.put_u32(stored);
+        offsets.push(stored as usize);
     }
     if offset != arena.len() as u64 {
         return Err(FormatError::Structural {
             rule: "fsst packed lengths disagree with the arena",
         });
+    }
+    Ok(FsstPackedValues {
+        arena,
+        offsets,
+        prefix_len,
+    })
+}
+
+pub(crate) fn fsst_packed_as_classic(body: &[u8]) -> Result<Vec<u8>, FormatError> {
+    let FsstPackedValues {
+        arena,
+        offsets,
+        prefix_len,
+    } = fsst_packed_values(body)?;
+    let prefix = body.get(..prefix_len).ok_or(FormatError::Structural {
+        rule: "fsst prefix out of range",
+    })?;
+    let mut out = Writer::with_capacity(prefix_len + offsets.len() * 4 + arena.len());
+    out.put_slice(prefix);
+    for offset in &offsets {
+        out.put_u32(*offset as u32);
     }
     out.put_slice(arena);
     Ok(out.into_bytes())
@@ -4690,17 +4754,20 @@ pub(crate) fn classic_fsst_view(
     )))
 }
 
+fn offsets_text_len(offsets: &[usize], data: &[u8]) -> usize {
+    let first = offsets.first().copied().unwrap_or(0);
+    let last = offsets.last().copied().unwrap_or(0);
+    last.saturating_sub(first).min(data.len())
+}
+
 fn merge_nulls_range<'a>(
     nulls: &NullStream,
     count: usize,
+    text_bytes: usize,
     value: impl Fn(usize) -> Result<&'a str, FormatError>,
     start: usize,
     end: usize,
 ) -> Result<StringColumn, FormatError> {
-    let mut text_bytes = 0usize;
-    for index in 0..count {
-        text_bytes += value(index)?.len();
-    }
     let mut result = StringColumn::with_capacity(end.saturating_sub(start), text_bytes);
     let mut next = 0usize;
     nulls.each_row_range(start, end, |row_present| {
@@ -4751,19 +4818,46 @@ fn decode_fsst_string_range(body: &[u8], start: usize, end: usize) -> Result<Str
     let present_start = header.nulls.present_before(start);
     let present_end = header.nulls.present_before(effective_end);
     let (data, offsets) = value_bytes_for_range(body, &header, present_start, present_end, "fsst data")?;
+    fsst_range_column(&header, data, &offsets, start, effective_end)
+}
+
+fn decode_fsst_packed_string_range(body: &[u8], start: usize, end: usize) -> Result<StringColumn, FormatError> {
+    let packed = fsst_packed_values(body)?;
+    let header = read_string_header(Transform::FsstString, &mut Reader::new(body))?;
+    let effective_end = end.min(header.nulls.row_count());
+    if effective_end <= start {
+        return Ok(StringColumn::new());
+    }
+    let present_start = header.nulls.present_before(start);
+    let present_end = header.nulls.present_before(effective_end);
+    let offsets = packed
+        .offsets
+        .get(present_start..=present_end)
+        .ok_or(FormatError::Truncated { what: "string offset" })?;
+    fsst_range_column(&header, packed.arena, offsets, start, effective_end)
+}
+
+fn fsst_range_column(
+    header: &StringHeader<'_>,
+    data: &[u8],
+    offsets: &[usize],
+    start: usize,
+    end: usize,
+) -> Result<StringColumn, FormatError> {
     let arena = fsst_decompress_arena(
         header.fsst()?,
         data,
-        &offsets,
+        offsets,
         "fsst value",
         "fsst offsets must be non-decreasing",
     )?;
     merge_nulls_range(
         &header.nulls,
         arena.len(),
+        arena.text.len(),
         |index| fsst_arena_value(&arena, index),
         start,
-        effective_end,
+        end,
     )
 }
 
@@ -4782,10 +4876,12 @@ fn decode_raw_string_range(body: &[u8], start: usize, end: usize) -> Result<Stri
     let present_start = header.nulls.present_before(start);
     let present_end = header.nulls.present_before(effective_end);
     let (data, offsets) = value_bytes_for_range(body, &header, present_start, present_end, "raw string data")?;
+    let raw = RawValues::validated(data, &offsets)?;
     merge_nulls_range(
         &header.nulls,
         offsets.len().saturating_sub(1),
-        |index| raw_string_value(data, &offsets, index),
+        offsets_text_len(&offsets, data),
+        |index| raw.value(&offsets, index),
         start,
         effective_end,
     )
@@ -4803,6 +4899,49 @@ fn raw_string_value<'a>(data: &'a [u8], offsets: &[usize], index: usize) -> Resu
     }
     simdutf8::basic::from_utf8(slice(data, start, end - start, "raw string")?)
         .map_err(|_| FormatError::InvalidUtf8 { what: "raw string" })
+}
+
+enum RawValues<'a> {
+    Bytes(&'a [u8]),
+    Text { base: usize, text: &'a str },
+}
+
+impl<'a> RawValues<'a> {
+    fn validated(data: &'a [u8], offsets: &[usize]) -> Result<Self, FormatError> {
+        if let Some((base, text)) = raw_values_text(data, offsets) {
+            return Ok(Self::Text { base, text });
+        }
+        for index in 0..offsets.len().saturating_sub(1) {
+            raw_string_value(data, offsets, index)?;
+        }
+        Ok(Self::Bytes(data))
+    }
+
+    fn value(&self, offsets: &[usize], index: usize) -> Result<&'a str, FormatError> {
+        match *self {
+            Self::Bytes(data) => raw_string_value(data, offsets, index),
+            Self::Text { base, text } => offsets
+                .get(index)
+                .zip(offsets.get(index + 1))
+                .and_then(|(start, end)| text.get(start.checked_sub(base)?..end.checked_sub(base)?))
+                .ok_or(FormatError::InvalidUtf8 { what: "raw string" }),
+        }
+    }
+}
+
+fn raw_values_text<'a>(data: &'a [u8], offsets: &[usize]) -> Option<(usize, &'a str)> {
+    let (first, last) = (*offsets.first()?, *offsets.last()?);
+    if offsets
+        .windows(2)
+        .any(|pair| matches!(pair, [start, end] if end < start))
+    {
+        return None;
+    }
+    let text = simdutf8::basic::from_utf8(data.get(first..last)?).ok()?;
+    offsets
+        .iter()
+        .all(|&offset| text.is_char_boundary(offset - first))
+        .then_some((first, text))
 }
 
 fn read_windowed_string_header(
@@ -4872,18 +5011,23 @@ fn decode_string_framed_range(
             merge_nulls_range(
                 &header.nulls,
                 arena.len(),
+                arena.text.len(),
                 |index| fsst_arena_value(&arena, index),
                 start,
                 effective_end,
             )
         }
-        _ => merge_nulls_range(
-            &header.nulls,
-            offsets.len().saturating_sub(1),
-            |index| raw_string_value(&data, &offsets, index),
-            start,
-            effective_end,
-        ),
+        _ => {
+            let raw = RawValues::validated(&data, &offsets)?;
+            merge_nulls_range(
+                &header.nulls,
+                offsets.len().saturating_sub(1),
+                offsets_text_len(&offsets, &data),
+                |index| raw.value(&offsets, index),
+                start,
+                effective_end,
+            )
+        }
     }
 }
 
@@ -5075,11 +5219,9 @@ pub fn decode_block_range_shared(
             (ValueKind::String, Transform::FsstString) => {
                 Ok(ColumnData::Strings(decode_fsst_string_range(body, start, end)?))
             }
-            (ValueKind::String, Transform::FsstPackedString) => Ok(ColumnData::Strings(decode_fsst_string_range(
-                &fsst_packed_as_classic(body)?,
-                start,
-                end,
-            )?)),
+            (ValueKind::String, Transform::FsstPackedString) => {
+                Ok(ColumnData::Strings(decode_fsst_packed_string_range(body, start, end)?))
+            }
             (ValueKind::String, Transform::RawString) => {
                 Ok(ColumnData::Strings(decode_raw_string_range(body, start, end)?))
             }
@@ -5142,11 +5284,16 @@ pub fn decode_block_shared_with_body(
     body: &[u8],
     shared: Option<&[String]>,
 ) -> Result<ColumnData, FormatError> {
-    if let Some((classic, body)) = classic_fsst_view(pipeline, body)? {
-        return decode_block_shared_with_body(classic, &body, shared);
+    let transform = pipeline.transform()?;
+    if transform == Transform::FsstPackedString {
+        if pipeline.value_kind()? != ValueKind::String {
+            return Err(FormatError::Structural {
+                rule: "packed fsst transform on a non-string block",
+            });
+        }
+        return Ok(ColumnData::Strings(decode_fsst_packed_string(body)?));
     }
     let mut reader = Reader::new(body);
-    let transform = pipeline.transform()?;
     match pipeline.value_kind()? {
         ValueKind::U64 => Ok(ColumnData::U64(decode_ints_with(transform, &mut reader)?)),
         ValueKind::I64 => Ok(ColumnData::I64(decode_ints_with(transform, &mut reader)?)),
