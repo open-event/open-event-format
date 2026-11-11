@@ -148,14 +148,32 @@ impl OeFile {
         let entry = self.granule_entry(batch.granule_id).ok_or(OUT_OF_STEP)?;
         let first = entry.first_row_ordinal;
         let mut masked: Vec<Vec<u32>> = vec![Vec::new(); column_ids.len()];
+        let mut withholding: Vec<u32> = Vec::new();
+        let mut projected: HashMap<Vec<u32>, Vec<usize>> = HashMap::new();
         for row in 0..batch.row_count {
             let ordinal = first + u64::from(row);
-            if !redactions.withholds_raw_payload(ordinal) {
+            withholding.clear();
+            withholding.extend(
+                (0u32..)
+                    .zip(&redactions.vectors)
+                    .filter(|(_, vector)| vector.withholds_raw_payload(ordinal))
+                    .map(|(index, _)| index),
+            );
+            if withholding.is_empty() {
                 continue;
             }
-            let ids = redactions.redacted_column_ids(self, ordinal);
-            for (rows, column_id) in masked.iter_mut().zip(column_ids) {
-                if ids.binary_search(column_id).is_ok() {
+            if !projected.contains_key(withholding.as_slice()) {
+                let ids = redactions.redacted_column_ids(self, ordinal);
+                let positions = column_ids
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, column_id)| ids.binary_search(column_id).is_ok())
+                    .map(|(position, _)| position)
+                    .collect();
+                projected.insert(withholding.clone(), positions);
+            }
+            for &position in projected.get(withholding.as_slice()).map_or(&[][..], Vec::as_slice) {
+                if let Some(rows) = masked.get_mut(position) {
                     rows.push(row);
                 }
             }
@@ -262,7 +280,11 @@ impl OeFile {
         Ok(())
     }
 
-    fn granule_entry(&self, granule_id: u32) -> Option<&GranuleEntry> {
+    pub(crate) fn block_page_stats(&self, column_id: u32, granule_id: u32) -> Option<&PageStats> {
+        self.page_stats_index.get(&(column_id, granule_id))
+    }
+
+    pub(crate) fn granule_entry(&self, granule_id: u32) -> Option<&GranuleEntry> {
         let granules = &self.footer.granules;
         granules
             .get(granule_id as usize)
@@ -353,78 +375,99 @@ fn bit_set(presence: &[u8], row: u32) -> bool {
         .is_some_and(|byte| byte & (1 << (row % 8)) != 0)
 }
 
-fn value_index(presence: &[u8], row: u32) -> Option<usize> {
+fn value_indexes(presence: &[u8], rows: &[u32]) -> Vec<usize> {
     if presence.is_empty() {
-        return Some(row as usize);
+        return rows.iter().map(|&row| row as usize).collect();
     }
-    if !bit_set(presence, row) {
-        return None;
+    let mut indexes = Vec::with_capacity(rows.len());
+    let mut at = 0u32;
+    let mut before = 0usize;
+    for &row in rows {
+        while at < row {
+            if at.is_multiple_of(8) && row - at >= 8 {
+                before += presence
+                    .get(at as usize / 8)
+                    .map_or(0, |byte| byte.count_ones() as usize);
+                at += 8;
+            } else {
+                before += usize::from(bit_set(presence, at));
+                at += 1;
+            }
+        }
+        if bit_set(presence, row) {
+            indexes.push(before);
+        }
     }
-    let whole = row as usize / 8;
-    let before: u32 = presence
-        .get(..whole)
-        .map_or(0, |bytes| bytes.iter().map(|b| b.count_ones()).sum());
-    let partial = presence
-        .get(whole)
-        .map_or(0, |byte| (byte & ((1u8 << (row % 8)) - 1)).count_ones());
-    Some((before + partial) as usize)
+    indexes
+}
+
+fn dense_presence(row_count: u32) -> Vec<u8> {
+    let mut dense = vec![0u8; (row_count as usize).div_ceil(8)];
+    for row in 0..row_count {
+        if let Some(byte) = dense.get_mut(row as usize / 8) {
+            *byte |= 1 << (row % 8);
+        }
+    }
+    dense
+}
+
+fn clear_bits(presence: &mut [u8], rows: &[u32]) {
+    for &row in rows {
+        if let Some(byte) = presence.get_mut(row as usize / 8) {
+            *byte &= !(1 << (row % 8));
+        }
+    }
 }
 
 fn mask_column(column: &mut ScanColumn, row_count: u32, rows: &[u32]) -> Result<(), FormatError> {
     match column {
         ScanColumn::Views { presence, views } => {
-            let hidden: Vec<usize> = rows.iter().filter_map(|&row| value_index(presence, row)).collect();
+            if presence.is_empty() {
+                *presence = dense_presence(row_count);
+            }
+            let hidden = value_indexes(presence, rows);
             if hidden.is_empty() {
                 return Ok(());
             }
+            clear_bits(presence, rows);
+            let mut hidden = hidden.into_iter().peekable();
             *views = views
                 .iter()
                 .enumerate()
-                .map(|(index, value)| if hidden.contains(&index) { None } else { value })
+                .filter(|(index, _)| hidden.next_if_eq(index).is_none())
+                .map(|(_, value)| value)
                 .collect();
+            validate_block_counts(presence, views.len(), row_count as usize)?;
         }
         ScanColumn::Materialized(read) => {
             if read.presence.is_empty() {
-                let mut dense = vec![0u8; (row_count as usize).div_ceil(8)];
-                for row in 0..row_count {
-                    if let Some(byte) = dense.get_mut(row as usize / 8) {
-                        *byte |= 1 << (row % 8);
-                    }
-                }
-                read.presence = dense;
+                read.presence = dense_presence(row_count);
             }
-            let mut dropped: Vec<usize> = rows
-                .iter()
-                .filter_map(|&row| value_index(&read.presence, row))
-                .collect();
+            let dropped = value_indexes(&read.presence, rows);
             if dropped.is_empty() {
                 return Ok(());
             }
-            dropped.sort_unstable();
-            for &row in rows {
-                if let Some(byte) = read.presence.get_mut(row as usize / 8) {
-                    *byte &= !(1 << (row % 8));
-                }
-            }
-            let keep = |index: usize| dropped.binary_search(&index).is_err();
-            fn retain_indexed<T>(values: &mut Vec<T>, keep: impl Fn(usize) -> bool) {
+            clear_bits(&mut read.presence, rows);
+            fn retain_indexed<T>(values: &mut Vec<T>, dropped: &[usize]) {
+                let mut dropped = dropped.iter().copied().peekable();
                 let mut index = 0;
                 values.retain(|_| {
-                    let kept = keep(index);
+                    let kept = dropped.next_if_eq(&index).is_none();
                     index += 1;
                     kept
                 });
             }
             match &mut read.data {
-                ColumnData::Decimal { values, .. } => retain_indexed(values, keep),
-                ColumnData::F64(values) => retain_indexed(values, keep),
-                ColumnData::I64(values) => retain_indexed(values, keep),
-                ColumnData::U128(values) => retain_indexed(values, keep),
-                ColumnData::U64(values) => retain_indexed(values, keep),
+                ColumnData::Decimal { values, .. } => retain_indexed(values, &dropped),
+                ColumnData::F64(values) => retain_indexed(values, &dropped),
+                ColumnData::I64(values) => retain_indexed(values, &dropped),
+                ColumnData::U128(values) => retain_indexed(values, &dropped),
+                ColumnData::U64(values) => retain_indexed(values, &dropped),
                 ColumnData::Strings(values) => {
                     let mut rebuilt = crate::encoding::StringColumn::with_capacity(values.len(), values.text_len());
+                    let mut dropped = dropped.iter().copied().peekable();
                     for (index, value) in values.iter().enumerate() {
-                        if keep(index) {
+                        if dropped.next_if_eq(&index).is_none() {
                             rebuilt.push(value);
                         }
                     }

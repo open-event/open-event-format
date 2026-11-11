@@ -312,3 +312,18 @@ fn log_object_throughput() {
     println!("log 64 MiB object: {measurement:?}");
     assert!(log_object_gate_passes(&measurement));
 }
+
+#[test]
+fn the_sealed_root_is_the_content_hash_and_the_tree_is_the_outboard_tree() {
+    let payload = vec![3u8; 48 * 1024];
+    for records in [0usize, 1, 3, 40] {
+        let payloads: Vec<&[u8]> = (0..records).map(|_| payload.as_slice()).collect();
+        let object = sealed(&payloads);
+        let content = parse_outboard_object(&object.bytes, &LOG_MAGIC).unwrap().content;
+        assert_eq!(object.root, *crate::file::integrity::hash_tree(content).as_bytes());
+        assert_eq!(
+            object.bytes,
+            crate::file::integrity::attach_outboard_tree(content.to_vec(), CHUNK_GROUP_BYTES)
+        );
+    }
+}

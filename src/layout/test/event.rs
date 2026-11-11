@@ -181,15 +181,15 @@ fn string_at_maps_dense_and_presence_mapped_values() {
     for value in [Some("a"), None, Some("c")] {
         dense.push(value);
     }
-    let dense = (vec![0b101], dense);
-    assert_eq!(string_at(&dense, 3, 0).as_deref(), Some("a"));
-    assert_eq!(string_at(&dense, 3, 1), None);
-    assert_eq!(string_at(&dense, 3, 2).as_deref(), Some("c"));
+    let dense = IdColumn::new((vec![0b101], dense), 3);
+    assert_eq!(dense.at(0).as_deref(), Some("a"));
+    assert_eq!(dense.at(1), None);
+    assert_eq!(dense.at(2).as_deref(), Some("c"));
     let mut sparse = StringColumn::new();
     for value in [Some("b"), Some("d")] {
         sparse.push(value);
     }
-    let sparse = (vec![0b1010], sparse);
-    let read: Vec<_> = (0..4).map(|row| string_at(&sparse, 4, row)).collect();
-    assert_eq!(read, [None, Some("b".to_owned()), None, Some("d".to_owned())]);
+    let sparse = IdColumn::new((vec![0b1010], sparse), 4);
+    let read: Vec<_> = (0..5).map(|row| sparse.at(row)).collect();
+    assert_eq!(read, [None, Some("b".to_owned()), None, Some("d".to_owned()), None]);
 }

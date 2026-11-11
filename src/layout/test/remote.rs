@@ -1276,3 +1276,47 @@ fn prefetch_checks_the_cache_for_each_piece_before_joining_neighbours() {
     );
     assert!(next.held.find(x.0, x.1).is_some(), "the cached piece is held");
 }
+
+#[test]
+fn a_tail_longer_than_the_speculative_window_is_fetched_in_two_pieces_and_cached() {
+    let rows: Vec<_> = (0..6_000u64)
+        .map(|i| {
+            row(
+                i,
+                StdBTreeMap::from([
+                    ("amount".to_owned(), VariantValue::Int((i * 7_919) as i64 % 10_007)),
+                    ("note".to_owned(), VariantValue::String(noise(i, 12))),
+                ]),
+            )
+        })
+        .collect();
+    let built = build_oe_file(rows, &config(1, 64 << 20, 64 << 20)).unwrap();
+    let mut entry = entry(&built);
+    entry.footer_len = None;
+    let range = entry.tail_range();
+    assert!(!range.exact);
+    let exact_tail = built.footer_len + built.tree_len.unwrap_or(0);
+    assert!(exact_tail > range.len, "tail of {exact_tail} bytes fits the window");
+
+    let source = CountingSource::new(&built.bytes);
+    let cache = Arc::new(BlockCache::new(64 << 20, None));
+    let header = HeaderCommitment::from_header_block(&built.bytes[..HEADER_BLOCK_LEN]).unwrap();
+    let open = || {
+        let source: Arc<dyn RangeSource> = source.clone();
+        OeFile::open_remote(source, Some(cache.clone()), &entry, &header, None).unwrap()
+    };
+    let first = open();
+    let requests = source.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0], (range.start, range.len));
+    assert_eq!(
+        requests[1].0 + requests[1].1,
+        range.start,
+        "the retry fetches only the bytes before the window"
+    );
+
+    let second = open();
+    assert_eq!(source.requests().len(), 2, "the second open was served from the cache");
+    assert_eq!(second.footer(), first.footer());
+    assert_eq!(first.footer(), local(&built, None).footer());
+}

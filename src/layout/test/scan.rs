@@ -361,3 +361,78 @@ fn a_live_scan_skips_fully_deleted_granules_and_marks_untouched_ones() {
         }
     }
 }
+
+fn string_forms(values: &[Option<&str>]) -> (ScanColumn, ScanColumn) {
+    let mut presence = vec![0u8; values.len().div_ceil(8)];
+    let mut strings = crate::encoding::StringColumn::new();
+    for (row, value) in values.iter().enumerate() {
+        if value.is_some() {
+            presence[row / 8] |= 1 << (row % 8);
+            strings.push(*value);
+        }
+    }
+    let presence = if values.iter().all(Option::is_some) {
+        Vec::new()
+    } else {
+        presence
+    };
+    let views: StringViewArray = values.iter().flatten().map(|value| Some(*value)).collect();
+    (
+        ScanColumn::Views {
+            presence: presence.clone(),
+            views,
+        },
+        ScanColumn::Materialized(ColumnRead {
+            data: ColumnData::Strings(strings),
+            presence,
+        }),
+    )
+}
+
+#[test]
+fn masking_makes_a_row_absent_in_both_string_forms() {
+    let words: Vec<String> = (0..21).map(|row| format!("value {row}")).collect();
+    let sparse: Vec<Option<&str>> = words
+        .iter()
+        .enumerate()
+        .map(|(row, word)| (row % 3 != 1).then_some(word.as_str()))
+        .collect();
+    let dense: Vec<Option<&str>> = words.iter().map(|word| Some(word.as_str())).collect();
+    for values in [sparse, dense] {
+        let masked_rows = [0u32, 1, 9, 10, 11, 20];
+        let (mut views, mut materialized) = string_forms(&values);
+        mask_column(&mut views, values.len() as u32, &masked_rows).unwrap();
+        mask_column(&mut materialized, values.len() as u32, &masked_rows).unwrap();
+        let (presence, kept) = flatten(&views);
+        assert_eq!((presence.clone(), kept.clone()), flatten(&materialized));
+        let expected: Vec<Option<&str>> = values
+            .iter()
+            .enumerate()
+            .map(|(row, value)| value.filter(|_| !masked_rows.contains(&(row as u32))))
+            .collect();
+        let read: Vec<Option<&str>> = (0..values.len() as u32)
+            .map(|row| {
+                value_indexes(&presence, &[row])
+                    .first()
+                    .and_then(|&index| kept[index].as_deref())
+            })
+            .collect();
+        assert_eq!(read, expected);
+        assert_eq!(kept.len(), expected.iter().flatten().count());
+    }
+}
+
+#[test]
+fn value_indexes_count_present_rows_before_each_row() {
+    let presence = [0b1011_0101u8, 0b0000_0000, 0b1111_1111, 0b0000_0110];
+    let bit = |row: u32| presence[row as usize / 8] & (1 << (row % 8)) != 0;
+    let rows: Vec<u32> = (0..32).filter(|row| row % 5 != 3).collect();
+    let expected: Vec<usize> = rows
+        .iter()
+        .filter(|&&row| bit(row))
+        .map(|&row| (0..row).filter(|&before| bit(before)).count())
+        .collect();
+    assert_eq!(value_indexes(&presence, &rows), expected);
+    assert_eq!(value_indexes(&presence, &[26, 31]), [14]);
+    assert_eq!(value_indexes(&[], &[4, 9]), [4, 9]);
+}
