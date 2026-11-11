@@ -5,6 +5,7 @@ use super::{
 use crate::error::FormatError;
 use crate::events::TenantId;
 use crate::file::bytes::{Reader, Writer, slice};
+use crate::file::integrity::PARALLEL_HASH_MIN_LEN;
 use uuid::Uuid;
 
 pub const FLAG_LARGE_EVENT_FRAME: u32 = 1;
@@ -332,7 +333,11 @@ pub fn decode_frame(frame: &[u8]) -> Result<(OejFrameHeaderV1, &[u8]), FormatErr
         .ok_or(FormatError::Truncated { what: "frame header" })?;
     hasher.update(head);
     hasher.update(&[0u8; BLAKE3_LEN]);
-    hasher.update_rayon(tail);
+    if tail.len() < PARALLEL_HASH_MIN_LEN {
+        hasher.update(tail);
+    } else {
+        hasher.update_rayon(tail);
+    }
     if hasher.finalize().as_bytes() != &header.frame_blake3 {
         return Err(FormatError::Blake3Mismatch { scope: "frame" });
     }

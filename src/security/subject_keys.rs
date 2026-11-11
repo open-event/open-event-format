@@ -64,6 +64,12 @@ fn append_synced(path: &Path, record: &[u8]) -> Result<(), StorageError> {
         .append(true)
         .open(path)
         .map_err(io("open log"))?;
+    let len = file.metadata().map_err(io("stat log"))?.len();
+    let torn = len % (record.len().max(1) as u64);
+    if torn != 0 {
+        file.set_len(len - torn).map_err(io("drop torn log record"))?;
+        file.sync_all().map_err(io("sync log"))?;
+    }
     file.write_all(record).map_err(io("append log"))?;
     file.sync_all().map_err(io("sync log"))
 }
@@ -209,7 +215,7 @@ impl FileSubjectKeyStore {
             tenant_dek,
         };
         for erasure in store.erasures()? {
-            store.destroy_key(erasure.subject)?;
+            store.destroy_key(&mut store.lock(), erasure.subject)?;
         }
         Ok(store)
     }
@@ -301,8 +307,9 @@ impl FileSubjectKeyStore {
         jurisdiction_profile_version: Option<u64>,
         clock: &dyn Clock,
     ) -> Result<SubjectErasure, StorageError> {
+        let mut checked_out = self.lock();
         if let Some(earlier) = self.erasures()?.into_iter().find(|erasure| erasure.subject == subject) {
-            self.destroy_key(subject)?;
+            self.destroy_key(&mut checked_out, subject)?;
             return Ok(earlier);
         }
         let erasure = SubjectErasure {
@@ -318,12 +325,16 @@ impl FileSubjectKeyStore {
             record[25..].copy_from_slice(&version.to_le_bytes());
         }
         append_synced(&self.erasure_log_v2(), &record)?;
-        self.destroy_key(subject)?;
+        self.destroy_key(&mut checked_out, subject)?;
         Ok(erasure)
     }
 
-    fn destroy_key(&self, subject: SubjectId) -> Result<(), StorageError> {
-        if let Some(mut key) = self.lock().remove(&subject) {
+    fn destroy_key(
+        &self,
+        checked_out: &mut HashMap<SubjectId, SubjectContentKey>,
+        subject: SubjectId,
+    ) -> Result<(), StorageError> {
+        if let Some(mut key) = checked_out.remove(&subject) {
             key.destroy();
         }
         let path = self.key_path(subject);

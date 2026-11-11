@@ -336,3 +336,30 @@ fn read_handles_are_cached_bounded_and_revalidated_by_length() {
     assert_eq!(journal.read(ShardId(99), 0, 1), Err(StorageError::UnknownShard));
     assert_eq!(journal.extent(ShardId(99)).unwrap(), 0);
 }
+
+#[test]
+fn a_reader_of_a_preallocated_shard_sees_frames_appended_into_the_zero_tail() {
+    use std::io::{Seek, SeekFrom, Write};
+    let dir = tempfile::tempdir().unwrap();
+    let shard = ShardId(6);
+    let first = real_frame(1, 100);
+    let path = {
+        let mut journal = FileJournalStorage::open(dir.path()).unwrap();
+        journal.append(shard, &first).unwrap();
+        journal.shard_path(shard)
+    };
+    let mut file = OpenOptions::new().write(true).open(&path).unwrap();
+    file.set_len(1 << 20).unwrap();
+
+    let journal = FileJournalStorage::open(dir.path()).unwrap();
+    let logical = first.len() as u64;
+    assert_eq!(journal.extent(shard).unwrap(), logical);
+    assert_eq!(journal.read(shard, 0, first.len() as u32).unwrap(), first);
+    assert_eq!(journal.read(shard, logical, 1), Err(StorageError::OutOfBounds));
+
+    let second = real_frame(2, 5_000);
+    file.seek(SeekFrom::Start(logical)).unwrap();
+    file.write_all(&second).unwrap();
+    assert_eq!(journal.extent(shard).unwrap(), logical + second.len() as u64);
+    assert_eq!(journal.read(shard, logical, second.len() as u32).unwrap(), second);
+}

@@ -96,30 +96,55 @@ pub fn field_deletion_vector_for_subject(
     file: &OeFile,
     erased: SubjectId,
 ) -> Result<Option<FieldDeletionVector>, FormatError> {
-    let mut columns = BTreeSet::new();
-    let mut ordinals = Vec::new();
+    let mut vectors = field_deletion_vectors_for_subject(file, erased)?.into_iter();
+    match (vectors.next(), vectors.next()) {
+        (vector, None) => Ok(vector),
+        (_, Some(_)) => Err(FormatError::Structural {
+            rule: "rows sealing different fields for the subject need one field deletion vector per field set",
+        }),
+    }
+}
+
+pub fn field_deletion_vectors_for_subject(
+    file: &OeFile,
+    erased: SubjectId,
+) -> Result<Vec<FieldDeletionVector>, FormatError> {
+    let mut rows_by_columns = BTreeMap::new();
     for granule in &file.footer().granules {
         for row in granule.first_row_ordinal..granule.first_row_ordinal + u64::from(granule.row_count) {
-            let PayloadRead::Value(value) = file.payload(row)? else {
-                continue;
-            };
-            let paths: Vec<String> = sealed_field_subjects(&value)
-                .into_iter()
-                .filter(|(_, subject)| *subject == erased)
-                .map(|(path, _)| path)
-                .collect();
-            if !paths.is_empty() {
-                ordinals.push(row);
-                columns.extend(paths);
+            if let PayloadRead::Value(value) = file.payload(row)? {
+                group_erased_fields(&mut rows_by_columns, row, &value, erased);
             }
         }
     }
-    if ordinals.is_empty() {
-        return Ok(None);
+    Ok(erased_field_vectors(rows_by_columns))
+}
+
+fn group_erased_fields(
+    rows_by_columns: &mut BTreeMap<Vec<String>, Vec<u64>>,
+    row: u64,
+    payload: &VariantValue,
+    erased: SubjectId,
+) {
+    let paths: Vec<String> = sealed_field_subjects(payload)
+        .into_iter()
+        .filter(|(_, subject)| *subject == erased)
+        .map(|(path, _)| path)
+        .collect();
+    if !paths.is_empty() {
+        rows_by_columns.entry(paths).or_default().push(row);
     }
-    let mut vector = FieldDeletionVector::new(columns.into_iter().collect());
-    ordinals.into_iter().for_each(|row| vector.mark_affected(row));
-    Ok(Some(vector))
+}
+
+fn erased_field_vectors(rows_by_columns: BTreeMap<Vec<String>, Vec<u64>>) -> Vec<FieldDeletionVector> {
+    rows_by_columns
+        .into_iter()
+        .map(|(columns, rows)| {
+            let mut vector = FieldDeletionVector::new(columns);
+            rows.into_iter().for_each(|row| vector.mark_affected(row));
+            vector
+        })
+        .collect()
 }
 
 fn field_block_id(event_id: u128, path: &str) -> u64 {

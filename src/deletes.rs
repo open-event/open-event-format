@@ -28,7 +28,7 @@ impl DeletionVector {
         });
     }
 
-    fn mark_range(&mut self, range: RowRange) {
+    pub(crate) fn mark_range(&mut self, range: RowRange) {
         if range.end <= range.start {
             return;
         }
@@ -552,6 +552,15 @@ pub fn encode_deletion_vector(vector: &DeletionVector) -> (DeletionVectorWireFor
         put_encoded_runs(&mut out, &vector.deleted_runs);
         (DeletionVectorWireForm::PositionalRoaring, out.into_bytes())
     }
+}
+
+pub(crate) fn check_decodable_row_count(vector: &DeletionVector) -> Result<(), FormatError> {
+    if vector.deleted_count() > MAX_DELETION_VECTOR_DECODED_ROWS {
+        return Err(FormatError::Structural {
+            rule: "deletion vector marks more rows than a reader decodes",
+        });
+    }
+    Ok(())
 }
 
 pub fn decode_deletion_vector(bytes: &[u8]) -> Result<DeletionVector, FormatError> {

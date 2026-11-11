@@ -410,11 +410,11 @@ impl LiveOverlayStore {
         let mut needed = range.first_sequence;
         let mut hits = Vec::new();
         while needed <= range.last_sequence {
-            if let Some(segment) = self.segment_covering(tenant_id, range.epoch, needed) {
-                needed = segment.meta.last_sequence.saturating_add(1);
+            let covered_through = if let Some(segment) = self.segment_covering(tenant_id, range.epoch, needed) {
                 hits.push(segment);
+                segment.meta.last_sequence
             } else if let Some(void) = self.void_covering(tenant_id, range.epoch, needed) {
-                needed = void.last_sequence.saturating_add(1);
+                void.last_sequence
             } else {
                 return FreshRead::Behind {
                     missing: SequenceRange {
@@ -423,6 +423,10 @@ impl LiveOverlayStore {
                         last_sequence: range.last_sequence,
                     },
                 };
+            };
+            match covered_through.checked_add(1) {
+                Some(next) => needed = next,
+                None => break,
             }
         }
         FreshRead::Ready(hits)

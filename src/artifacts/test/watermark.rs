@@ -223,3 +223,12 @@ fn range_set_in_place_merge_matches_the_rebuilding_merge() {
         assert_inserts_match_reference(&inserts);
     }
 }
+
+#[test]
+fn a_range_reaching_the_last_sequence_leaves_no_trailing_gap() {
+    let set = RangeSet {
+        ranges: vec![(5, u64::MAX)],
+    };
+    assert_eq!(set.gaps(0, u64::MAX), vec![(0, 4)]);
+    assert_eq!(set.gaps(7, u64::MAX), Vec::new());
+}

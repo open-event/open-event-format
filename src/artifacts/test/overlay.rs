@@ -619,3 +619,20 @@ fn a_rebuilt_overlay_rejects_frames_overlapping_one_already_published() {
         FreshRead::Ready(_) => panic!("the late void must not claim the published range"),
     }
 }
+
+#[test]
+fn a_fresh_read_ends_at_coverage_reaching_the_last_sequence() {
+    let void = void_frame(1, u64::MAX - 1, u64::MAX);
+    let replay = ReplayOutcome {
+        frames: vec![replayed_frame(void, 0)],
+        segment_chain_blake3: None,
+        tail: ReplayTail::Clean,
+    };
+    let mut store = LiveOverlayStore::new();
+    store.rebuild_from_replay(&replay, 1, 1, |_, _| false).unwrap();
+
+    match store.fresh_read(TenantId::new_test_id(7), seq_range(1, u64::MAX - 1, u64::MAX)) {
+        FreshRead::Ready(hits) => assert!(hits.is_empty()),
+        FreshRead::Behind { missing } => panic!("expected Ready over the void, got Behind {missing:?}"),
+    }
+}

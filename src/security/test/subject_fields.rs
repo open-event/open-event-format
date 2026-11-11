@@ -130,3 +130,52 @@ fn subject_keys_scrub_their_material_on_drop() {
     zeroized_on_drop::<crate::security::SealedContentKey>();
     zeroized_on_drop::<crate::deletes::SubjectContentKey>();
 }
+
+#[test]
+fn an_erased_subject_redacts_only_its_own_field_of_each_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let keys = store(dir.path());
+    let (erased, kept) = (SubjectId::new_test_id(1), SubjectId::new_test_id(2));
+    let message = object(&[
+        (
+            "sender",
+            object(&[("email", VariantValue::String("s@example.com".into()))]),
+        ),
+        (
+            "recipient",
+            object(&[("email", VariantValue::String("r@example.com".into()))]),
+        ),
+    ]);
+    let seal = |event: u128, fields: FieldSubjects| {
+        seal_subject_fields(EventId::new_test_id(event), &message, &fields, &keys).unwrap()
+    };
+    let rows = [
+        seal(1, FieldSubjects::from([("sender.email".to_owned(), erased)])),
+        seal(
+            2,
+            FieldSubjects::from([
+                ("recipient.email".to_owned(), erased),
+                ("sender.email".to_owned(), kept),
+            ]),
+        ),
+        seal(3, FieldSubjects::from([("sender.email".to_owned(), erased)])),
+        seal(4, FieldSubjects::from([("sender.email".to_owned(), kept)])),
+    ];
+
+    let mut grouped = BTreeMap::new();
+    for (row, payload) in rows.iter().enumerate() {
+        group_erased_fields(&mut grouped, row as u64, payload, erased);
+    }
+    let vectors = erased_field_vectors(grouped);
+    let redacted = |column: &str, row: u64| vectors.iter().any(|vector| vector.column_redacted(column, row));
+
+    assert_eq!(vectors.len(), 2, "one vector per distinct set of erased fields");
+    assert!(redacted("sender.email", 0) && redacted("sender.email", 2));
+    assert!(redacted("recipient.email", 1));
+    assert!(
+        !redacted("sender.email", 1),
+        "another subject's field of a shared row survives"
+    );
+    assert!(!redacted("recipient.email", 0) && !redacted("recipient.email", 2));
+    assert!(!redacted("sender.email", 3) && !redacted("recipient.email", 3));
+}
