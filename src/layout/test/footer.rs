@@ -1716,8 +1716,13 @@ fn external_id_32_index_is_compact_and_rejects_hostile_input() {
     wide.extend_from_slice(&[0; 5]);
     assert!(decode_external_ids_32(&wide).is_err());
     assert!(decode_external_ids_32(&[1, 0, 0, 0, 65, 0, 0, 0, 0]).is_err());
-    let overflow = [2, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 1, 1];
-    assert!(decode_external_ids_32(&overflow).is_err());
+    let overflow = [2, 0, 0, 0, 1, 0xFF, 0xFF, 0xFF, 0xFF, 1, 1, 0b10];
+    assert!(matches!(
+        decode_external_ids_32(&overflow),
+        Err(FormatError::Structural {
+            rule: "external id key exceeds 32 bits"
+        })
+    ));
 }
 
 #[test]
@@ -1838,4 +1843,86 @@ fn a_packed_shared_dictionary_round_trips_and_refuses_forgeries_when_expanded() 
     footer.shared_dictionaries.clear();
     footer.packed_shared_dictionaries = vec![packed.clone(), packed];
     assert!(decode_footer(&encode_footer(&footer)).is_err());
+}
+
+#[test]
+fn external_id_indexes_refuse_a_count_their_row_ordinals_cannot_tell_apart() {
+    let count = 1_000_000u32;
+    let delta_blocks = (count as usize - 1).div_ceil(128);
+    let mut packed = count.to_le_bytes().to_vec();
+    packed.push(0);
+    packed.extend_from_slice(&7u64.to_le_bytes());
+    packed.extend(std::iter::repeat_n(0u8, delta_blocks));
+    assert!(matches!(
+        decode_external_ids_packed(&packed),
+        Err(FormatError::Structural {
+            rule: "external id ordinal width cannot hold one distinct row per entry"
+        })
+    ));
+    let mut narrow = count.to_le_bytes().to_vec();
+    narrow.push(0);
+    narrow.extend_from_slice(&7u32.to_le_bytes());
+    narrow.extend(std::iter::repeat_n(0u8, delta_blocks));
+    assert!(matches!(
+        decode_external_ids_32(&narrow),
+        Err(FormatError::Structural {
+            rule: "external id ordinal width cannot hold one distinct row per entry"
+        })
+    ));
+
+    let mut wide_enough = u32::MAX.to_le_bytes().to_vec();
+    wide_enough.push(32);
+    wide_enough.extend_from_slice(&7u32.to_le_bytes());
+    wide_enough.extend(std::iter::repeat_n(0u8, (u32::MAX as usize - 1).div_ceil(128)));
+    assert!(matches!(
+        decode_external_ids_32(&wide_enough),
+        Err(FormatError::Structural {
+            rule: "external id count exceeds input"
+        })
+    ));
+
+    let entries: Vec<_> = (0..300u64).map(|row| key_entry(9, row)).collect();
+    let mut out = Writer::new();
+    encode_external_ids_32(&entries, &mut out);
+    assert_eq!(decode_external_ids_32(out.bytes()).unwrap(), entries);
+    let mut out = Writer::new();
+    encode_external_ids_packed(&entries, &mut out);
+    assert_eq!(decode_external_ids_packed(out.bytes()).unwrap(), entries);
+}
+
+fn packed_dictionary_plaintext(values: &[String]) -> Vec<u8> {
+    let mut plain = Vec::new();
+    for value in values {
+        plain.extend_from_slice(&(value.len() as u16).to_le_bytes());
+    }
+    for value in values {
+        plain.extend_from_slice(value.as_bytes());
+    }
+    plain
+}
+
+#[test]
+fn packed_shared_dictionary_compresses_small_alphabets_hard_and_large_ones_fast() {
+    let ids = |count: u64| -> Vec<String> {
+        let mut values: Vec<String> = (0..count)
+            .map(|i| format!("ent-{:016x}", i.wrapping_mul(0x9E37_79B9_7F4A_7C15)))
+            .collect();
+        values.sort();
+        values
+    };
+
+    let small = ids(2_000);
+    let plain = packed_dictionary_plaintext(&small);
+    assert!(plain.len() <= 1 << 20);
+    let packed = PackedSharedDictionary::pack(15, &small).unwrap();
+    assert_eq!(packed.compressed, zstd::bulk::compress(&plain, 19).unwrap());
+    assert_eq!(packed.values().unwrap(), small);
+
+    let large = ids(60_000);
+    let plain = packed_dictionary_plaintext(&large);
+    assert!(plain.len() > 1 << 20);
+    let packed = PackedSharedDictionary::pack(15, &large).unwrap();
+    assert_eq!(packed.compressed, zstd::bulk::compress(&plain, 1).unwrap());
+    assert_eq!(packed.plain_len as usize, plain.len());
+    assert_eq!(packed.values().unwrap(), large);
 }

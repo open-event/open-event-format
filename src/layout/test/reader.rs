@@ -117,34 +117,29 @@ fn file_with_mark(mark: ColumnMark, bytes: Vec<u8>, usable_optional_features: u6
         column_cache_bytes: AtomicU64::new(0),
         decoded_cache_budget: DECODED_CACHE_BUDGET_BYTES,
         dictionary_decodes: AtomicU64::new(0),
-        embedding_row_offsets: HashMap::new(),
-        entity_hash_filters_by_granule: HashMap::new(),
-        footer,
-        freetext_row_offsets: HashMap::new(),
+        footer: Arc::new(footer),
         granule_dictionaries: DashMap::default(),
         granule_dictionaries_bytes: AtomicU64::new(0),
-        granule_stripe_base: HashMap::new(),
         graph_edges: DashMap::default(),
         graph_edges_bytes: AtomicU64::new(0),
         header: minimal_header(),
+        index: Arc::new(FileIndex {
+            usable_optional_features,
+            ..FileIndex::default()
+        }),
         inflated_residuals: DashMap::default(),
         inflated_residuals_bytes: AtomicU64::new(0),
         lazy_stripes: None,
-        marks: Marks::Eager([((mark.column_id, mark.projection_id, mark.granule_id), mark)].into()),
-        page_marks: BTreeMap::new(),
-        page_stats_index: HashMap::new(),
-        payload_granule_index: HashMap::new(),
+        marks: Marks::Eager(Arc::new(
+            [((mark.column_id, mark.projection_id, mark.granule_id), mark)].into(),
+        )),
         point_probe_counts: DashMap::default(),
         residual_seek_tables: DashMap::default(),
-        shared_alphabets: HashMap::new(),
         packed_shared_alphabets: HashMap::new(),
         shared_string_views: DashMap::new(),
         snapshot_first_keys_in_order: false,
-        stripe_position_by_id: HashMap::new(),
         stripe_relative: false,
         text_token_cache: DashMap::default(),
-        text_token_indexes_by_key: HashMap::new(),
-        text_token_offsets: HashMap::new(),
         usable_optional_features,
     }
 }
@@ -379,7 +374,7 @@ fn forged_stripe_relative_offset_near_u64_max_refuses() {
     };
     let mut file = file_with_mark(mark, vec![0u8; 64], 0);
     file.stripe_relative = true;
-    file.granule_stripe_base.insert(3, 1);
+    Arc::make_mut(&mut file.index).granule_stripe_base.insert(3, 1);
     assert!(matches!(
         file.read_column_raw(7, 3),
         Err(FormatError::RefOutOfRange {
@@ -940,15 +935,15 @@ fn columnar_marks_pruned_stripe_never_decodes_its_marks_page() {
 
     let columnar = OeFile::open(built.bytes.clone(), Some(&built.file_seal)).unwrap();
     let mut row_oriented = OeFile::open(built.bytes, Some(&built.file_seal)).unwrap();
-    row_oriented.marks = Marks::Eager(
+    row_oriented.marks = Marks::Eager(Arc::new(
         built
             .footer
             .marks
             .iter()
             .map(|mark| ((mark.column_id, mark.projection_id, mark.granule_id), *mark))
             .collect(),
-    );
-    row_oriented.page_marks = built
+    ));
+    Arc::make_mut(&mut row_oriented.index).page_marks = built
         .footer
         .page_directory
         .iter()
@@ -1231,7 +1226,9 @@ fn aliased_extent_cache_hit_is_revalidated_against_the_asking_mark() {
     };
 
     let mut file = file_with_mark(mark_a, block, 0);
-    file.marks = Marks::Eager([((mark_a.column_id, 0, 0), mark_a), ((mark_b.column_id, 0, 0), mark_b)].into());
+    file.marks = Marks::Eager(Arc::new(
+        [((mark_a.column_id, 0, 0), mark_a), ((mark_b.column_id, 0, 0), mark_b)].into(),
+    ));
     file.aliased_extents = [(0u64, block_len)].into_iter().collect();
 
     let first = file.read_column(mark_a.column_id, 0).unwrap();
@@ -1364,7 +1361,7 @@ fn embedding_row_slot_resolves_offset_and_len_from_the_index() {
     bytes[204..210].copy_from_slice(&[5, 6, 7, 8, 9, 10]);
 
     let mut file = file_with_mark(mark, bytes, optional_features::TYPED_COLUMN_ROW_OFFSETS);
-    file.embedding_row_offsets = [(
+    Arc::make_mut(&mut file.index).embedding_row_offsets = [(
         (5000, 0),
         EmbeddingRowOffsets {
             bytes_len: 10,
@@ -1433,7 +1430,7 @@ fn embedding_value_for_row_reads_via_the_index_in_bounded_iops() {
     bytes[204..210].copy_from_slice(&[5, 6, 7, 8, 9, 10]);
 
     let mut file = file_with_mark(mark, bytes, optional_features::TYPED_COLUMN_ROW_OFFSETS);
-    file.embedding_row_offsets = [(
+    Arc::make_mut(&mut file.index).embedding_row_offsets = [(
         (5000, 0),
         EmbeddingRowOffsets {
             bytes_len: 10,
@@ -1510,7 +1507,7 @@ fn a_file_without_compressed_presence_reads_the_legacy_presence_frame() {
         uncompressed_size: 0,
     };
     let mut file = file_with_mark(mark, block, 0);
-    file.footer.required_feature_flags &= !required_features::COMPRESSED_PRESENCE;
+    Arc::make_mut(&mut file.footer).required_feature_flags &= !required_features::COMPRESSED_PRESENCE;
 
     let read = file.read_column(5000, 0).unwrap();
     assert_eq!(read.data, data);
@@ -2426,4 +2423,165 @@ fn a_graph_profile_build_opens_with_its_profile_in_header_and_footer() {
     let file = OeFile::open(built.bytes, Some(&built.file_seal)).unwrap();
     assert_eq!(file.header().profile, crate::layout::Profile::Graph);
     assert_eq!(file.footer().profile, crate::layout::Profile::Graph);
+}
+
+fn single_block_file(data: &ColumnData, presence: &[u8], row_count: u32) -> OeFile {
+    let encoded = encode_block(data, false);
+    let mut body = Writer::with_capacity(4 + encoded.bytes.len());
+    crate::layout::encode_presence(presence, row_count, &mut body);
+    body.put_slice(&encoded.bytes);
+    let block = body.into_bytes();
+    let mark = ColumnMark {
+        codec_pipeline_id: encoded.pipeline,
+        column_id: 5000,
+        compressed_offset: 0,
+        compressed_size: block.len() as u64,
+        first_value_offset: None,
+        granule_id: 0,
+        page_count: 1,
+        projection_id: 0,
+        row_count,
+        uncompressed_offset: 0,
+        uncompressed_size: 0,
+    };
+    file_with_mark(mark, block, 0)
+}
+
+#[test]
+fn embedding_value_for_row_fallback_maps_rows_through_the_presence_bitmap() {
+    let data = ColumnData::Strings(vec![Some("a".to_owned()), Some("b".to_owned())].into());
+    let file = single_block_file(&data, &[0b0000_0110], 3);
+    assert_eq!(file.embedding_value_for_row(5000, 0).unwrap(), None);
+    assert_eq!(file.embedding_value_for_row(5000, 1).unwrap(), Some(b"a".to_vec()));
+    assert_eq!(file.embedding_value_for_row(5000, 2).unwrap(), Some(b"b".to_vec()));
+}
+
+#[test]
+fn a_dense_block_keeps_answering_point_reads_once_it_is_cached() {
+    let values = [10i64, 20, 30];
+    let file = single_block_file(&ColumnData::I64(values.to_vec()), &[], 3);
+    let granule = file.footer.granules[0].clone();
+    for probe in 0..=POINT_READS_BEFORE_WHOLE_GRANULE_DECODE as usize + 8 {
+        let row = probe % values.len();
+        assert_eq!(
+            file.shredded_value_for_row(5000, &granule, row as u64).unwrap(),
+            Some(VariantValue::Int(values[row])),
+            "probe {probe}"
+        );
+    }
+    let cached = file.cached_column(5000, 0).unwrap();
+    assert_eq!(cached.value_at(1), Some(VariantValue::Int(20)));
+    assert_eq!(cached.value_at(3), None);
+}
+
+#[test]
+fn a_tree_trailer_leaving_less_than_a_header_of_content_is_refused() {
+    let mut header = minimal_header();
+    header.file_id = u128::from(u32::from_le_bytes(*b"OEF1")) << 96;
+    let mut bytes = crate::layout::encode_header(&header);
+    assert_eq!(bytes.len(), HEADER_BLOCK_LEN);
+    assert_eq!(&bytes[16..28], b"\0\0\0\0\0\0\0\0OEF1");
+    let tree_len = (bytes.len() - 28) as u64;
+    bytes.extend_from_slice(&tree_len.to_le_bytes());
+    bytes.extend_from_slice(b"OEFT");
+    assert!(matches!(
+        OeFile::open(bytes, None),
+        Err(FormatError::Truncated { what: "oe body tail" })
+    ));
+}
+
+fn assemble_minimal(mut footer: Footer) -> Result<OeFile, FormatError> {
+    footer.required_feature_flags &= !required_features::STRIPE_RELATIVE_MARKS;
+    OeFile::assemble(
+        FileBytes::Local(Arc::new(Vec::new())),
+        minimal_header(),
+        footer,
+        0,
+        None,
+        DECODED_CACHE_BUDGET_BYTES,
+    )
+}
+
+fn empty_mark(row_count: u32) -> ColumnMark {
+    ColumnMark {
+        codec_pipeline_id: PipelineId(0),
+        column_id: 5000,
+        compressed_offset: 0,
+        compressed_size: 0,
+        first_value_offset: None,
+        granule_id: 0,
+        page_count: 1,
+        projection_id: 0,
+        row_count,
+        uncompressed_offset: 0,
+        uncompressed_size: 0,
+    }
+}
+
+#[test]
+fn a_last_granule_whose_row_range_overflows_is_refused() {
+    assemble_minimal(minimal_footer(empty_mark(1))).expect("the unmodified footer assembles");
+    let mut footer = minimal_footer(empty_mark(1));
+    footer.granules[0].first_row_ordinal = u64::MAX;
+    assert!(matches!(
+        assemble_minimal(footer),
+        Err(FormatError::Structural {
+            rule: "granule row range overflows"
+        })
+    ));
+}
+
+#[test]
+fn a_mark_declaring_more_rows_than_a_block_can_hold_is_refused() {
+    let mut footer = minimal_footer(empty_mark(1));
+    footer.marks[0].row_count = u32::MAX;
+    assert!(matches!(
+        assemble_minimal(footer),
+        Err(FormatError::Structural {
+            rule: BLOCK_ROWS_BEYOND_BOUND
+        })
+    ));
+
+    let rows: Vec<_> = (0..8).map(|i| freetext_row(i, Some("free text body"))).collect();
+    let built = build_oe_file(rows, &freetext_config()).unwrap();
+    let mut columnar_footer = built.footer.clone();
+    columnar_footer.required_feature_flags &= !required_features::STRIPE_MARKS_PAGES;
+    columnar_footer.required_feature_flags |= required_features::COLUMNAR_MARKS;
+    let forged = columnar_footer.marks[0];
+    columnar_footer.marks[0].row_count = u32::MAX;
+    let blob = crate::layout::footer::encode_footer(&columnar_footer);
+    let old_footer_len = u64::from_le_bytes(
+        built.bytes[built.bytes.len() - 12..built.bytes.len() - 4]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let mut columnar_bytes = built.bytes[..built.bytes.len() - (old_footer_len + 12)].to_vec();
+    columnar_bytes.extend_from_slice(&blob);
+    columnar_bytes.extend_from_slice(&(blob.len() as u64).to_le_bytes());
+    columnar_bytes.extend_from_slice(b"OEF1");
+    let file = OeFile::open(columnar_bytes, None).unwrap();
+    assert!(matches!(
+        file.read_column(forged.column_id, forged.granule_id),
+        Err(FormatError::Structural {
+            rule: BLOCK_ROWS_BEYOND_BOUND
+        })
+    ));
+}
+
+#[test]
+fn fresh_reader_shares_the_footer_and_index_with_its_template() {
+    let (bytes, seal, footer) = multi_stripe_file_with_gaps();
+    let template = OeFile::open(bytes, Some(&seal)).unwrap();
+    let fresh = template.fresh_reader().unwrap();
+    assert!(Arc::ptr_eq(&template.footer, &fresh.footer));
+    assert!(Arc::ptr_eq(&template.index, &fresh.index));
+    assert_eq!(fresh.column_block_reads(), 0);
+    for granule in &footer.granules {
+        for column in &footer.columns {
+            assert_eq!(
+                read_shape(&fresh, column.column_id, granule.granule_id).ok(),
+                read_shape(&template, column.column_id, granule.granule_id).ok()
+            );
+        }
+    }
 }

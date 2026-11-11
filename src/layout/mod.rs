@@ -46,15 +46,12 @@ pub fn encode_presence(presence: &[u8], row_count: u32, out: &mut Writer) {
         return;
     }
     let rows = row_count as usize;
-    let is_set = |row: usize| presence.get(row / 8).is_some_and(|byte| byte & (1 << (row % 8)) != 0);
-    let (mut set_count, mut run_count) = (0usize, 0usize);
-    for row in 0..rows {
-        if is_set(row) {
-            set_count += 1;
-            if row == 0 || !is_set(row - 1) {
-                run_count += 1;
-            }
-        }
+    let covered = presence.get(..rows.div_ceil(8)).unwrap_or(presence);
+    let (mut set_count, mut run_count, mut carry) = (0usize, 0usize, 0u64);
+    for word in presence_words(covered, rows) {
+        set_count += word.count_ones() as usize;
+        run_count += (word & !((word << 1) | carry)).count_ones() as usize;
+        carry = word >> 63;
     }
     if set_count == rows {
         out.put_u8(presence_forms::ALL_PRESENT);
@@ -75,24 +72,50 @@ pub fn encode_presence(presence: &[u8], row_count: u32, out: &mut Writer) {
         out.put_u8(presence_forms::SET_RUNS);
         out.put_u32(run_count as u32);
         let mut start = None;
-        for row in 0..=rows {
-            match (start, row < rows && is_set(row)) {
-                (None, true) => start = Some(row),
-                (Some(first), false) => {
-                    out.put_u32(first as u32);
-                    out.put_u32((row - first) as u32);
-                    start = None;
+        let mut carry = 0u64;
+        for (index, word) in presence_words(covered, rows).enumerate() {
+            let mut edges = word ^ ((word << 1) | carry);
+            while edges != 0 {
+                let row = index * 64 + edges.trailing_zeros() as usize;
+                edges &= edges - 1;
+                match start.take() {
+                    None => start = Some(row),
+                    Some(first) => {
+                        out.put_u32(first as u32);
+                        out.put_u32((row - first) as u32);
+                    }
                 }
-                _ => {}
             }
+            carry = word >> 63;
+        }
+        if let Some(first) = start {
+            out.put_u32(first as u32);
+            out.put_u32((rows.min(covered.len() * 8) - first) as u32);
         }
     } else {
         out.put_u8(presence_forms::SET_POSITIONS);
         out.put_u32(set_count as u32);
-        for row in (0..rows).filter(|&row| is_set(row)) {
-            out.put_u32(row as u32);
+        for (index, mut word) in presence_words(covered, rows).enumerate() {
+            while word != 0 {
+                out.put_u32((index * 64 + word.trailing_zeros() as usize) as u32);
+                word &= word - 1;
+            }
         }
     }
+}
+
+fn presence_words(covered: &[u8], rows: usize) -> impl Iterator<Item = u64> + '_ {
+    covered.chunks(8).enumerate().map(move |(index, chunk)| {
+        let mut bytes = [0u8; 8];
+        if let Some(prefix) = bytes.get_mut(..chunk.len()) {
+            prefix.copy_from_slice(chunk);
+        }
+        let word = u64::from_le_bytes(bytes);
+        match rows.saturating_sub(index * 64) {
+            valid if valid < 64 => word & ((1u64 << valid) - 1),
+            _ => word,
+        }
+    })
 }
 
 pub fn decode_presence_frame<'a>(
@@ -146,7 +169,7 @@ pub fn decode_presence_ranges(
                     rule: "presence run count beyond the block's row count",
                 });
             }
-            let mut ranges = Vec::with_capacity(count);
+            let mut ranges = Vec::with_capacity(count.min(reader.remaining() / 8));
             for _ in 0..count {
                 let start = u64::from(reader.u32("presence run start")?);
                 let len = u64::from(reader.u32("presence run length")?);
@@ -167,7 +190,7 @@ pub fn decode_presence_ranges(
                     rule: "presence position count beyond the block's row count",
                 });
             }
-            let mut positions = Vec::with_capacity(count);
+            let mut positions = Vec::with_capacity(count.min(reader.remaining() / 4));
             for _ in 0..count {
                 let row = u64::from(reader.u32("presence position")?);
                 if row >= rows {
@@ -190,6 +213,11 @@ pub fn decode_presence_ranges(
 pub fn decode_presence<'a>(reader: &mut Reader<'a>, row_count: u32) -> Result<Cow<'a, [u8]>, FormatError> {
     let form = reader.u8("presence form")?;
     let rows = row_count as usize;
+    if rows > MAX_ELIDED_BLOCK_ROWS && form != presence_forms::EMPTY && form != presence_forms::RAW {
+        return Err(FormatError::Structural {
+            rule: "presence row count beyond the block bound",
+        });
+    }
     match form {
         presence_forms::EMPTY => Ok(Cow::Borrowed(&[])),
         presence_forms::ALL_PRESENT => {

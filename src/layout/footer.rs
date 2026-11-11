@@ -362,6 +362,10 @@ pub const PACKED_SHARED_DICTIONARY_MAX_PLAIN_BYTES: u32 = 1 << 28;
 
 const PACKED_SHARED_DICTIONARY_ZSTD_LEVEL: i32 = 19;
 
+const PACKED_SHARED_DICTIONARY_LARGE_PLAIN_BYTES: usize = 1 << 20;
+
+const PACKED_SHARED_DICTIONARY_LARGE_ZSTD_LEVEL: i32 = 1;
+
 impl PackedSharedDictionary {
     pub fn pack(column_id: u32, values: &[String]) -> Option<Self> {
         let mut plain = Vec::with_capacity(values.len() * 2 + values.iter().map(String::len).sum::<usize>());
@@ -374,7 +378,12 @@ impl PackedSharedDictionary {
         let plain_len = u32::try_from(plain.len())
             .ok()
             .filter(|len| *len <= PACKED_SHARED_DICTIONARY_MAX_PLAIN_BYTES)?;
-        let compressed = zstd::bulk::compress(&plain, PACKED_SHARED_DICTIONARY_ZSTD_LEVEL).ok()?;
+        let level = if plain.len() > PACKED_SHARED_DICTIONARY_LARGE_PLAIN_BYTES {
+            PACKED_SHARED_DICTIONARY_LARGE_ZSTD_LEVEL
+        } else {
+            PACKED_SHARED_DICTIONARY_ZSTD_LEVEL
+        };
+        let compressed = zstd::bulk::compress(&plain, level).ok()?;
         Some(Self {
             column_id,
             value_count: u32::try_from(values.len()).ok()?,
@@ -1441,6 +1450,20 @@ pub fn encode_external_ids_packed(entries: &[ExternalIdEntry], out: &mut Writer)
     out.put_slice(&packer.finish());
 }
 
+fn check_external_id_ordinals_fit(count: usize, ordinal_width: u8, reader: &Reader<'_>) -> Result<(), FormatError> {
+    if ordinal_width < bit_width((count - 1) as u64) {
+        return Err(FormatError::Structural {
+            rule: "external id ordinal width cannot hold one distinct row per entry",
+        });
+    }
+    if packed_len(count, ordinal_width)? > reader.remaining() {
+        return Err(FormatError::Structural {
+            rule: "external id count exceeds input",
+        });
+    }
+    Ok(())
+}
+
 fn packed_len(count: usize, width: u8) -> Result<usize, FormatError> {
     count
         .checked_mul(usize::from(width))
@@ -1464,6 +1487,7 @@ pub fn decode_external_ids_packed(bytes: &[u8]) -> Result<Vec<ExternalIdEntry>, 
             rule: "external id count exceeds input",
         });
     }
+    check_external_id_ordinals_fit(count, ordinal_width, &r)?;
     let mut entries = Vec::with_capacity(count);
     entries.push(ExternalIdEntry {
         id_hash: hash,
@@ -1549,6 +1573,7 @@ pub fn decode_external_ids_32(bytes: &[u8]) -> Result<Vec<ExternalIdEntry>, Form
             rule: "external id count exceeds input",
         });
     }
+    check_external_id_ordinals_fit(count, ordinal_width, &r)?;
     let mut entries = Vec::with_capacity(count);
     entries.push(ExternalIdEntry {
         id_hash: key << 32,
