@@ -2,8 +2,9 @@ use super::error::{FlushError, LeaseError, QueueError};
 use super::queue::{CommitQueue, PendingRecord, QueueRegion, peek_steal_raw};
 use super::reserve::{FORCE_COMMIT_IDLE_NANOS, SequenceAllocator};
 use super::retry::{RetryReceipt, SafeRetryStore, StatusClass};
+use crate::artifacts::FRAME_HEADER_LEN;
 use crate::artifacts::batch::{EventInput, build_batch, decode_batch};
-use crate::artifacts::frame::{FLAG_VOID_RECORD, FrameBuildInput, build_frame, decode_frame};
+use crate::artifacts::frame::{FLAG_VOID_RECORD, FrameBuildInput, build_frame, precheck_header};
 use crate::artifacts::overlay::{LiveOverlayStore, convert_frame};
 use crate::artifacts::watermark::WatermarkTracker;
 use crate::error::FormatError;
@@ -304,17 +305,7 @@ impl WorkerCommitPipeline {
         }
         self.queue.release_hardened();
 
-        let mut receipts = Vec::new();
-        for frame in &frames {
-            receipts.extend(self.record_receipts(
-                &frame.events,
-                frame.range,
-                frame.offset,
-                now,
-                StatusClass::Acknowledged,
-                retry,
-            ));
-        }
+        let receipts = self.record_receipts(&frames, now, StatusClass::Acknowledged, retry);
 
         let state = match self.route {
             RouteDependency::AppendOnly => CommitState::Committed,
@@ -395,51 +386,50 @@ impl WorkerCommitPipeline {
     ) {
         for frame in frames {
             let _ = allocator.accept_late(frame.lease_id);
-            self.record_receipts(
-                &frame.events,
-                frame.range,
-                frame.offset,
-                now,
-                StatusClass::Indeterminate,
-                retry,
-            );
             self.queue.abort_flush(frame.region);
         }
+        self.record_receipts(frames, now, StatusClass::Indeterminate, retry);
     }
 
     fn record_receipts(
         &self,
-        events: &[EventInput],
-        range: SequenceRange,
-        frame_offset: u64,
+        frames: &[StagedFrame],
         now: i64,
         status_class: StatusClass,
         retry: &mut dyn SafeRetryStore,
     ) -> Vec<RetryReceipt> {
-        let mut receipts = Vec::with_capacity(events.len());
-        for (row, event) in events.iter().enumerate() {
-            let receipt = RetryReceipt {
-                delivery_identity: (event.connector_delivery_hash_low, event.connector_delivery_hash_high),
-                tenant_id: self.tenant_id,
-                commit: SequencePoint {
-                    epoch: range.epoch,
-                    sequence: range.first_sequence + row as u64,
-                },
-                shard: self.shard,
-                frame_offset,
-                status_class,
-                expiry_physical_nanos: now + self.ack_guard_nanos,
-                dedupe: (event.envelope.dedupe_hash_low, event.envelope.dedupe_hash_high),
-            };
-            retry.record(receipt.clone());
-            receipts.push(receipt);
+        if frames.is_empty() {
+            return Vec::new();
         }
+        let mut receipts = Vec::with_capacity(frames.iter().map(|frame| frame.events.len()).sum());
+        for frame in frames {
+            for (row, event) in frame.events.iter().enumerate() {
+                receipts.push(RetryReceipt {
+                    delivery_identity: (event.connector_delivery_hash_low, event.connector_delivery_hash_high),
+                    tenant_id: self.tenant_id,
+                    commit: SequencePoint {
+                        epoch: frame.range.epoch,
+                        sequence: frame.range.first_sequence + row as u64,
+                    },
+                    shard: self.shard,
+                    frame_offset: frame.offset,
+                    status_class,
+                    expiry_physical_nanos: now + self.ack_guard_nanos,
+                    dedupe: (event.envelope.dedupe_hash_low, event.envelope.dedupe_hash_high),
+                });
+            }
+        }
+        retry.record_batch(&receipts);
         retry.evict_expired(now);
         receipts
     }
 
     fn publish_to_overlay(&self, frame_bytes: &[u8], overlay: &mut LiveOverlayStore) -> Result<(), FlushError> {
-        let (header, payload) = decode_frame(frame_bytes).map_err(FlushError::Format)?;
+        let header = precheck_header(frame_bytes).map_err(FlushError::Format)?;
+        let payload = frame_bytes
+            .get(FRAME_HEADER_LEN as usize..)
+            .and_then(|rest| rest.get(..header.payload_len as usize))
+            .ok_or(FlushError::Format(FormatError::Truncated { what: "frame payload" }))?;
         let decoded = decode_batch(payload, header.event_count).map_err(FlushError::Format)?;
         let segment = convert_frame(&header, &decoded, u64::from(self.shard.0), 0, None, |_, _| false)
             .map_err(FlushError::Format)?;

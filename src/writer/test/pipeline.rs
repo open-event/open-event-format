@@ -1,5 +1,6 @@
 use super::*;
 use crate::artifacts::batch::PayloadInput;
+use crate::artifacts::frame::decode_frame;
 use crate::artifacts::overlay::FreshRead;
 use crate::artifacts::segment::{ReplayTail, replay_segment};
 use crate::events::variant::VariantValue;
@@ -1636,4 +1637,76 @@ fn on_disk_journal_and_retry_store_survive_a_restart_and_rebuild_from_replay() {
         rebuilt.lookup(TenantId::new_test_id(9), (5000, 1)).unwrap().commit,
         retry.lookup(TenantId::new_test_id(9), (5000, 1)).unwrap().commit
     );
+}
+
+/// A safe-retry store that counts how its receipts arrive.
+struct CountingRetryStore {
+    batches: Vec<usize>,
+    inner: SimSafeRetryStore,
+    singles: usize,
+}
+
+impl SafeRetryStore for CountingRetryStore {
+    fn record(&mut self, receipt: RetryReceipt) {
+        self.singles += 1;
+        self.inner.record(receipt);
+    }
+    fn record_batch(&mut self, receipts: &[RetryReceipt]) {
+        self.batches.push(receipts.len());
+        for receipt in receipts {
+            self.inner.record(receipt.clone());
+        }
+    }
+    fn evict_expired(&mut self, now_physical_nanos: i64) {
+        self.inner.evict_expired(now_physical_nanos);
+    }
+    fn lookup(&self, tenant_id: TenantId, delivery_identity: (u64, u64)) -> Option<RetryReceipt> {
+        self.inner.lookup(tenant_id, delivery_identity)
+    }
+    fn acknowledged_within_guard(
+        &mut self,
+        tenant_id: TenantId,
+        dedupe: (u64, u64),
+        now_physical_nanos: i64,
+    ) -> Option<RetryReceipt> {
+        self.inner
+            .acknowledged_within_guard(tenant_id, dedupe, now_physical_nanos)
+    }
+}
+
+#[test]
+fn a_flush_records_the_receipts_of_all_its_frames_as_one_batch() {
+    let clock = SimClock::new(61);
+    let mut storage = CountingStorage::new(None);
+    let mut allocator = SequenceAllocator::new(1);
+    let mut watermarks = WatermarkTracker::new();
+    let mut retry = CountingRetryStore {
+        batches: Vec::new(),
+        inner: SimSafeRetryStore::new(),
+        singles: 0,
+    };
+    let mut overlay = LiveOverlayStore::new();
+    let mut worker = pipeline();
+    let count = queue_past_three_targets(&mut worker, &mut retry.inner, &clock);
+    let result = worker
+        .flush(
+            FlushReason::Target,
+            &mut allocator,
+            &mut storage,
+            &mut watermarks,
+            &mut retry,
+            &mut overlay,
+            &clock,
+        )
+        .unwrap();
+    assert!(storage.appends >= 4, "{} frames", storage.appends);
+    assert_eq!(retry.batches, vec![count as usize]);
+    assert_eq!(retry.singles, 0);
+    assert_eq!(result.receipts.len() as u64, count);
+    for receipt in &result.receipts {
+        assert_eq!(
+            retry.lookup(receipt.tenant_id, receipt.delivery_identity).as_ref(),
+            Some(receipt)
+        );
+    }
 }
