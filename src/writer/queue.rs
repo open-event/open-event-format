@@ -525,11 +525,10 @@ impl CommitQueue {
                 .buffer
                 .get(offset..offset + len as usize)
                 .ok_or(QueueError::Codec)?;
-            let record = decode_pending(bytes).map_err(|_| QueueError::Codec)?;
-            if record.tenant_id != tenant_id || record.epoch != epoch {
+            if peek_tenant_epoch(bytes).is_some_and(|front| front != (tenant_id, epoch)) {
                 break;
             }
-            records.push(record);
+            records.push(decode_pending(bytes).map_err(|_| QueueError::Codec)?);
             cursor += (LEN_HEADER + len).next_multiple_of(RECORD_ALIGN);
         }
         Ok((QueueRegion { start, end: cursor }, records))

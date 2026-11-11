@@ -26,6 +26,12 @@ pub struct RetryReceipt {
 pub trait SafeRetryStore {
     fn record(&mut self, receipt: RetryReceipt);
 
+    fn record_batch(&mut self, receipts: &[RetryReceipt]) {
+        for receipt in receipts {
+            self.record(receipt.clone());
+        }
+    }
+
     fn evict_expired(&mut self, now_physical_nanos: i64);
 
     fn lookup(&self, tenant_id: TenantId, delivery_identity: (u64, u64)) -> Option<RetryReceipt>;

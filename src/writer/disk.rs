@@ -14,8 +14,6 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
-const FRAME_OVERHEAD: usize = 4 + 8;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LogEntry {
     Evict(i64),
@@ -39,40 +37,48 @@ fn status_from_code(code: u8) -> Option<StatusClass> {
     }
 }
 
+fn frame_into(out: &mut Vec<u8>, write_payload: impl FnOnce(&mut Vec<u8>)) {
+    let start = out.len();
+    out.extend_from_slice(&[0; 4]);
+    write_payload(out);
+    let len = (out.len() - start - 4) as u32;
+    if let Some(prefix) = out.get_mut(start..start + 4) {
+        prefix.copy_from_slice(&len.to_le_bytes());
+    }
+    let crc = crc_fast::crc64_nvme(out.get(start..).unwrap_or_default());
+    out.extend_from_slice(&crc.to_le_bytes());
+}
+
+fn record_frame_into(receipt: &RetryReceipt, out: &mut Vec<u8>) {
+    frame_into(out, |payload| {
+        payload.push(RETRY_LOG_TAG_RECORD);
+        payload.extend_from_slice(&receipt.tenant_id.uuid().as_u128().to_le_bytes());
+        for word in [
+            receipt.delivery_identity.0,
+            receipt.delivery_identity.1,
+            receipt.dedupe.0,
+            receipt.dedupe.1,
+            receipt.commit.epoch,
+            receipt.commit.sequence,
+            receipt.frame_offset,
+        ] {
+            payload.extend_from_slice(&word.to_le_bytes());
+        }
+        payload.extend_from_slice(&receipt.expiry_physical_nanos.to_le_bytes());
+        payload.extend_from_slice(&receipt.shard.0.to_le_bytes());
+        payload.push(status_code(receipt.status_class));
+    });
+}
+
 impl LogEntry {
-    fn encode(&self) -> Vec<u8> {
-        let mut payload = Vec::with_capacity(96);
+    fn encode_into(&self, out: &mut Vec<u8>) {
         match self {
-            Self::Evict(now) => {
+            Self::Evict(now) => frame_into(out, |payload| {
                 payload.push(RETRY_LOG_TAG_EVICT);
                 payload.extend_from_slice(&now.to_le_bytes());
-            }
-            Self::Record(receipt) => {
-                payload.push(RETRY_LOG_TAG_RECORD);
-                payload.extend_from_slice(&receipt.tenant_id.uuid().as_u128().to_le_bytes());
-                for word in [
-                    receipt.delivery_identity.0,
-                    receipt.delivery_identity.1,
-                    receipt.dedupe.0,
-                    receipt.dedupe.1,
-                    receipt.commit.epoch,
-                    receipt.commit.sequence,
-                    receipt.frame_offset,
-                ] {
-                    payload.extend_from_slice(&word.to_le_bytes());
-                }
-                payload.extend_from_slice(&receipt.expiry_physical_nanos.to_le_bytes());
-                payload.extend_from_slice(&receipt.shard.0.to_le_bytes());
-                payload.push(status_code(receipt.status_class));
-            }
+            }),
+            Self::Record(receipt) => record_frame_into(receipt, out),
         }
-        let len = payload.len() as u32;
-        let mut frame = Vec::with_capacity(payload.len() + FRAME_OVERHEAD);
-        frame.extend_from_slice(&len.to_le_bytes());
-        frame.extend_from_slice(&payload);
-        let crc = crc_fast::crc64_nvme(&frame);
-        frame.extend_from_slice(&crc.to_le_bytes());
-        frame
     }
 
     fn decode(payload: &[u8]) -> Option<Self> {
@@ -181,6 +187,7 @@ pub struct FileSafeRetryStore {
     index: SimSafeRetryStore,
     log_entries: u64,
     log_len: u64,
+    scratch: Vec<u8>,
     sync_each_record: bool,
 }
 
@@ -215,6 +222,7 @@ impl FileSafeRetryStore {
             index: SimSafeRetryStore::new(),
             log_entries: 0,
             log_len: RETRY_LOG_HEADER_LEN,
+            scratch: Vec::new(),
             sync_each_record: true,
         };
         let expected = header();
@@ -293,7 +301,7 @@ impl FileSafeRetryStore {
         let mut bytes = header().to_vec();
         let mut entries = 0;
         for receipt in self.index.receipts() {
-            bytes.extend_from_slice(&LogEntry::Record(receipt.clone()).encode());
+            record_frame_into(receipt, &mut bytes);
             entries += 1;
         }
         let mut staged = File::create(&staged_path).map_err(io_error("retry log compact"))?;
@@ -320,7 +328,15 @@ impl FileSafeRetryStore {
     }
 
     fn append(&mut self, entry: &LogEntry) {
-        if let Err(failure) = self.try_append(entry) {
+        let mut frames = std::mem::take(&mut self.scratch);
+        frames.clear();
+        entry.encode_into(&mut frames);
+        self.append_frames(&frames, 1);
+        self.scratch = frames;
+    }
+
+    fn append_frames(&mut self, frames: &[u8], entries: u64) {
+        if let Err(failure) = self.try_append(frames, entries) {
             let _ = self.file.set_len(self.log_len);
             self.failure.get_or_insert(failure);
             return;
@@ -335,17 +351,16 @@ impl FileSafeRetryStore {
         }
     }
 
-    fn try_append(&mut self, entry: &LogEntry) -> Result<(), StorageError> {
-        let frame = entry.encode();
+    fn try_append(&mut self, frames: &[u8], entries: u64) -> Result<(), StorageError> {
         self.file
             .seek(SeekFrom::Start(self.log_len))
             .map_err(io_error("retry log seek"))?;
-        self.file.write_all(&frame).map_err(io_error("retry log append"))?;
+        self.file.write_all(frames).map_err(io_error("retry log append"))?;
         if self.sync_each_record {
             self.file.sync_data().map_err(io_error("retry log sync"))?;
         }
-        self.log_len += frame.len() as u64;
-        self.log_entries += 1;
+        self.log_len += frames.len() as u64;
+        self.log_entries += entries;
         Ok(())
     }
 }
@@ -355,6 +370,20 @@ impl SafeRetryStore for FileSafeRetryStore {
         let entry = LogEntry::Record(receipt.clone());
         self.index.record(receipt);
         self.append(&entry);
+    }
+
+    fn record_batch(&mut self, receipts: &[RetryReceipt]) {
+        if receipts.is_empty() {
+            return;
+        }
+        let mut frames = std::mem::take(&mut self.scratch);
+        frames.clear();
+        for receipt in receipts {
+            record_frame_into(receipt, &mut frames);
+            self.index.record(receipt.clone());
+        }
+        self.append_frames(&frames, receipts.len() as u64);
+        self.scratch = frames;
     }
 
     fn evict_expired(&mut self, now_physical_nanos: i64) {
@@ -384,6 +413,15 @@ impl SafeRetryStore for FileSafeRetryStore {
 #[cfg(test)]
 #[path = "test/disk.rs"]
 mod tests;
+
+#[cfg(test)]
+impl LogEntry {
+    fn encode(&self) -> Vec<u8> {
+        let mut frame = Vec::new();
+        self.encode_into(&mut frame);
+        frame
+    }
+}
 
 #[cfg(test)]
 impl FileSafeRetryStore {

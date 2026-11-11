@@ -248,3 +248,47 @@ fn behaves_like_the_simulation_store() {
         assert_eq!(disk.lookup(row.tenant_id, row.delivery_identity).as_ref(), Some(row));
     }
 }
+
+#[test]
+fn a_batch_of_receipts_writes_the_same_log_as_recording_each_and_survives_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut moved = receipt(9, 1, 100, 1_000, StatusClass::Acknowledged);
+    moved.frame_offset = 99;
+    let rows = vec![
+        receipt(9, 1, 100, 1_000, StatusClass::Acknowledged),
+        receipt(9, 2, 200, 1_000, StatusClass::Indeterminate),
+        receipt(8, 1, 100, 2_000, StatusClass::Rejected),
+        // Overwrites the first row: the later one wins, in a batch as one by one.
+        moved.clone(),
+    ];
+    let mut single = FileSafeRetryStore::open(dir.path().join("single")).unwrap();
+    for row in &rows {
+        single.record(row.clone());
+    }
+    let mut batched = FileSafeRetryStore::open(dir.path().join("batched")).unwrap();
+    batched.record_batch(&[]);
+    assert_eq!(batched.log_entries(), 0);
+    batched.record_batch(&rows);
+    assert!(batched.take_failure().is_none());
+    assert_eq!(batched.log_entries(), rows.len() as u64);
+    assert_eq!(batched.len(), 3);
+    assert_eq!(
+        std::fs::read(batched.log_path()).unwrap(),
+        std::fs::read(single.log_path()).unwrap()
+    );
+    // A later single record lands right after the batch.
+    let after = receipt(7, 5, 500, 3_000, StatusClass::Acknowledged);
+    batched.record(after.clone());
+    drop(batched);
+
+    let reopened = FileSafeRetryStore::open(dir.path().join("batched")).unwrap();
+    assert_eq!(reopened.len(), 4);
+    assert_eq!(reopened.log_entries(), 5);
+    assert_eq!(reopened.lookup(moved.tenant_id, moved.delivery_identity), Some(moved));
+    for row in rows.iter().skip(1).take(2).chain([&after]) {
+        assert_eq!(
+            reopened.lookup(row.tenant_id, row.delivery_identity).as_ref(),
+            Some(row)
+        );
+    }
+}

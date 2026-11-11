@@ -936,3 +936,48 @@ fn snapshot_epoch_replacement() {
         builds[3], publishes[3]
     );
 }
+
+#[test]
+fn a_published_compaction_that_rebases_onto_a_newer_deletion_of_an_input_row_is_refused() {
+    let objects = SimObjectStore::new();
+    let first = stored_input(&objects, 1, 2, 1..=2);
+    let second = stored_input(&objects, 3, 4, 3..=4);
+    let mut inner = SimulatedPublishedSet::new();
+    publish_directly(
+        &mut inner,
+        ManifestGeneration {
+            files: vec![first.clone(), second.clone()],
+            generation: 1,
+            ..Default::default()
+        },
+    );
+    let target = first.file_id;
+    let mut set = crate::writer::merge::tests::RivalSet {
+        inner,
+        rival: Some(Box::new(move |next| {
+            let mut deleted = crate::deletes::DeletionVector::new();
+            deleted.mark_deleted(0);
+            assert!(next.publish_deletions(target, &deleted, None).unwrap().is_some());
+        })),
+    };
+    let mut notices = NoopPeerNotices::default();
+
+    let result = OePublisher::new().publish_compaction(
+        merged_file(),
+        &build_config(),
+        &[first.file_id, second.file_id],
+        &mut set,
+        &objects,
+        &mut notices,
+        &FixedClock::at(START_NANOS),
+    );
+
+    assert!(matches!(result, Err(PublishFailure::Verification(_))));
+    let (head_id, head) = set.head().unwrap();
+    assert_eq!(head_id, 2, "only the rival's deletion was published");
+    let deleted_input = head.files.iter().find(|entry| entry.file_id == first.file_id).unwrap();
+    assert_eq!(deleted_input.part_state, PartState::Active);
+    assert!(deleted_input.load_deletion_vector().unwrap().unwrap().is_deleted(0));
+    assert_eq!(head.files.len(), 2, "the stale output never became a file");
+    assert!(notices.published.is_empty());
+}

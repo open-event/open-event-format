@@ -151,6 +151,7 @@ fn column_block(rows: &[BuildRow], column_id: u32) -> Result<SourceFormBlock, Fo
         return Ok((column_id, presence, ColumnData::Strings(values)));
     }
     if column_id == column_ids::CONNECTOR_DELIVERY_HASH {
+        let mut scratch = String::new();
         for (index, row) in rows.iter().enumerate() {
             let Some(lineage) = row.delivery.as_ref().filter(|_| carries(row, column_id)) else {
                 continue;
@@ -158,11 +159,10 @@ fn column_block(rows: &[BuildRow], column_id: u32) -> Result<SourceFormBlock, Fo
             if let Some(byte) = presence.get_mut(index / 8) {
                 *byte |= 1 << (index % 8);
             }
-            let hex = format!(
-                "{:016x}{:016x}",
-                lineage.connector_delivery_hash_high, lineage.connector_delivery_hash_low
-            );
-            values.push(Some(&hex));
+            scratch.clear();
+            hex_lower_into(&lineage.connector_delivery_hash_high.to_be_bytes(), &mut scratch);
+            hex_lower_into(&lineage.connector_delivery_hash_low.to_be_bytes(), &mut scratch);
+            values.push(Some(&scratch));
         }
         return Ok((column_id, presence, ColumnData::Strings(values)));
     }

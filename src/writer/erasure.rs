@@ -1,6 +1,7 @@
 use super::build::{BuildLifecycle, BuildPayload, OeBuildConfig, build_oe_file};
-use super::merge::{open_stored_input, read_build_rows};
+use super::merge::{open_stored_input, read_build_rows_redacted};
 use super::publish::{OePublisher, PeerNotices, PublishFailure};
+use super::retire::MergedInput;
 use super::subject_seal::seal_subject_rows;
 use crate::clock::Clock;
 use crate::deletes::SubjectId;
@@ -66,7 +67,21 @@ pub fn rekey_backlog_file(
             "a re-keyed file is not an active file of this tenant",
         )))?;
     let file = open_stored_input(file_id, &entry.file_seal, config, objects).map_err(RekeyError::Publish)?;
-    let mut rows = read_build_rows(&file).map_err(|error| RekeyError::Publish(PublishFailure::Format(error)))?;
+    let format = |error| RekeyError::Publish(PublishFailure::Format(error));
+    let input = MergedInput::read(entry, file.header());
+    let deletes = entry.load_deletion_vector_from(objects).map_err(format)?;
+    let redactions = entry.load_field_deletion_vectors().map_err(format)?;
+    let mut rows: Vec<_> = read_build_rows_redacted(&file, &redactions)
+        .map_err(format)?
+        .into_iter()
+        .enumerate()
+        .filter(|(ordinal, _)| {
+            !deletes
+                .as_ref()
+                .is_some_and(|vector| vector.is_deleted(*ordinal as u64))
+        })
+        .map(|(_, row)| row)
+        .collect();
     for row in &mut rows {
         let event_id = row.envelope.event_id;
         let Some(subject) = resolved.get(&event_id) else {
@@ -96,7 +111,7 @@ pub fn rekey_backlog_file(
     };
     let built = build_oe_file(rows, &config).map_err(|error| RekeyError::Publish(PublishFailure::Format(error)))?;
     let published = publisher
-        .publish_compaction(built, &config, &[file_id], published, objects, notices, clock)
+        .publish_merged(built, &config, &[input], published, objects, notices, clock)
         .map_err(RekeyError::Publish)?;
     for event_id in report.sealed.iter().chain(&report.dropped) {
         backlog.mark_rekeyed(*event_id).map_err(RekeyError::Backlog)?;
