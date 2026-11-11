@@ -513,24 +513,29 @@ fn source_shared_alphabets(footer: &Footer) -> Option<BTreeMap<u32, Vec<String>>
     Some(alphabets)
 }
 
-fn union_alphabet<'a>(granule_values: Vec<Box<dyn Iterator<Item = &'a str> + 'a>>) -> Option<Vec<String>> {
+fn union_alphabet<'a>(granule_values: Vec<Box<dyn Iterator<Item = &'a str> + Send + 'a>>) -> Option<Vec<String>> {
     fn code_bits(distinct: usize) -> u64 {
         u64::from(usize::BITS - distinct.saturating_sub(1).leading_zeros())
     }
     let mut union: ahash::AHashSet<&str> = ahash::AHashSet::new();
     let mut local_bits = 0u64;
     let mut rows = 0u64;
-    for values in granule_values {
-        let mut local: ahash::AHashSet<&str> = ahash::AHashSet::new();
-        let mut present = 0u64;
-        let mut text_bytes = 0u64;
-        for value in values {
-            present += 1;
-            text_bytes += value.len() as u64;
-            if local.insert(value) {
-                union.insert(value);
+    let locals: Vec<(ahash::AHashSet<&str>, u64, u64)> = granule_values
+        .into_par_iter()
+        .map(|values| {
+            let mut local: ahash::AHashSet<&str> = ahash::AHashSet::new();
+            let mut present = 0u64;
+            let mut text_bytes = 0u64;
+            for value in values {
+                present += 1;
+                text_bytes += value.len() as u64;
+                local.insert(value);
             }
-        }
+            (local, present, text_bytes)
+        })
+        .collect();
+    for (local, present, text_bytes) in locals {
+        union.extend(local.iter().copied());
         if union.len() > UNION_SHARED_DICTIONARY_MAX_VALUES {
             return None;
         }
@@ -622,11 +627,12 @@ fn plan_sparse_update(
         return None;
     }
     let mut build: Vec<Option<HashSet<u32>>> = vec![None; granule_count];
+    let mut granule_positions: HashMap<u32, usize> = HashMap::with_capacity(granule_count);
+    for (index, granule) in footer.granules.iter().enumerate() {
+        granule_positions.entry(granule.granule_id).or_insert(index);
+    }
     for (granule_id, changed) in &reuse.changed_columns_by_granule {
-        let index = footer
-            .granules
-            .iter()
-            .position(|granule| granule.granule_id == *granule_id)?;
+        let index = *granule_positions.get(granule_id)?;
         let head = index - index % REPLAY_SEGMENT_GRANULES;
         for target in [index, head] {
             if let Some(slot) = build.get_mut(target) {
@@ -637,20 +643,93 @@ fn plan_sparse_update(
     Some(SparsePlan { build, rows_cover_file })
 }
 
-fn source_extent(source: &BuiltOe, granule_id: u32, offset: u64, len: u64) -> Option<&[u8]> {
-    let granule = source
-        .footer
-        .granules
-        .iter()
-        .find(|granule| granule.granule_id == granule_id)?;
-    let stripe = source
-        .footer
-        .stripes
-        .iter()
-        .find(|stripe| stripe.stripe_id == granule.stripe_id)?;
-    let start = usize::try_from(stripe.file_offset.checked_add(offset)?).ok()?;
-    let end = start.checked_add(usize::try_from(len).ok()?)?;
-    source.bytes.get(start..end)
+struct SourceIndex<'a> {
+    freetext_row_offsets: HashMap<(u32, u32), &'a FreetextRowOffsets>,
+    granules: HashMap<u32, &'a GranuleEntry>,
+    marks: HashMap<(u32, u32), &'a ColumnMark>,
+    page_stats: HashMap<(u32, u32), &'a PageStats>,
+    pages: HashMap<(u32, u32), Vec<&'a PageDirectoryEntry>>,
+    payload_granules: HashMap<u32, &'a PayloadGranule>,
+    source: &'a BuiltOe,
+    stripe_offsets: HashMap<u32, u64>,
+    text_token_indexes: HashMap<(u32, u32), Vec<&'a TextTokenEntry>>,
+    text_token_offsets: HashMap<(u32, u32), Vec<&'a TextTokenOffsetsEntry>>,
+}
+
+impl<'a> SourceIndex<'a> {
+    fn new(source: &'a BuiltOe) -> Self {
+        let footer = &source.footer;
+        let mut granules = HashMap::with_capacity(footer.granules.len());
+        for granule in &footer.granules {
+            granules.entry(granule.granule_id).or_insert(granule);
+        }
+        let mut stripe_offsets = HashMap::with_capacity(footer.stripes.len());
+        for stripe in &footer.stripes {
+            stripe_offsets.entry(stripe.stripe_id).or_insert(stripe.file_offset);
+        }
+        let mut marks: HashMap<(u32, u32), &ColumnMark> = HashMap::with_capacity(footer.marks.len());
+        for mark in footer.marks.iter().filter(|mark| mark.projection_id == 0) {
+            marks.entry((mark.column_id, mark.granule_id)).or_insert(mark);
+        }
+        let mut page_stats = HashMap::with_capacity(footer.page_stats.len());
+        for stats in &footer.page_stats {
+            page_stats.entry((stats.column_id, stats.granule_id)).or_insert(stats);
+        }
+        let mut pages: HashMap<(u32, u32), Vec<&PageDirectoryEntry>> = HashMap::default();
+        for page in footer.page_directory.iter().filter(|page| page.projection_id == 0) {
+            let key = (page.column_id, page.granule_id);
+            if marks.get(&key).is_some_and(|mark| mark.page_count > 1) {
+                pages.entry(key).or_default().push(page);
+            }
+        }
+        for entries in pages.values_mut() {
+            entries.sort_by_key(|page| page.page_index);
+        }
+        let mut payload_granules = HashMap::with_capacity(footer.payload_granules.len());
+        for payload in &footer.payload_granules {
+            payload_granules.entry(payload.granule_id).or_insert(payload);
+        }
+        let mut freetext_row_offsets = HashMap::with_capacity(footer.freetext_row_offsets.len());
+        for index in &footer.freetext_row_offsets {
+            freetext_row_offsets
+                .entry((index.column_id, index.granule_id))
+                .or_insert(index);
+        }
+        let mut text_token_indexes: HashMap<(u32, u32), Vec<&TextTokenEntry>> = HashMap::default();
+        for token in &footer.text_token_indexes {
+            text_token_indexes
+                .entry((token.column_id, token.granule_id))
+                .or_default()
+                .push(token);
+        }
+        let mut text_token_offsets: HashMap<(u32, u32), Vec<&TextTokenOffsetsEntry>> = HashMap::default();
+        for token in &footer.text_token_offsets {
+            text_token_offsets
+                .entry((token.column_id, token.granule_id))
+                .or_default()
+                .push(token);
+        }
+        Self {
+            freetext_row_offsets,
+            granules,
+            marks,
+            page_stats,
+            pages,
+            payload_granules,
+            source,
+            stripe_offsets,
+            text_token_indexes,
+            text_token_offsets,
+        }
+    }
+
+    fn extent(&self, granule_id: u32, offset: u64, len: u64) -> Option<&'a [u8]> {
+        let granule = self.granules.get(&granule_id)?;
+        let stripe_offset = *self.stripe_offsets.get(&granule.stripe_id)?;
+        let start = usize::try_from(stripe_offset.checked_add(offset)?).ok()?;
+        let end = start.checked_add(usize::try_from(len).ok()?)?;
+        self.source.bytes.get(start..end)
+    }
 }
 
 fn variant_value_bytes(value: &VariantValue) -> usize {
@@ -696,6 +775,8 @@ const PADDED_REGIONS_PER_GRANULE: usize = 4;
 const RESIDUAL_ROW_FRAMING_BYTES: usize = 4;
 
 const MIN_METADATA_GRANULES_PER_JOB: usize = 4;
+
+const SHREDDED_COLUMNS_MAX: usize = (column_ids::FREETEXT_BASE - column_ids::SHREDDED_BASE) as usize;
 
 #[derive(Default)]
 struct FieldIdentityCatalog {
@@ -1174,6 +1255,7 @@ const FIELD_STAYS_RESIDUAL: u32 = u32::MAX;
 
 struct ShapeRoutes {
     by_shape: Vec<Box<[u32]>>,
+    residual_fields_by_shape: Vec<usize>,
 }
 
 impl ShapeRoutes {
@@ -1181,6 +1263,13 @@ impl ShapeRoutes {
         self.by_shape
             .get(shape_id as usize)
             .map(Box::as_ref)
+            .unwrap_or_default()
+    }
+
+    fn residual_fields(&self, shape_id: u32) -> usize {
+        self.residual_fields_by_shape
+            .get(shape_id as usize)
+            .copied()
             .unwrap_or_default()
     }
 }
@@ -1201,6 +1290,20 @@ fn build_shape_routes(identities: &FieldIdentityCatalog, routes: &[FieldRoute]) 
                         }
                     })
                     .collect()
+            })
+            .collect(),
+        residual_fields_by_shape: identities
+            .shapes
+            .iter()
+            .map(|shape| {
+                shape
+                    .iter()
+                    .filter(|&&field_id| {
+                        routes
+                            .get(field_id as usize)
+                            .is_none_or(|route| route.shred_index.is_none() && route.freetext_index.is_none())
+                    })
+                    .count()
             })
             .collect(),
     }
@@ -1638,14 +1741,15 @@ fn finish_footer_metadata(batches: Vec<FooterMetadataBatch>, row_count: u64) -> 
     }
 }
 
-fn borrow_footer_metadata(source: &BuiltOe) -> Result<ScheduledFooterMetadata, FormatError> {
+fn borrow_footer_metadata(index: &SourceIndex<'_>) -> Result<ScheduledFooterMetadata, FormatError> {
+    let source = index.source;
     let mut entity_hash_filters = BTreeMap::new();
     for entry in &source.footer.entity_hash_filters {
-        let filter = source_extent(source, entry.granule_id, entry.index_offset, entry.index_len).ok_or(
-            FormatError::Structural {
+        let filter = index
+            .extent(entry.granule_id, entry.index_offset, entry.index_len)
+            .ok_or(FormatError::Structural {
                 rule: "a source identity-hash filter must lie inside its stripe",
-            },
-        )?;
+            })?;
         entity_hash_filters.insert(entry.granule_id, filter.to_vec());
     }
     Ok(ScheduledFooterMetadata {
@@ -1788,7 +1892,27 @@ fn mark_payload_change(
         if let Some(entry) = freetext {
             changed.insert(entry.column_id);
         }
-        residual_changed |= shredded.is_none() && freetext.is_none();
+        let shred_kind = shredded.and_then(|entry| {
+            source
+                .footer
+                .columns
+                .iter()
+                .find(|column| column.column_id == entry.column_id)
+                .map(|column| column.kind)
+        });
+        let moves_out = |value: &VariantValue| {
+            matches!(
+                (shred_kind, value),
+                (Some(ColumnKind::I64), VariantValue::Int(_))
+                    | (Some(ColumnKind::F64), VariantValue::Double(_))
+                    | (Some(ColumnKind::String), VariantValue::String(_))
+            ) || (freetext.is_some() && matches!(value, VariantValue::String(_)))
+        };
+        residual_changed |= shred_kind == Some(ColumnKind::Decimal)
+            || [before_value, after_value]
+                .into_iter()
+                .flatten()
+                .any(|value| !moves_out(value));
     }
     if !config.analytical_columns.is_empty() {
         changed.extend(config.analytical_columns.iter().map(|column| column.column_id));
@@ -1817,6 +1941,7 @@ fn plan_update_reuse_from<'a, 'b>(
         || source.header.row_count != before_len as u64
         || before_len != after_len
         || source.footer.format_version != (1, 0)
+        || (source.header.profile == Profile::Inbox) != (config.profile == Profile::Inbox)
     {
         return None;
     }
@@ -1841,7 +1966,8 @@ fn plan_update_reuse_from<'a, 'b>(
             && before.provenance == after.provenance
             && before.relationships == after.relationships
             && before.external_id == after.external_id
-            && before.raw_payload == after.raw_payload;
+            && before.raw_payload == after.raw_payload
+            && before.delivery == after.delivery;
         if !only_payload_and_dedupe {
             mark_all_columns(source, changed);
             changed_payload_granules.insert(granule_id);
@@ -1881,8 +2007,8 @@ fn plan_update_reuse_from<'a, 'b>(
 }
 
 fn with_sparse_plan<'a>(mut reuse: UpdateReuse<'a>, after: &[BuildRow], config: &OeBuildConfig) -> UpdateReuse<'a> {
-    let carries_provenance = after.iter().any(|row| row.provenance.is_some());
-    let carries_relationships = after.iter().any(|row| row.relationships.is_some());
+    let carries_provenance = after.par_iter().any(|row| row.provenance.is_some());
+    let carries_relationships = after.par_iter().any(|row| row.relationships.is_some());
     reuse.sparse = plan_sparse_update(&reuse, config, carries_provenance, carries_relationships, true);
     reuse
 }
@@ -1954,7 +2080,7 @@ fn plan_source_update<'a>(
         });
     };
 
-    let file = OeFile::open(source.bytes.clone(), Some(&source.file_seal))?;
+    let file = OeFile::open_lazy(source.bytes.clone(), Some(&source.file_seal), None)?;
     let u64_column = |column_id: u32, granule_id: u32| -> Result<Vec<u64>, FormatError> {
         match file.read_column(column_id, granule_id)?.data {
             ColumnData::U64(values) => Ok(values),
@@ -2052,6 +2178,12 @@ fn plan_source_update<'a>(
     Ok((rows, reuse))
 }
 
+fn order_update_rows(rows: &mut [BuildRow], config: &OeBuildConfig) {
+    if config.profile == Profile::Inbox {
+        rows.par_sort_unstable_by_key(|row| RowOrder::Entity.key(row));
+    }
+}
+
 fn plan_update_reuse<'a>(
     source: &'a BuiltOe,
     before: &[BuildRow],
@@ -2091,8 +2223,10 @@ pub fn update_oe_file_with_executor<R: BuildInput>(
     encode: &dyn EncodeExecutor,
 ) -> Result<BuiltOe, FormatError> {
     refuse_audit_rewrite(source.header.profile, config.profile)?;
-    let before = R::into_build_rows(before.to_vec());
-    let after = R::into_build_rows(after);
+    let mut before = R::into_build_rows(before.to_vec());
+    let mut after = R::into_build_rows(after);
+    order_update_rows(&mut before, config);
+    order_update_rows(&mut after, config);
     let reuse = plan_update_reuse(source, &before, &after, config).map(|reuse| with_sparse_plan(reuse, &after, config));
     build_oe_file_sealed(after, config, encode, None, None, reuse.as_ref())
 }
@@ -2105,7 +2239,8 @@ pub fn update_oe_file_from_changes_with_executor<R: BuildInput>(
     encode: &dyn EncodeExecutor,
 ) -> Result<BuiltOe, FormatError> {
     refuse_audit_rewrite(source.header.profile, config.profile)?;
-    let after = R::into_build_rows(after);
+    let mut after = R::into_build_rows(after);
+    order_update_rows(&mut after, config);
     let reuse = plan_change_set_reuse(source, &after, &R::build_changes(changes), config);
     build_oe_file_sealed(after, config, encode, None, None, reuse.as_ref())
 }
@@ -2129,8 +2264,10 @@ pub fn update_oe_file_profiled_with_executor<R: BuildInput>(
     encode: &dyn EncodeExecutor,
 ) -> Result<(BuiltOe, BuildProfile), FormatError> {
     refuse_audit_rewrite(source.header.profile, config.profile)?;
-    let before = R::into_build_rows(before.to_vec());
-    let after = R::into_build_rows(after);
+    let mut before = R::into_build_rows(before.to_vec());
+    let mut after = R::into_build_rows(after);
+    order_update_rows(&mut before, config);
+    order_update_rows(&mut after, config);
     let reuse = plan_update_reuse(source, &before, &after, config).map(|reuse| with_sparse_plan(reuse, &after, config));
     let mut profile = BuildProfile::default();
     let built = build_oe_file_sealed(after, config, encode, None, Some(&mut profile), reuse.as_ref())?;
@@ -2145,7 +2282,8 @@ pub fn update_oe_file_from_changes_profiled_with_executor<R: BuildInput>(
     encode: &dyn EncodeExecutor,
 ) -> Result<(BuiltOe, BuildProfile), FormatError> {
     refuse_audit_rewrite(source.header.profile, config.profile)?;
-    let after = R::into_build_rows(after);
+    let mut after = R::into_build_rows(after);
+    order_update_rows(&mut after, config);
     let reuse = plan_change_set_reuse(source, &after, &R::build_changes(changes), config);
     let mut profile = BuildProfile::default();
     let built = build_oe_file_sealed(after, config, encode, None, Some(&mut profile), reuse.as_ref())?;
@@ -2400,6 +2538,7 @@ fn build_oe_file_sealed_in_order(
     let sparse_reuse = update_reuse.filter(|reuse| reuse.sparse.is_some());
     let sparse: Option<&SparsePlan> = sparse_reuse.and_then(|reuse| reuse.sparse.as_ref());
     let source = sparse_reuse.map(|reuse| reuse.source);
+    let source_index = update_reuse.map(|reuse| SourceIndex::new(reuse.source));
     let (row_count, first_key, last_key) = match source {
         Some(source) => {
             let (Some(first), Some(last)) = (source.footer.granules.first(), source.footer.granules.last()) else {
@@ -2567,6 +2706,13 @@ fn build_oe_file_sealed_in_order(
         });
     }
     validate_promotion_plan(&config.promotion)?;
+    if config.promotion.columns.len() > (column_ids::SHREDDED_BASE - column_ids::PROMOTED_BASE) as usize
+        || config.freetext.fields.len() > (column_ids::CONTEXT_BASE - column_ids::FREETEXT_BASE) as usize
+    {
+        return Err(FormatError::Structural {
+            rule: "a promotion plan or free-text declaration holds more columns than its column id range",
+        });
+    }
 
     if config
         .analytical_columns
@@ -2694,8 +2840,10 @@ fn build_oe_file_sealed_in_order(
             .iter()
             .map(|name| name.to_string())
             .collect();
-        let candidates = statistics.shred_candidates_by_id(&field_names, &excluded_field_ids);
-        let sparse = statistics.sparse_candidates_by_id(&field_names, &excluded_field_ids);
+        let mut candidates = statistics.shred_candidates_by_id(&field_names, &excluded_field_ids);
+        let mut sparse = statistics.sparse_candidates_by_id(&field_names, &excluded_field_ids);
+        candidates.truncate(SHREDDED_COLUMNS_MAX);
+        sparse.truncate(SHREDDED_COLUMNS_MAX - candidates.len());
         let shred_plan: Vec<ShredEntry> = candidates
             .iter()
             .chain(sparse.iter())
@@ -2777,7 +2925,7 @@ fn build_oe_file_sealed_in_order(
     };
     let carries_provenance = match source {
         Some(_) => source_has_column(column_ids::AUTHOR_PUBKEY),
-        None => rows.iter().any(|row| row.provenance.is_some()),
+        None => rows.par_iter().any(|row| row.provenance.is_some()),
     };
     if carries_provenance {
         for spec in PROVENANCE_COLUMNS {
@@ -2792,7 +2940,7 @@ fn build_oe_file_sealed_in_order(
     }
     let carries_relationships = match source {
         Some(_) => source_has_column(column_ids::PARENT_REF),
-        None => rows.iter().any(|row| row.relationships.is_some()),
+        None => rows.par_iter().any(|row| row.relationships.is_some()),
     };
     if carries_relationships {
         for spec in RELATIONSHIP_COLUMNS {
@@ -2854,16 +3002,29 @@ fn build_oe_file_sealed_in_order(
     let mut granule_row_ranges: Vec<(usize, usize)> = sparse_ranges.unwrap_or_default();
     let mut start = 0usize;
     let mut payload_bytes = 0usize;
-    let mut estimator = PayloadByteEstimator::default();
     let byte_limit_enabled = config.targets.index_granularity_bytes != usize::MAX;
+    let payload_estimates: Vec<Vec<usize>> = if byte_limit_enabled && sparse.is_none() {
+        rows.par_chunks(NORMALIZE_BATCH_ROWS)
+            .zip(payloads.rows.par_chunks(NORMALIZE_BATCH_ROWS))
+            .map(|(rows, entries)| {
+                let mut estimator = PayloadByteEstimator::default();
+                rows.iter()
+                    .zip(entries)
+                    .map(|(row, &entry)| estimator.estimate(&payloads, entry, row))
+                    .collect()
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut payload_estimates = payload_estimates.iter().flatten().copied();
     for (index, row) in rows
         .iter()
         .enumerate()
         .take(if sparse.is_some() { 0 } else { rows.len() })
     {
         if byte_limit_enabled {
-            let estimate = estimator.estimate(&payloads, payloads.payload(index), row);
-            payload_bytes = payload_bytes.saturating_add(estimate);
+            payload_bytes = payload_bytes.saturating_add(payload_estimates.next().unwrap_or_default());
         }
         let rows_in_granule = index - start + 1;
         let epoch_boundary = rows.get(index + 1).is_some_and(|next| next.epoch != row.epoch);
@@ -3067,18 +3228,19 @@ fn build_oe_file_sealed_in_order(
                 }
                 continue;
             }
-            let Some(source) = source.filter(|_| config.freetext_row_offset_index) else {
+            let Some(source_index) = source_index
+                .as_ref()
+                .filter(|_| source.is_some() && config.freetext_row_offset_index)
+            else {
                 continue;
             };
-            let (bytes, offsets) = source
-                .footer
+            let (bytes, offsets) = source_index
                 .freetext_row_offsets
-                .iter()
-                .find(|index| index.column_id == entry.column_id && index.granule_id == granule.entry.granule_id)
+                .get(&(entry.column_id, granule.entry.granule_id))
                 .and_then(|index| {
                     Some((
-                        source_extent(source, index.granule_id, index.bytes_offset, index.bytes_len)?,
-                        source_extent(source, index.granule_id, index.offsets_offset, index.offsets_len)?,
+                        source_index.extent(index.granule_id, index.bytes_offset, index.bytes_len)?,
+                        source_index.extent(index.granule_id, index.offsets_offset, index.offsets_len)?,
                     ))
                 })
                 .ok_or(FormatError::Structural {
@@ -3441,20 +3603,18 @@ fn build_oe_file_sealed_in_order(
     }
 
     fn reuse_block_piece<'a>(
-        source: &'a BuiltOe,
+        index: &SourceIndex<'a>,
         entry: &GranuleEntry,
         column_id: u32,
         stripe_id: u32,
         page_size_rows: usize,
     ) -> Option<BlockProduct<'a>> {
-        let source_granule = source.footer.granules.iter().find(|granule| {
-            granule.granule_id == entry.granule_id
-                && granule.first_row_ordinal == entry.first_row_ordinal
-                && granule.row_count == entry.row_count
+        let source = index.source;
+        let key = (column_id, entry.granule_id);
+        let source_granule = index.granules.get(&entry.granule_id).filter(|granule| {
+            granule.first_row_ordinal == entry.first_row_ordinal && granule.row_count == entry.row_count
         })?;
-        let mark = source.footer.marks.iter().find(|mark| {
-            mark.projection_id == 0 && mark.column_id == column_id && mark.granule_id == entry.granule_id
-        })?;
+        let mark = *index.marks.get(&key)?;
         let expected_pages = if page_size_rows > 0 && entry.row_count as usize > page_size_rows {
             (entry.row_count as usize).div_ceil(page_size_rows) as u32
         } else {
@@ -3463,11 +3623,7 @@ fn build_oe_file_sealed_in_order(
         if mark.row_count != entry.row_count || mark.page_count != expected_pages {
             return None;
         }
-        let stats = source
-            .footer
-            .page_stats
-            .iter()
-            .find(|stats| stats.column_id == column_id && stats.granule_id == entry.granule_id)?;
+        let stats = index.page_stats.get(&key)?;
         let stats = BlockStats {
             max_f64: stats.max_f64,
             max_i128: stats.max_i128,
@@ -3476,12 +3632,8 @@ fn build_oe_file_sealed_in_order(
             null_count: stats.null_count,
             row_count: stats.row_count,
         };
-        let source_stripe = source
-            .footer
-            .stripes
-            .iter()
-            .find(|stripe| stripe.stripe_id == source_granule.stripe_id)?;
-        let start = usize::try_from(source_stripe.file_offset.checked_add(mark.compressed_offset)?).ok()?;
+        let stripe_offset = *index.stripe_offsets.get(&source_granule.stripe_id)?;
+        let start = usize::try_from(stripe_offset.checked_add(mark.compressed_offset)?).ok()?;
         let end = start.checked_add(usize::try_from(mark.compressed_size).ok()?)?;
         let stored = source.bytes.get(start..end)?;
         let (body, prefix) = if mark.compressed_size == 0 {
@@ -3492,21 +3644,13 @@ fn build_oe_file_sealed_in_order(
         } else {
             (Cow::Borrowed(stored), Cow::Borrowed(&[][..]))
         };
-        let mut page_entries: Vec<_> = source
-            .footer
-            .page_directory
-            .iter()
-            .filter(|page| {
-                page.projection_id == 0 && page.column_id == column_id && page.granule_id == entry.granule_id
-            })
-            .collect();
-        page_entries.sort_by_key(|page| page.page_index);
         let pages = if mark.page_count > 1 {
+            let page_entries = index.pages.get(&key).map(Vec::as_slice).unwrap_or_default();
             if page_entries.len() != mark.page_count as usize {
                 return None;
             }
             page_entries
-                .into_iter()
+                .iter()
                 .map(|page| {
                     Some((
                         page.compressed_len,
@@ -3528,20 +3672,15 @@ fn build_oe_file_sealed_in_order(
             Vec::new()
         };
 
-        let mut text_tokens: Vec<TextTokenEntry> = source
-            .footer
+        let mut text_tokens: Vec<TextTokenEntry> = index
             .text_token_indexes
-            .iter()
-            .filter(|token| token.column_id == column_id && token.granule_id == entry.granule_id)
-            .cloned()
+            .get(&key)
+            .into_iter()
+            .flatten()
+            .map(|token| (*token).clone())
             .collect();
-        for offsets in source
-            .footer
-            .text_token_offsets
-            .iter()
-            .filter(|token| token.column_id == column_id && token.granule_id == entry.granule_id)
-        {
-            let start = usize::try_from(source_stripe.file_offset.checked_add(offsets.index_offset)?).ok()?;
+        for offsets in index.text_token_offsets.get(&key).into_iter().flatten() {
+            let start = usize::try_from(stripe_offset.checked_add(offsets.index_offset)?).ok()?;
             let end = start.checked_add(usize::try_from(offsets.index_len).ok()?)?;
             text_tokens.push(TextTokenEntry {
                 column_id,
@@ -3604,9 +3743,9 @@ fn build_oe_file_sealed_in_order(
             column_id: u32,
             values: impl Iterator<Item = &'a str>,
             candidates: &mut BTreeMap<u32, (std::collections::BTreeSet<&'a str>, usize)>,
-            diverged: &mut HashSet<u32>,
+            settled: &mut HashSet<u32>,
         ) {
-            if diverged.contains(&column_id) {
+            if settled.contains(&column_id) {
                 return;
             }
             let mut set: std::collections::BTreeSet<&'a str> = std::collections::BTreeSet::new();
@@ -3622,22 +3761,21 @@ fn build_oe_file_sealed_in_order(
                 }
                 std::collections::btree_map::Entry::Occupied(mut slot) => {
                     let (first, matching) = slot.get_mut();
-                    if *first != set {
-                        diverged.insert(column_id);
-                        return;
+                    settled.insert(column_id);
+                    if *first == set {
+                        *matching += 1;
                     }
-                    *matching += 1;
                 }
             }
         }
         let mut candidates: BTreeMap<u32, (std::collections::BTreeSet<&str>, usize)> = BTreeMap::new();
-        let mut diverged: HashSet<u32> = HashSet::default();
+        let mut settled: HashSet<u32> = HashSet::default();
         for granule in &granules {
             for block in &granule.blocks {
                 if shareable_column(block.column_id)
                     && let ColumnData::Strings(values) = &block.data
                 {
-                    observe_alphabet(block.column_id, values.iter_present(), &mut candidates, &mut diverged);
+                    observe_alphabet(block.column_id, values.iter_present(), &mut candidates, &mut settled);
                 }
             }
         }
@@ -3647,7 +3785,7 @@ fn build_oe_file_sealed_in_order(
             {
                 for (g_start, g_end) in &granule_row_ranges {
                     let present = (*g_start..*g_end).filter_map(|index| values.get(index).flatten());
-                    observe_alphabet(col.column_id, present, &mut candidates, &mut diverged);
+                    observe_alphabet(col.column_id, present, &mut candidates, &mut settled);
                 }
             }
         }
@@ -3664,7 +3802,7 @@ fn build_oe_file_sealed_in_order(
             if shared_alphabets.contains_key(&column_id) {
                 continue;
             }
-            let mut granule_values: Vec<Box<dyn Iterator<Item = &str> + '_>> = Vec::new();
+            let mut granule_values: Vec<Box<dyn Iterator<Item = &str> + Send + '_>> = Vec::new();
             for granule in &granules {
                 for block in &granule.blocks {
                     if block.column_id == column_id
@@ -3744,19 +3882,22 @@ fn build_oe_file_sealed_in_order(
                 let Some(granule) = granules.get(granule_idx) else {
                     return;
                 };
-                if let Some(product) = update_reuse.and_then(|reuse| {
-                    (!reuse.block_changed(granule.entry.granule_id, column_id))
-                        .then(|| {
-                            reuse_block_piece(
-                                reuse.source,
-                                &granule.entry,
-                                column_id,
-                                granule.entry.stripe_id,
-                                config.page_size_rows,
-                            )
-                        })
-                        .flatten()
-                }) {
+                if let Some(product) = update_reuse
+                    .zip(source_index.as_ref())
+                    .and_then(|(reuse, source_index)| {
+                        (!reuse.block_changed(granule.entry.granule_id, column_id))
+                            .then(|| {
+                                reuse_block_piece(
+                                    source_index,
+                                    &granule.entry,
+                                    column_id,
+                                    granule.entry.stripe_id,
+                                    config.page_size_rows,
+                                )
+                            })
+                            .flatten()
+                    })
+                {
                     *slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Ok(product));
                     return;
                 }
@@ -3849,24 +3990,21 @@ fn build_oe_file_sealed_in_order(
             .get_mut(granule_index)
             .map(std::mem::take)
             .unwrap_or_default();
-        let reused_geometry = update_reuse.and_then(|reuse| {
-            if reuse.changed_payload_granules.contains(&granule.entry.granule_id) {
-                return None;
-            }
-            let payload = reuse
-                .source
-                .footer
-                .payload_granules
-                .iter()
-                .find(|payload| payload.granule_id == granule.entry.granule_id)?;
-            let extent = |offset: u64, len: u64| source_extent(reuse.source, granule.entry.granule_id, offset, len);
-            Some((
-                extent(payload.dictionary_offset, payload.dictionary_len)?,
-                extent(payload.offsets_offset, payload.offsets_len)?,
-                extent(payload.residual_offset, payload.residual_len)?,
-                payload.residual_compression,
-            ))
-        });
+        let reused_geometry = update_reuse
+            .zip(source_index.as_ref())
+            .and_then(|(reuse, source_index)| {
+                if reuse.changed_payload_granules.contains(&granule.entry.granule_id) {
+                    return None;
+                }
+                let payload = source_index.payload_granules.get(&granule.entry.granule_id)?;
+                let extent = |offset: u64, len: u64| source_index.extent(granule.entry.granule_id, offset, len);
+                Some((
+                    extent(payload.dictionary_offset, payload.dictionary_len)?,
+                    extent(payload.offsets_offset, payload.offsets_len)?,
+                    extent(payload.residual_offset, payload.residual_len)?,
+                    payload.residual_compression,
+                ))
+            });
         if let Some((dictionary, offsets, residual, residual_compression)) = reused_geometry {
             payload_geometry.push(PayloadGeometry {
                 granule_id: granule.entry.granule_id,
@@ -3986,8 +4124,8 @@ fn build_oe_file_sealed_in_order(
 
     let hot_columns = column_ids::PROMOTED_BASE..column_ids::PROMOTED_BASE + config.promotion.columns.len() as u32;
     phase_clock.transition(BuildPhase::FooterConstruction);
-    let mut scheduled_metadata = match source {
-        Some(source) => borrow_footer_metadata(source)?,
+    let mut scheduled_metadata = match source_index.as_ref().filter(|_| source.is_some()) {
+        Some(source_index) => borrow_footer_metadata(source_index)?,
         None => build_scheduled_footer_metadata(
             &granules,
             &dictionaries,
@@ -4609,12 +4747,20 @@ fn build_oe_file_sealed_in_order(
 
     let entity_summary = match sparse_reuse {
         Some(reuse) => reuse.source.entity_summary.clone(),
-        None => crate::indexes::entity_summary::EntitySummary::from_keys(rows.iter().map(|row| {
-            crate::indexes::entity_summary::EntityKey::new(
-                row.envelope.entity_id_hash_high,
-                row.envelope.entity_id_hash_low,
-            )
-        })),
+        None => {
+            let mut keys: Vec<crate::indexes::entity_summary::EntityKey> = rows
+                .par_iter()
+                .map(|row| {
+                    crate::indexes::entity_summary::EntityKey::new(
+                        row.envelope.entity_id_hash_high,
+                        row.envelope.entity_id_hash_low,
+                    )
+                })
+                .collect();
+            keys.par_sort_unstable();
+            keys.dedup();
+            crate::indexes::entity_summary::EntitySummary::from_keys(keys)
+        }
     };
     optional_flags |= optional_features::ENTITY_SUMMARY;
 
@@ -4929,15 +5075,27 @@ fn encode_residual(
     payloads: &NormalizedPayloads,
 ) -> Result<EncodedResidual, FormatError> {
     let row_count = residuals.len();
-    let mut key_names: HashSet<&str> = HashSet::with_capacity(payloads.identities().field_names().len());
+    let field_name_count = payloads.identities().field_names().len();
+    let mut key_names: HashSet<&str> = HashSet::with_capacity(field_name_count.min(residual_fields.len()));
     let mut nested_names: Vec<&str> = Vec::new();
+    let mut seen_names: HashSet<*const str> = HashSet::default();
+    let mut previous_fields: &[(&str, &VariantValue)] = &[];
     for residual in residuals.iter().flatten() {
         match residual {
             Residual::Fields(range) => {
-                for (path, value) in residual_fields.get(range.clone()).unwrap_or_default() {
-                    key_names.insert(path);
+                let fields = residual_fields.get(range.clone()).unwrap_or_default();
+                let repeats = fields.len() == previous_fields.len()
+                    && fields
+                        .iter()
+                        .zip(previous_fields)
+                        .all(|((name, _), (previous, _))| std::ptr::eq::<str>(*name, *previous));
+                for &(path, value) in fields {
+                    if !repeats && seen_names.insert(std::ptr::from_ref::<str>(path)) {
+                        key_names.insert(path);
+                    }
                     collect_key_names(value, &mut nested_names);
                 }
+                previous_fields = fields;
             }
             Residual::Whole(value) => collect_key_names(value, &mut nested_names),
         }
@@ -5111,29 +5269,9 @@ fn build_granule(
     let mut relationship_columns: [(Vec<u8>, StringColumn); 6] =
         std::array::from_fn(|_| (vec![0u8; row_count.div_ceil(8)], StringColumn::new()));
 
-    let residual_fields_by_shape: Vec<usize> = payloads
-        .identities()
-        .shapes
-        .iter()
-        .map(|shape| {
-            shape
-                .iter()
-                .filter(|&&field_id| {
-                    field_routes
-                        .get(field_id as usize)
-                        .is_none_or(|route| route.shred_index.is_none() && route.freetext_index.is_none())
-                })
-                .count()
-        })
-        .collect();
     let residual_field_estimate: usize = granule_payloads
         .iter()
-        .map(|&entry| {
-            residual_fields_by_shape
-                .get(payloads.shape_id(entry) as usize)
-                .copied()
-                .unwrap_or_default()
-        })
+        .map(|&entry| shape_routes.residual_fields(payloads.shape_id(entry)))
         .sum();
     let mut residual_fields: Vec<(&str, &VariantValue)> = Vec::with_capacity(residual_field_estimate);
     let mut residual_value_bytes = 0usize;
