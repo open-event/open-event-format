@@ -4234,3 +4234,281 @@ fn updates_over_a_compressed_entity_alphabet_reuse_only_while_it_is_unchanged() 
         update_oe_file_with_executor(&source, &before, after.clone(), &config(), &SerialEncodeExecutor).unwrap();
     check(&updated, &after);
 }
+
+fn with_payload_edit(
+    before: &[OeRow],
+    ordinal: usize,
+    edit: impl FnOnce(&mut BTreeMap<String, VariantValue>),
+) -> Vec<OeRow> {
+    let mut after = before.to_vec();
+    edit(payload_of(&mut after[ordinal]));
+    after
+}
+
+fn assert_update_matches_a_fresh_build(before: Vec<OeRow>, after: Vec<OeRow>, cfg: &OeBuildConfig) {
+    let source = build_oe_file(before.clone(), cfg).unwrap();
+    let full = build_oe_file(after.clone(), cfg).unwrap();
+    assert_eq!(source.footer.shredded, full.footer.shredded);
+    let updated = update_oe_file_with_executor(&source, &before, after, cfg, &SerialEncodeExecutor).unwrap();
+    assert!(updated.reused_source_blocks > 0);
+    assert_same_content(&full, &updated);
+}
+
+#[test]
+fn an_update_that_changes_a_shredded_values_kind_rebuilds_the_residual() {
+    let cfg = sparse_config();
+    let ints: Vec<OeRow> = (0..64).map(row).collect();
+    let source = build_oe_file(ints.clone(), &cfg).unwrap();
+    assert!(source.footer.shredded.iter().any(|entry| entry.path == "amount"));
+    let text = with_payload_edit(&ints, 21, |payload| {
+        payload.insert("amount".to_owned(), VariantValue::String("unknown".to_owned()));
+    });
+
+    assert_update_matches_a_fresh_build(ints.clone(), text.clone(), &cfg);
+    assert_update_matches_a_fresh_build(text.clone(), ints, &cfg);
+    let removed = with_payload_edit(&text, 21, |payload| {
+        payload.remove("amount");
+    });
+    assert_update_matches_a_fresh_build(text, removed, &cfg);
+}
+
+#[test]
+fn an_update_that_makes_a_free_text_field_a_non_string_rebuilds_the_residual() {
+    let cfg = sparse_config();
+    let strings: Vec<OeRow> = (0..64).map(row).collect();
+    let number = with_payload_edit(&strings, 40, |payload| {
+        payload.insert("note".to_owned(), VariantValue::Int(7));
+    });
+
+    assert_update_matches_a_fresh_build(strings.clone(), number.clone(), &cfg);
+    assert_update_matches_a_fresh_build(number, strings, &cfg);
+}
+
+#[test]
+fn an_update_that_changes_a_shredded_decimals_scale_rebuilds_the_residual() {
+    let cfg = sparse_config();
+    let priced: Vec<OeRow> = (0..64)
+        .map(|i| {
+            let mut priced = row(i);
+            payload_of(&mut priced).insert(
+                "price".to_owned(),
+                VariantValue::Decimal {
+                    scale: 2,
+                    unscaled: 100 + i128::from(i),
+                },
+            );
+            priced
+        })
+        .collect();
+    let source = build_oe_file(priced.clone(), &cfg).unwrap();
+    assert!(source.footer.shredded.iter().any(|entry| entry.path == "price"));
+    let rescale = |payload: &mut BTreeMap<String, VariantValue>| {
+        payload.insert(
+            "price".to_owned(),
+            VariantValue::Decimal {
+                scale: 3,
+                unscaled: 4_321,
+            },
+        );
+    };
+
+    for ordinal in [20, 32] {
+        let rescaled = with_payload_edit(&priced, ordinal, rescale);
+        assert_update_matches_a_fresh_build(priced.clone(), rescaled.clone(), &cfg);
+        assert_update_matches_a_fresh_build(rescaled, priced.clone(), &cfg);
+    }
+}
+
+#[test]
+fn an_update_that_changes_only_delivery_lineage_rebuilds_the_lineage_blocks() {
+    let cfg = OeBuildConfig {
+        delivery_lineage: true,
+        ..sparse_config()
+    };
+    let before: Vec<OeRow> = (0..64)
+        .map(|i| {
+            let mut delivered = row(i);
+            delivered.event.source_delivery = Some(format!("delivery-{}", i % 3));
+            delivered
+        })
+        .collect();
+    let source = build_oe_file(before.clone(), &cfg).unwrap();
+    for column_id in [column_ids::SOURCE_DELIVERY, column_ids::CONNECTOR_DELIVERY_HASH] {
+        assert!(source.footer.columns.iter().any(|column| column.column_id == column_id));
+    }
+    let mut after = before.clone();
+    after[21].event.source_delivery = Some("redelivered".to_owned());
+    after[40].event.connector_delivery_hash_low = 999_999;
+
+    assert_update_matches_a_fresh_build(before, after, &cfg);
+}
+
+fn inbox_rows() -> Vec<OeRow> {
+    (0..64)
+        .map(|i| {
+            let mut inbox_row = row(i);
+            inbox_row.event.envelope.entity_id_hash_low = (i * 37) % 64;
+            inbox_row
+        })
+        .collect()
+}
+
+#[test]
+fn an_inbox_update_maps_changes_to_granules_by_the_files_entity_order() {
+    let cfg = OeBuildConfig {
+        profile: crate::layout::Profile::Inbox,
+        ..sparse_config()
+    };
+    let before = inbox_rows();
+    let source = build_oe_file(before.clone(), &cfg).unwrap();
+    assert!(source.footer.granules.len() > 1);
+    let changed = 5usize;
+    let file_ordinal = before[changed].event.envelope.entity_id_hash_low;
+    assert_ne!(
+        granule_for_ordinal(&source.footer, changed as u64),
+        granule_for_ordinal(&source.footer, file_ordinal)
+    );
+    let mut after = before.clone();
+    after[changed].event.envelope.dedupe_hash_low += 10_000;
+    payload_of(&mut after[changed]).insert("amount".to_owned(), VariantValue::Int(77_777));
+    let full = build_oe_file(after.clone(), &cfg).unwrap();
+
+    let updated = update_oe_file_with_executor(&source, &before, after.clone(), &cfg, &SerialEncodeExecutor).unwrap();
+    assert!(updated.reused_source_blocks > 0);
+    assert_same_content(&full, &updated);
+
+    let by_file_ordinal = [OeRowChange {
+        after: after[changed].clone(),
+        before: before[changed].clone(),
+        row_ordinal: file_ordinal,
+    }];
+    let updated = update_oe_file_from_changes_with_executor(
+        &source,
+        after.clone(),
+        &by_file_ordinal,
+        &cfg,
+        &SerialEncodeExecutor,
+    )
+    .unwrap();
+    assert!(updated.reused_source_blocks > 0);
+    assert_same_content(&full, &updated);
+
+    let by_handed_position = changes_for(&before, &after, &[changed]);
+    let updated =
+        update_oe_file_from_changes_with_executor(&source, after, &by_handed_position, &cfg, &SerialEncodeExecutor)
+            .unwrap();
+    assert_eq!(updated.reused_source_blocks, 0);
+    assert_same_content(&full, &updated);
+}
+
+#[test]
+fn an_update_across_the_inbox_row_order_borrows_nothing() {
+    let cfg = sparse_config();
+    let inbox = OeBuildConfig {
+        profile: crate::layout::Profile::Inbox,
+        ..sparse_config()
+    };
+    let rows = inbox_rows();
+    let source = build_oe_file(rows.clone(), &inbox).unwrap();
+    let full = build_oe_file(rows.clone(), &cfg).unwrap();
+
+    let updated = update_oe_file_with_executor(&source, &rows, rows.clone(), &cfg, &SerialEncodeExecutor).unwrap();
+    assert_eq!(updated.reused_source_blocks, 0);
+    assert_eq!(updated.bytes, full.bytes);
+}
+
+#[test]
+fn a_payload_wider_than_the_shredded_id_range_keeps_the_overflow_in_the_residual() {
+    let rows: Vec<OeRow> = (0..8)
+        .map(|i| {
+            let mut wide = row(i);
+            let payload = payload_of(&mut wide);
+            for field in 0..1_100i64 {
+                payload.insert(format!("f{field:04}"), VariantValue::Int(field + i as i64));
+            }
+            wide
+        })
+        .collect();
+
+    let built = build_oe_file(rows.clone(), &config()).unwrap();
+    assert_eq!(built.footer.shredded.len(), 1_000);
+    assert!(
+        built
+            .footer
+            .shredded
+            .iter()
+            .all(|entry| (column_ids::SHREDDED_BASE..column_ids::FREETEXT_BASE).contains(&entry.column_id))
+    );
+    let file = OeFile::open(built.bytes.clone(), Some(&built.file_seal)).unwrap();
+    for (ordinal, input_row) in rows.iter().enumerate() {
+        let PayloadInput::Variant(expected) = &input_row.event.payload else {
+            panic!("variant input");
+        };
+        assert_eq!(
+            file.payload(ordinal as u64).unwrap(),
+            PayloadRead::Value(expected.clone()),
+            "row {ordinal}"
+        );
+    }
+}
+
+#[test]
+fn a_column_family_larger_than_its_id_range_is_refused() {
+    let refused = |cfg: &OeBuildConfig| {
+        matches!(
+            build_oe_file((0..4).map(row).collect::<Vec<OeRow>>(), cfg),
+            Err(FormatError::Structural { rule }) if rule.contains("column id range")
+        )
+    };
+    let mut promoted = config();
+    promoted.promotion.columns = (0..1_001)
+        .map(|index| PromotedColumn {
+            name: format!("promoted{index}"),
+            path: format!("path{index}"),
+            kind: ColumnKind::I64,
+            since_schema_version: 1,
+            substring_searchable: false,
+        })
+        .collect();
+    assert!(refused(&promoted));
+
+    let mut freetext = config();
+    freetext.freetext.fields = (0..1_001).map(|index| format!("text{index}")).collect();
+    assert!(refused(&freetext));
+}
+
+#[test]
+fn residual_keys_are_gathered_across_rows_of_differing_field_sets() {
+    let rows: Vec<OeRow> = (0..48)
+        .map(|i| {
+            let mut varied = row(i);
+            let payload = payload_of(&mut varied);
+            match i % 4 {
+                0 => {
+                    payload.insert("only_some".to_owned(), VariantValue::Bool(i % 8 == 0));
+                }
+                1 => {
+                    payload.insert(
+                        "nested".to_owned(),
+                        VariantValue::Object(BTreeMap::from([(format!("inner{}", i % 3), VariantValue::Int(1))])),
+                    );
+                }
+                _ => {}
+            }
+            varied
+        })
+        .collect();
+
+    let built = build_oe_file(rows.clone(), &config()).unwrap();
+    let file = OeFile::open(built.bytes.clone(), Some(&built.file_seal)).unwrap();
+    for (ordinal, input_row) in rows.iter().enumerate() {
+        let PayloadInput::Variant(expected) = &input_row.event.payload else {
+            panic!("variant input");
+        };
+        assert_eq!(
+            file.payload(ordinal as u64).unwrap(),
+            PayloadRead::Value(expected.clone()),
+            "row {ordinal}"
+        );
+    }
+}
