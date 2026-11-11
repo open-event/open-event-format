@@ -535,3 +535,67 @@ fn a_prefix_read_inflates_only_the_frames_it_needs() {
     decompress_prefix_into(&empty, &mut out, |_| Some(0)).unwrap();
     assert!(out.is_empty());
 }
+
+fn frames_from_a_fresh_encoder(bytes: &[u8], breaks: &[usize]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut consumed = 0;
+    for end in breaks.iter().copied().chain([bytes.len()]) {
+        if end <= consumed || end > bytes.len() {
+            continue;
+        }
+        for frame in bytes[consumed..end].chunks(FRAME_BYTES as usize) {
+            out.extend_from_slice(&zstd::bulk::compress(frame, LEVEL).unwrap());
+        }
+        consumed = end;
+    }
+    out
+}
+
+#[test]
+fn a_reused_encoder_writes_the_bytes_a_fresh_one_does() {
+    let frame = FRAME_BYTES as usize;
+    let mut noise = Vec::with_capacity(3 * frame + 16);
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    while noise.len() < 3 * frame + 11 {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        noise.extend_from_slice(&state.to_le_bytes());
+    }
+    let text = arena(4096);
+    let arenas: Vec<(&[u8], Vec<usize>)> = vec![
+        (&text, vec![]),
+        (&[], vec![]),
+        (&text[..1], vec![]),
+        (&text[..frame], vec![]),
+        (&text[..2 * frame], vec![frame]),
+        (&text[..2 * frame + 1], vec![17, frame, frame + 5]),
+        (&noise, vec![]),
+        (&noise, vec![1, frame - 1, 2 * frame, 3 * frame + 10]),
+        (&text[..300], vec![100, 200]),
+        (&text, vec![text.len() / 3, text.len() / 2]),
+        (&text[..1], vec![]),
+    ];
+    for round in 0..2 {
+        for (bytes, breaks) in &arenas {
+            let stored = compress_with_breaks(bytes, breaks).unwrap();
+            let frames = frames_from_a_fresh_encoder(bytes, breaks);
+            let table = seek_table(&stored).unwrap();
+            assert_eq!(table.size_comp(), frames.len() as u64, "round {round}: {breaks:?}");
+            assert_eq!(
+                &stored[..frames.len()],
+                frames.as_slice(),
+                "round {round}: {} bytes with breaks {breaks:?}",
+                bytes.len()
+            );
+            assert_eq!(decompress_all(&stored).unwrap(), *bytes);
+        }
+    }
+    let on_another_thread = std::thread::spawn({
+        let text = text.clone();
+        move || compress(&text).unwrap()
+    })
+    .join()
+    .unwrap();
+    assert_eq!(on_another_thread, compress(&text).unwrap());
+}

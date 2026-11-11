@@ -1,8 +1,9 @@
 use super::constant::MAX_RLE_EXPANSION_VALUES;
 use super::{
-    ColumnData, DictionaryValues, FsstDecodeTable, IntValue, NullStream, PipelineId, SideStream, StringColumn,
-    Transform, ValueKind, decode_block_shared_with_body, fastlanes_value_at, fsst_decompress_value, offset_window,
-    read_packed_stream, read_string_header, take_delta_bitpack, with_trailing_removed,
+    ColumnData, DictionaryValues, FsstDecodeTable, IntValue, MAX_BLOCK_VALUES, NullStream, NullStreamForm, PipelineId,
+    SideStream, StringColumn, Transform, ValueKind, decode_block_shared_with_body, fastlanes_value_at,
+    fsst_decompress_value, offset_window, read_packed_stream, read_string_header, take_delta_bitpack,
+    with_trailing_removed,
 };
 use crate::error::FormatError;
 use crate::file::bytes::{Reader, slice};
@@ -15,6 +16,7 @@ const NULL_CODE: u32 = u32::MAX;
 pub struct DictionaryCodes<'a> {
     codes: Vec<u32>,
     dictionary: Cow<'a, [String]>,
+    sorted: bool,
 }
 
 impl<'a> DictionaryCodes<'a> {
@@ -58,6 +60,14 @@ impl<'a> DictionaryCodes<'a> {
     }
 
     pub fn equals_mask(&self, needle: &str) -> Vec<bool> {
+        if !self.sorted {
+            let equal: Vec<bool> = self.dictionary.iter().map(|entry| entry == needle).collect();
+            return self
+                .codes
+                .iter()
+                .map(|&code| equal.get(code as usize).copied().unwrap_or(false))
+                .collect();
+        }
         match self.dictionary.binary_search_by(|entry| entry.as_str().cmp(needle)) {
             Ok(index) => {
                 let target = index as u32;
@@ -88,6 +98,7 @@ impl<'a> DictionaryCodes<'a> {
         DictionaryCodes {
             codes: self.codes,
             dictionary: Cow::Owned(self.dictionary.into_owned()),
+            sorted: self.sorted,
         }
     }
 }
@@ -104,6 +115,15 @@ pub fn decode_dictionary_codes<'a>(
     with_trailing_removed(pipeline.compression()?, bytes, |body| {
         dictionary_codes_from_body(body, side, shared).map(Some)
     })
+}
+
+pub(super) fn bounded_row_count(nulls: &NullStream<'_>) -> Result<usize, FormatError> {
+    if matches!(nulls.form, NullStreamForm::Runs(_)) && nulls.row_count() > MAX_BLOCK_VALUES {
+        return Err(FormatError::Structural {
+            rule: "null stream row count beyond the block bound",
+        });
+    }
+    Ok(nulls.row_count())
 }
 
 pub(super) fn dictionary_codes_from_body<'a>(
@@ -128,7 +148,7 @@ pub(super) fn dictionary_codes_from_body<'a>(
         });
     }
     let stored = super::bitunpack(&mut reader)?;
-    let mut codes = Vec::with_capacity(nulls.row_count());
+    let mut codes = Vec::with_capacity(bounded_row_count(&nulls)?);
     let mut next = 0usize;
     nulls.each_row(|present| {
         if !present {
@@ -152,7 +172,14 @@ pub(super) fn dictionary_codes_from_body<'a>(
             rule: "null bitmap disagrees with present count",
         });
     }
-    Ok(DictionaryCodes { codes, dictionary })
+    let sorted = dictionary
+        .windows(2)
+        .all(|pair| matches!(pair, [low, high] if low < high));
+    Ok(DictionaryCodes {
+        codes,
+        dictionary,
+        sorted,
+    })
 }
 
 pub fn fsst_uncompressed_len(pipeline: PipelineId, bytes: &[u8]) -> Result<Option<usize>, FormatError> {
@@ -274,11 +301,85 @@ pub fn take_block_rows(pipeline: PipelineId, bytes: &[u8], rows: &[usize]) -> Re
     take_block_rows_shared(pipeline, bytes, None, rows)
 }
 
-fn present_position_of(nulls: &NullStream<'_>, row: usize) -> Result<Option<usize>, FormatError> {
-    if row >= nulls.row_count() {
-        return Err(FormatError::RefOutOfRange { what: "take row" });
+struct PresentRank<'n, 'a> {
+    before: usize,
+    nulls: &'n NullStream<'a>,
+    row: usize,
+    run: usize,
+}
+
+impl<'n, 'a> PresentRank<'n, 'a> {
+    fn new(nulls: &'n NullStream<'a>) -> Self {
+        Self {
+            before: 0,
+            nulls,
+            row: 0,
+            run: 0,
+        }
     }
-    Ok(nulls.is_present(row).then(|| nulls.present_before(row)))
+
+    fn position(&mut self, row: usize) -> Result<Option<usize>, FormatError> {
+        if row >= self.nulls.row_count() {
+            return Err(FormatError::RefOutOfRange { what: "take row" });
+        }
+        if row < self.row {
+            self.before = 0;
+            self.row = 0;
+            self.run = 0;
+        }
+        match &self.nulls.form {
+            NullStreamForm::AllAbsent => Ok(None),
+            NullStreamForm::AllPresent => Ok(Some(row)),
+            NullStreamForm::Raw(bits) => {
+                self.before += count_bits_between(bits, self.row, row);
+                self.row = row;
+                Ok(self.nulls.is_present(row).then_some(self.before))
+            }
+            NullStreamForm::Runs(runs) => {
+                self.row = row;
+                loop {
+                    match runs.get(self.run) {
+                        Some((start, end)) if end as usize <= row => {
+                            self.before += (end - start) as usize;
+                            self.run += 1;
+                        }
+                        Some((start, _)) if start as usize <= row => {
+                            return Ok(Some(self.before + (row - start as usize)));
+                        }
+                        _ => return Ok(None),
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn count_bits_between(bits: &[u8], from: usize, to: usize) -> usize {
+    if from >= to {
+        return 0;
+    }
+    let byte = |index: usize| bits.get(index).copied().unwrap_or(0);
+    let from_mask = 0xFFu8 << (from % 8);
+    let to_mask = !(0xFFu8 << (to % 8));
+    let (first, last) = (from / 8, to / 8);
+    if first == last {
+        return (byte(first) & from_mask & to_mask).count_ones() as usize;
+    }
+    let whole = bits.get(first + 1..last.min(bits.len())).unwrap_or(&[]);
+    (byte(first) & from_mask).count_ones() as usize
+        + whole.iter().map(|byte| byte.count_ones() as usize).sum::<usize>()
+        + (byte(last) & to_mask).count_ones() as usize
+}
+
+fn offset_pair(table: &[u8], position: usize) -> Result<(usize, usize), FormatError> {
+    let entry = |index: usize| {
+        let at = index.checked_mul(4)?;
+        let bytes: [u8; 4] = table.get(at..at.checked_add(4)?)?.try_into().ok()?;
+        Some(u32::from_le_bytes(bytes) as usize)
+    };
+    entry(position)
+        .zip(position.checked_add(1).and_then(entry))
+        .ok_or(FormatError::Truncated { what: "string offset" })
 }
 
 fn take_fsst(body: &[u8], rows: &[usize]) -> Result<StringColumn, FormatError> {
@@ -297,21 +398,19 @@ fn take_fsst(body: &[u8], rows: &[usize]) -> Result<StringColumn, FormatError> {
     let decode = header.fsst()?;
     let mut out = StringColumn::with_capacity(rows.len(), 0);
     let mut buffer = Vec::new();
+    let mut rank = PresentRank::new(&header.nulls);
     for &row in rows {
-        let Some(position) = present_position_of(&header.nulls, row)? else {
+        let Some(position) = rank.position(row)? else {
             out.push(None);
             continue;
         };
-        let bounds = offset_window(table, position, 2)?;
-        let [start, end] = bounds.as_slice() else {
-            return Err(FormatError::Truncated { what: "string offset" });
-        };
+        let (start, end) = offset_pair(table, position)?;
         if end < start {
             return Err(FormatError::Structural {
                 rule: "fsst offsets must be non-decreasing",
             });
         }
-        let compressed = slice(data, *start, end - start, "fsst value")?;
+        let compressed = slice(data, start, end - start, "fsst value")?;
         buffer.clear();
         fsst_decompress_value(decode, compressed, &mut buffer)?;
         let text = simdutf8::basic::from_utf8(&buffer).map_err(|_| FormatError::InvalidUtf8 { what: "fsst value" })?;
@@ -350,8 +449,9 @@ fn take_fsst_packed(body: &[u8], rows: &[usize]) -> Result<StringColumn, FormatE
     let decode = header.fsst()?;
     let mut out = StringColumn::with_capacity(rows.len(), 0);
     let mut buffer = Vec::new();
+    let mut rank = PresentRank::new(&header.nulls);
     for &row in rows {
-        let Some(position) = present_position_of(&header.nulls, row)? else {
+        let Some(position) = rank.position(row)? else {
             out.push(None);
             continue;
         };
@@ -381,21 +481,19 @@ fn take_raw(body: &[u8], rows: &[usize]) -> Result<StringColumn, FormatError> {
         .unwrap_or(0);
     let data = slice(body, header.offsets_start + table.len(), arena_len, "raw string data")?;
     let mut out = StringColumn::with_capacity(rows.len(), 0);
+    let mut rank = PresentRank::new(&header.nulls);
     for &row in rows {
-        let Some(position) = present_position_of(&header.nulls, row)? else {
+        let Some(position) = rank.position(row)? else {
             out.push(None);
             continue;
         };
-        let bounds = offset_window(table, position, 2)?;
-        let [start, end] = bounds.as_slice() else {
-            return Err(FormatError::Truncated { what: "string offset" });
-        };
+        let (start, end) = offset_pair(table, position)?;
         if end < start {
             return Err(FormatError::Structural {
                 rule: "raw offsets must be non-decreasing",
             });
         }
-        let bytes = slice(data, *start, end - start, "raw string value")?;
+        let bytes = slice(data, start, end - start, "raw string value")?;
         let text = simdutf8::basic::from_utf8(bytes).map_err(|_| FormatError::InvalidUtf8 {
             what: "raw string value",
         })?;
@@ -435,8 +533,9 @@ fn take_dictionary(
         });
     }
     let mut out = StringColumn::with_capacity(rows.len(), 0);
+    let mut rank = PresentRank::new(&nulls);
     for &row in rows {
-        let Some(position) = present_position_of(&nulls, row)? else {
+        let Some(position) = rank.position(row)? else {
             out.push(None);
             continue;
         };

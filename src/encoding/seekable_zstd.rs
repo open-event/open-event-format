@@ -11,6 +11,8 @@ const LEVEL: i32 = 3;
 const MAX_RANGE_BYTES: u64 = 1 << 28;
 
 thread_local! {
+    static ENCODER: RefCell<Option<(Compressor<'static>, Vec<u8>)>> = const { RefCell::new(None) };
+
     static DECODER: RefCell<Decompressor<'static>> = RefCell::new(Decompressor::default());
 
     static SPARE_FRAME: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
@@ -81,10 +83,37 @@ pub fn compress_with_breaks_by(
     breaks: &[usize],
     bar_at: impl Fn(usize) -> (usize, usize),
 ) -> Option<Vec<u8>> {
+    ENCODER.with(|slot| match slot.try_borrow_mut() {
+        Ok(mut slot) => {
+            if slot.is_none() {
+                *slot = Some(new_encoder()?);
+            }
+            let (compressor, scratch) = slot.as_mut()?;
+            compress_frames(bytes, breaks, bar_at, compressor, scratch)
+        }
+        Err(_) => {
+            let (mut compressor, mut scratch) = new_encoder()?;
+            compress_frames(bytes, breaks, bar_at, &mut compressor, &mut scratch)
+        }
+    })
+}
+
+fn new_encoder() -> Option<(Compressor<'static>, Vec<u8>)> {
+    Some((
+        Compressor::new(LEVEL).ok()?,
+        Vec::with_capacity(zstd::zstd_safe::compress_bound(FRAME_BYTES as usize)),
+    ))
+}
+
+fn compress_frames(
+    bytes: &[u8],
+    breaks: &[usize],
+    bar_at: impl Fn(usize) -> (usize, usize),
+    compressor: &mut Compressor<'static>,
+    scratch: &mut Vec<u8>,
+) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(bytes.len());
     let mut table = SeekTable::new();
-    let mut compressor = Compressor::new(LEVEL).ok()?;
-    let mut scratch = Vec::with_capacity(zstd::zstd_safe::compress_bound(FRAME_BYTES as usize));
     let mut consumed = 0;
     for end in breaks.iter().copied().chain([bytes.len()]) {
         if end <= consumed || end > bytes.len() {
@@ -92,11 +121,11 @@ pub fn compress_with_breaks_by(
         }
         for (index, frame) in bytes.get(consumed..end)?.chunks(FRAME_BYTES as usize).enumerate() {
             scratch.clear();
-            compressor.compress_to_buffer(frame, &mut scratch).ok()?;
+            compressor.compress_to_buffer(frame, scratch).ok()?;
             let stored_start = out.len();
             let bar = bar_at(consumed + index * FRAME_BYTES as usize);
             if scratch.len().saturating_mul(bar.1) <= frame.len().saturating_mul(bar.0) {
-                out.extend_from_slice(&scratch);
+                out.extend_from_slice(scratch);
             } else {
                 push_raw_frame(frame, &mut out);
             }

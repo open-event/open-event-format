@@ -1,7 +1,7 @@
 use super::*;
 use crate::encoding::predicate::{NumericBound, NumericPredicate, filter_numeric_block};
 use crate::encoding::{
-    CascadeStrategy, EncodedBlock, decode_block, decode_block_range, decode_block_shared,
+    CascadeStrategy, Compression, EncodedBlock, decode_block, decode_block_range, decode_block_shared,
     encode_block_forced_for_conformance, encode_block_with_shared_dictionary,
 };
 
@@ -305,4 +305,115 @@ fn take_matches_full_decode_for_delta_bitpack() {
         }
         assert!(take_block_rows(block.pipeline, &block.bytes, &[5000]).is_err());
     }
+}
+
+fn clustered_nulls(rows: usize, distinct: usize) -> StringColumn {
+    (0..rows)
+        .map(|row| {
+            ((row / 190) % 3 != 1).then(|| format!("tenant-{:04}/path/{}", (row * 31) % distinct, row % distinct))
+        })
+        .collect()
+}
+
+#[test]
+fn take_ranks_rows_in_any_order_over_both_presence_forms() {
+    let len = 5000;
+    let ascending: Vec<usize> = (0..len).step_by(13).chain([len - 1]).collect();
+    let descending: Vec<usize> = ascending.iter().rev().copied().collect();
+    let jumping: Vec<usize> = (0..len).map(|step| (step * 2741) % len).take(700).collect();
+    let repeated = vec![188, 188, 189, 190, 190, 379, 380, 380, 0, 0, len - 1, len - 1];
+    for (transform, distinct) in [
+        (Transform::FsstString, 5000),
+        (Transform::RawString, 5000),
+        (Transform::DictionaryString, 40),
+    ] {
+        for (column, runs) in [(strings(len, distinct), false), (clustered_nulls(len, distinct), true)] {
+            let data = ColumnData::Strings(column);
+            let block = forced(&data, transform);
+            with_trailing_removed(block.pipeline.compression().unwrap(), &block.bytes, |body| {
+                let nulls = NullStream::read(&mut Reader::new(body))?;
+                assert_eq!(matches!(nulls.form, NullStreamForm::Runs(_)), runs);
+                assert_eq!(matches!(nulls.form, NullStreamForm::Raw(_)), !runs);
+                Ok(())
+            })
+            .unwrap();
+            for rows in [&ascending, &descending, &jumping, &repeated] {
+                assert_eq!(
+                    take_block_rows(block.pipeline, &block.bytes, rows).unwrap(),
+                    oracle_gather(&data, rows),
+                    "{transform:?} runs {runs}"
+                );
+            }
+            assert!(take_block_rows(block.pipeline, &block.bytes, &[0, len]).is_err());
+        }
+    }
+}
+
+#[test]
+fn bit_range_counts_match_a_bit_by_bit_count() {
+    let bits: Vec<u8> = (0..9u32).map(|index| (index * 151 + 77) as u8).collect();
+    let bit = |row: usize| bits.get(row / 8).is_some_and(|byte| byte & (1 << (row % 8)) != 0);
+    for from in 0..=80 {
+        for to in 0..=80 {
+            let expected = (from..to).filter(|row| bit(*row)).count();
+            assert_eq!(count_bits_between(&bits, from, to), expected, "[{from}, {to})");
+        }
+    }
+}
+
+fn dictionary_body(entries: &[&str], codes: &[u64]) -> Vec<u8> {
+    let mut out = crate::file::bytes::Writer::new();
+    out.put_u32(codes.len() as u32);
+    out.put_u8(0);
+    out.put_u32(entries.len() as u32);
+    let mut offset = 0u32;
+    out.put_u32(offset);
+    for entry in entries {
+        offset += entry.len() as u32;
+        out.put_u32(offset);
+    }
+    for entry in entries {
+        out.put_slice(entry.as_bytes());
+    }
+    crate::encoding::bitpack(codes, 2, &mut out);
+    out.into_bytes()
+}
+
+#[test]
+fn equality_over_an_unsorted_dictionary_matches_the_decoded_rows() {
+    let pipeline = PipelineId::new(Transform::DictionaryString, Compression::None, ValueKind::String);
+    for entries in [["b", "a", "c"], ["c", "b", "a"], ["a", "b", "a"], ["a", "b", "c"]] {
+        let body = dictionary_body(&entries, &[0, 1, 2, 2, 1, 0, 1]);
+        let ColumnData::Strings(decoded) = decode_block(pipeline, &body).unwrap() else {
+            panic!("a dictionary block decodes to strings");
+        };
+        let codes = decode_dictionary_codes(pipeline, &body, None).unwrap().unwrap();
+        assert_eq!(codes.to_strings(), decoded);
+        for needle in ["a", "b", "c", "d"] {
+            let expected: Vec<bool> = decoded.iter().map(|value| value == Some(needle)).collect();
+            assert_eq!(codes.equals_mask(needle), expected, "{entries:?} = {needle}");
+            assert_eq!(codes.clone().into_owned().equals_mask(needle), expected);
+        }
+    }
+}
+
+#[test]
+fn a_forged_run_form_row_count_refuses_the_code_projection() {
+    let mut out = crate::file::bytes::Writer::new();
+    out.put_u32(u32::MAX);
+    out.put_u8(2);
+    out.put_u32(1);
+    out.put_u32(0);
+    out.put_u32(1);
+    out.put_u32(1);
+    out.put_u32(0);
+    out.put_u32(1);
+    out.put_slice(b"a");
+    out.put_u32(1);
+    out.put_u8(0);
+    let pipeline = PipelineId::new(Transform::DictionaryString, Compression::None, ValueKind::String);
+    assert!(matches!(
+        decode_dictionary_codes(pipeline, &out.into_bytes(), None),
+        Err(FormatError::Structural { .. })
+    ));
 }
