@@ -330,7 +330,7 @@ impl zeroize::ZeroizeOnDrop for SealedContentKey {}
 
 struct SealState {
     key_epoch: u64,
-    sealed_nonces: HashSet<Vec<u8>>,
+    sealed_blocks: HashSet<u64>,
 }
 
 impl SealedContentKey {
@@ -357,7 +357,7 @@ impl SealedContentKey {
             scheme,
             state: Arc::new(Mutex::new(SealState {
                 key_epoch,
-                sealed_nonces: HashSet::new(),
+                sealed_blocks: HashSet::new(),
             })),
         }
     }
@@ -375,16 +375,15 @@ impl SealedContentKey {
         if state.key_epoch >= self.epoch_limit {
             return None;
         }
-        let mut nonce = BlockNonce::derive(self.scheme, block_id, state.key_epoch);
-        while state.sealed_nonces.contains(&nonce.bytes) {
+        if state.sealed_blocks.contains(&block_id) {
             let next_epoch = state.key_epoch.checked_add(1).filter(|next| *next < self.epoch_limit)?;
             state.key_epoch = next_epoch;
-            nonce = BlockNonce::derive(self.scheme, block_id, state.key_epoch);
+            state.sealed_blocks.clear();
         }
         let sealed = self
             .content_key
             .seal(block_id, file_id, state.key_epoch, plaintext, self.scheme)?;
-        state.sealed_nonces.insert(nonce.bytes);
+        state.sealed_blocks.insert(block_id);
         Some(sealed)
     }
 

@@ -72,6 +72,10 @@ impl KeyDictionary {
 
     fn field_id_from(&self, key: &str, cursor: &mut usize) -> Option<u32> {
         let start = (*cursor).min(self.keys.len());
+        if self.keys.get(start).is_some_and(|next| next == key) {
+            *cursor = start + 1;
+            return Some(start as u32);
+        }
         let suffix = self.keys.get(start..).unwrap_or(&[]);
         match suffix.binary_search_by(|probe| probe.as_str().cmp(key)) {
             Ok(offset) => {
@@ -151,6 +155,7 @@ pub struct EncodeScratch {
     bodies: Vec<Writer>,
     offsets: Vec<Vec<u32>>,
     placed: Vec<Vec<(u32, u32)>>,
+    remap: Vec<Option<u32>>,
 }
 
 impl EncodeScratch {
@@ -265,12 +270,16 @@ pub fn transcode_value_into_with_scratch(
     scratch: &mut EncodeScratch,
     out: &mut Writer,
 ) -> Result<(), FormatError> {
-    let remap = build_id_remap(from, to);
-    transcode_into(value, &remap, scratch, out, 0)
+    let mut remap = std::mem::take(&mut scratch.remap);
+    fill_id_remap(from, to, &mut remap);
+    let transcoded = transcode_into(value, &remap, scratch, out, 0);
+    scratch.remap = remap;
+    transcoded
 }
 
-fn build_id_remap(from: &KeyDictionary, to: &KeyDictionary) -> Vec<Option<u32>> {
-    let mut remap = vec![None; from.keys.len()];
+fn fill_id_remap(from: &KeyDictionary, to: &KeyDictionary, remap: &mut Vec<Option<u32>>) {
+    remap.clear();
+    remap.resize(from.keys.len(), None);
     let mut to_index = 0usize;
     for (from_id, from_key) in from.keys.iter().enumerate() {
         while to
@@ -289,7 +298,6 @@ fn build_id_remap(from: &KeyDictionary, to: &KeyDictionary) -> Vec<Option<u32>> 
             *slot = Some(to_index as u32);
         }
     }
-    remap
 }
 
 fn transcode_into(
@@ -865,7 +873,7 @@ impl<'a> VariantRef<'a> {
             }
             BASIC_OBJECT => {
                 let geometry = self.object_header(header)?;
-                let mut fields = BTreeMap::new();
+                let mut fields = Vec::with_capacity(geometry.count.min(DECODE_ARRAY_PRE_ALLOCATE_CAP));
                 let mut previous_id: Option<u32> = None;
                 for index in 0..geometry.count {
                     let id = self.read_uint_at(
@@ -885,10 +893,10 @@ impl<'a> VariantRef<'a> {
                     let value = self
                         .child_slice(&geometry, index)?
                         .decode_at_depth(dictionary, depth + 1)?;
-                    fields.insert(key.to_owned(), value);
+                    fields.push((key.to_owned(), value));
                 }
                 self.check_container_fills_slice(&geometry)?;
-                Ok(VariantValue::Object(fields))
+                Ok(VariantValue::Object(BTreeMap::from_iter(fields)))
             }
             _ => Err(FormatError::Structural {
                 rule: "unknown basic type",

@@ -1,6 +1,7 @@
 use crate::columns::column_ids;
 use crate::deletes::{
-    DeletionVector, FieldDeletionVector, FieldDeletionVectorRef, decode_deletion_vector, encode_deletion_vector,
+    DeletionVector, FieldDeletionVector, FieldDeletionVectorRef, check_decodable_row_count, decode_deletion_vector,
+    encode_deletion_vector,
 };
 use crate::error::FormatError;
 use crate::events::SequenceRange;
@@ -41,6 +42,7 @@ impl StoredFieldDeletionVector {
             None => (DeletionVector::new(), 1),
         };
         additions.affected_ordinals().for_each(|row| rows.mark_deleted(row));
+        check_decodable_row_count(&rows)?;
         let (_, encoded) = encode_deletion_vector(&rows);
         let mut stored = Self {
             blake3: [0; 32],

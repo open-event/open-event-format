@@ -217,3 +217,59 @@ fn the_erasure_log_pins_the_jurisdiction_profile_version_and_reads_legacy_record
     );
     assert!(reopened.opening_key(pinned).unwrap().is_none());
 }
+
+#[test]
+fn an_erasure_racing_a_sealing_checkout_never_leaves_a_live_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = FixedClock::at(1);
+    let store = FileSubjectKeyStore::open(dir.path(), dek()).unwrap();
+    for id in 0..24 {
+        let subject = SubjectId::new_test_id(100 + id);
+        store.sealing_key(subject).unwrap().unwrap();
+        let erased = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while !erased.load(std::sync::atomic::Ordering::Acquire) {
+                    store.sealing_key(subject).unwrap();
+                }
+            });
+            let erasure = store.erase_subject(subject, &clock);
+            erased.store(true, std::sync::atomic::Ordering::Release);
+            erasure.unwrap();
+        });
+        assert!(store.is_erased(subject).unwrap(), "subject {id} stays erased");
+        assert!(store.opening_key(subject).unwrap().is_none());
+        assert!(store.sealing_key(subject).unwrap().is_none());
+    }
+}
+
+#[test]
+fn a_torn_log_record_is_dropped_before_the_next_append() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = FixedClock::at(7);
+    let (first, second) = (SubjectId::new_test_id(40), SubjectId::new_test_id(41));
+    let store = FileSubjectKeyStore::open(dir.path(), dek()).unwrap();
+    let erased_first = store.erase_subject(first, &clock).unwrap();
+    let mut log = OpenOptions::new().append(true).open(store.erasure_log_v2()).unwrap();
+    log.write_all(&[0xAB; 10]).unwrap();
+    drop(log);
+    let erased_second = store.erase_subject(second, &clock).unwrap();
+    assert_eq!(store.erasures().unwrap(), vec![erased_first, erased_second]);
+
+    let path = dir.path().join("backlog.log");
+    let backlog = FileErasureBacklog::open(&path);
+    let event = EventId::new_test_id(3);
+    backlog.record_unresolved(10, event).unwrap();
+    let mut log = OpenOptions::new().append(true).open(&path).unwrap();
+    log.write_all(&[BACKLOG_PENDING; 5]).unwrap();
+    drop(log);
+    backlog.resolve(event, second).unwrap();
+    assert_eq!(
+        backlog.pending().unwrap(),
+        vec![BacklogEntry {
+            event_id: event,
+            file_id: 10,
+            subject: Some(second)
+        }]
+    );
+}
