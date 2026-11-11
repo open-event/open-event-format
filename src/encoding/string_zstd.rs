@@ -191,19 +191,45 @@ fn unrelay(tag: u8, relaid: &[u8], classic_len: usize, plain: &mut Vec<u8>) -> R
     Ok(())
 }
 
-pub(crate) fn compress(transform: Transform, side: SideStream, classic: &[u8]) -> Option<Vec<u8>> {
-    let (tag, relaid) = relay(transform, side, classic)?;
-    let mut restored = Vec::new();
-    unrelay(tag, &relaid, classic.len(), &mut restored).ok()?;
-    if restored != classic {
-        return None;
-    }
+pub(crate) enum Relayout {
+    Kept(Vec<u8>),
+    Refused,
+    Unavailable,
+}
+
+pub(crate) fn compress_if(
+    transform: Transform,
+    side: SideStream,
+    classic: &[u8],
+    keep: impl FnOnce(usize) -> bool,
+) -> Relayout {
+    let Some((tag, relaid)) = relay(transform, side, classic) else {
+        return Relayout::Unavailable;
+    };
+    let Ok(classic_len) = u32::try_from(classic.len()) else {
+        return Relayout::Unavailable;
+    };
     let framed = lz4_flex::compress_prepend_size(&relaid);
+    if !keep(5 + framed.len()) {
+        return Relayout::Refused;
+    }
+    let mut restored = Vec::new();
+    if unrelay(tag, &relaid, classic.len(), &mut restored).is_err() || restored != classic {
+        return Relayout::Unavailable;
+    }
     let mut out = Vec::with_capacity(5 + framed.len());
-    out.extend_from_slice(&u32::try_from(classic.len()).ok()?.to_le_bytes());
+    out.extend_from_slice(&classic_len.to_le_bytes());
     out.push(tag | TAG_LZ4);
     out.extend_from_slice(&framed);
-    Some(out)
+    Relayout::Kept(out)
+}
+
+#[cfg(test)]
+pub(crate) fn compress(transform: Transform, side: SideStream, classic: &[u8]) -> Option<Vec<u8>> {
+    match compress_if(transform, side, classic, |_| true) {
+        Relayout::Kept(stored) => Some(stored),
+        Relayout::Refused | Relayout::Unavailable => None,
+    }
 }
 
 pub(crate) fn decompress_into(

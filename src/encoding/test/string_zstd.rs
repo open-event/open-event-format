@@ -269,3 +269,27 @@ fn a_zero_width_relaid_dictionary_refuses_an_amplified_code_count() {
     assert_eq!(plain.len(), classic_len as usize);
     assert!(parse(TAG_DICTIONARY, &empty, classic_len as usize).is_ok());
 }
+
+#[test]
+fn a_refused_relayout_is_not_built_and_a_kept_one_matches_the_stage() {
+    let data = column(&rooms(2000));
+    for transform in [Transform::RawString, Transform::DictionaryString] {
+        let (classic_bytes, side) = classic(transform, &data);
+        let stored = compress(transform, side, &classic_bytes).unwrap();
+        let mut offered = 0;
+        let refused = compress_if(transform, side, &classic_bytes, |len| {
+            offered = len;
+            false
+        });
+        assert!(matches!(refused, Relayout::Refused));
+        assert_eq!(offered, stored.len());
+        let Relayout::Kept(kept) = compress_if(transform, side, &classic_bytes, |len| len == stored.len()) else {
+            unreachable!("the relayout is kept at its own length")
+        };
+        assert_eq!(kept, stored);
+    }
+    assert!(matches!(
+        compress_if(Transform::FsstString, SideStream::None, &[], |_| true),
+        Relayout::Unavailable
+    ));
+}

@@ -2089,6 +2089,7 @@ fn write_fsst_dictionary_values(
     Ok(true)
 }
 
+#[cfg(test)]
 fn encode_dictionary_string(
     values: &StringColumn,
     present: &[&str],
@@ -2099,6 +2100,7 @@ fn encode_dictionary_string(
     encode_dictionary_string_with(values, present, strategy, shared, true, out)
 }
 
+#[cfg(test)]
 fn encode_dictionary_string_with(
     values: &StringColumn,
     present: &[&str],
@@ -2107,20 +2109,61 @@ fn encode_dictionary_string_with(
     fsst_values: bool,
     out: &mut Writer,
 ) -> Result<SideStream, FormatError> {
+    encode_prepared_dictionary(values, &prepare_dictionary(present), strategy, shared, fsst_values, out)
+}
+
+#[derive(Default)]
+struct PreparedDictionary<'a> {
+    codes: Vec<u32>,
+    dictionary: Vec<&'a str>,
+}
+
+fn prepare_dictionary<'a>(present: &[&'a str]) -> PreparedDictionary<'a> {
+    prepare_dictionary_within(present, present.len()).unwrap_or_default()
+}
+
+fn prepare_dictionary_within<'a>(present: &[&'a str], max_distinct: usize) -> Option<PreparedDictionary<'a>> {
+    let mut first_seen: AHashMap<&str, u32> = AHashMap::new();
+    let mut sorted: Vec<(&'a str, u32)> = Vec::new();
+    let mut codes = Vec::with_capacity(present.len());
+    for &value in present {
+        let next = sorted.len() as u32;
+        let id = *first_seen.entry(value).or_insert(next);
+        if id == next {
+            sorted.push((value, id));
+            if sorted.len() > max_distinct {
+                return None;
+            }
+        }
+        codes.push(id);
+    }
+    sorted.sort_unstable();
+    let mut rank = vec![0u32; sorted.len()];
+    for (position, (_, id)) in sorted.iter().enumerate() {
+        if let Some(slot) = rank.get_mut(*id as usize) {
+            *slot = position as u32;
+        }
+    }
+    for code in &mut codes {
+        *code = rank.get(*code as usize).copied().unwrap_or(0);
+    }
+    Some(PreparedDictionary {
+        codes,
+        dictionary: sorted.into_iter().map(|(value, _)| value).collect(),
+    })
+}
+
+fn encode_prepared_dictionary(
+    values: &StringColumn,
+    prepared: &PreparedDictionary<'_>,
+    strategy: CascadeStrategy,
+    shared: Option<&[String]>,
+    fsst_values: bool,
+    out: &mut Writer,
+) -> Result<SideStream, FormatError> {
     NullStream::from_values(values).write(out);
-    let mut dictionary: Vec<&str> = AHashSet::from_iter(present.iter().copied()).into_iter().collect();
-    dictionary.sort_unstable();
-    let code_of: AHashMap<&str, u64> = dictionary
-        .iter()
-        .enumerate()
-        .map(|(index, value)| (*value, index as u64))
-        .collect();
-    let local_code = |row: usize| {
-        present
-            .get(row)
-            .and_then(|value| code_of.get(value).copied())
-            .unwrap_or(0)
-    };
+    let PreparedDictionary { codes, dictionary } = prepared;
+    let local_code = |row: usize| codes.get(row).map_or(0, |&code| u64::from(code));
     if let Some(alphabet) = shared
         && dictionary
             .iter()
@@ -2137,14 +2180,14 @@ fn encode_dictionary_string_with(
             .collect();
         let max = alphabet_index_of.iter().copied().max().unwrap_or(0);
         let mut shared_out = Writer::new();
-        bitpack_with(present.len(), bits_needed(max), &mut shared_out, |row| {
+        bitpack_with(codes.len(), bits_needed(max), &mut shared_out, |row| {
             alphabet_index_of.get(local_code(row) as usize).copied().unwrap_or(0)
         });
         let shared_bytes = shared_out.into_bytes();
         let mut local_out = Writer::new();
         let local_side = encode_local_dictionary_with(
-            &dictionary,
-            present.len(),
+            dictionary,
+            codes.len(),
             local_code,
             strategy,
             fsst_values,
@@ -2158,7 +2201,7 @@ fn encode_dictionary_string_with(
         out.put_slice(&local_bytes);
         return Ok(local_side);
     }
-    encode_local_dictionary_with(&dictionary, present.len(), local_code, strategy, fsst_values, out)
+    encode_local_dictionary_with(dictionary, codes.len(), local_code, strategy, fsst_values, out)
 }
 
 #[cfg(test)]
@@ -3477,15 +3520,14 @@ fn shared_alphabet_covers(shared: Option<&[String]>, present: &[&str]) -> bool {
         .all(|value| !seen.insert(value) || alphabet.binary_search_by(|entry| entry.as_str().cmp(value)).is_ok())
 }
 
-fn dictionary_trial_worthwhile(present: &[&str]) -> bool {
-    let limit = present.len() * DICTIONARY_TRIAL_MAX_DISTINCT_NUM / DICTIONARY_TRIAL_MAX_DISTINCT_DEN;
-    let mut distinct = AHashSet::with_capacity(limit + 1);
-    for value in present {
-        if distinct.insert(*value) && distinct.len() > limit {
-            return false;
-        }
-    }
-    true
+fn dictionary_trial_max_distinct(present_count: usize) -> usize {
+    present_count * DICTIONARY_TRIAL_MAX_DISTINCT_NUM / DICTIONARY_TRIAL_MAX_DISTINCT_DEN
+}
+
+#[derive(Default)]
+struct StringTrial<'a> {
+    dictionary: Option<Option<PreparedDictionary<'a>>>,
+    present: Option<Vec<&'a str>>,
 }
 
 fn choose_string_transform(present: &[&str]) -> Transform {
@@ -4125,6 +4167,7 @@ fn encode_chosen_form(
     shared: Option<&[String]>,
     string_zstd: bool,
 ) -> EncodedBlock {
+    let mut trial = StringTrial::default();
     let block = encode_selected_form(
         data,
         random_access,
@@ -4133,52 +4176,63 @@ fn encode_chosen_form(
         replay_trailing,
         replay_fsst,
         shared,
+        &mut trial,
     );
     if string_zstd
         && let ColumnData::Strings(values) = data
         && (forced.is_none() || replay_trailing.is_some_and(|captured| captured != Compression::None))
-        && let Some(candidate) = string_zstd_candidate(values, strategy, shared, block.bytes.len(), block.stats)
+        && let Some(candidate) = string_zstd_candidate(values, strategy, shared, block.bytes.len(), block.stats, trial)
     {
         return candidate;
     }
     block
 }
 
-fn string_zstd_candidate(
-    values: &StringColumn,
+fn string_zstd_candidate<'a>(
+    values: &'a StringColumn,
     strategy: CascadeStrategy,
     shared: Option<&[String]>,
     current_len: usize,
     stats: BlockStats,
+    trial: StringTrial<'a>,
 ) -> Option<EncodedBlock> {
     if strategy == CascadeStrategy::NoTrailing || !cascade_level_fits(2) {
         return None;
     }
-    let present = present_values(values);
+    let present = trial.present.unwrap_or_else(|| present_values(values));
     if present.is_empty() {
         return None;
     }
     let bar = current_len.saturating_mul(STRING_ZSTD_MIN_SAVINGS_NUM) / STRING_ZSTD_MIN_SAVINGS_DEN;
     let mut best: Option<(Transform, SideStream, Compression, Vec<u8>, u64)> = None;
     let mut consider = |transform: Transform, side: SideStream, body: &[u8]| {
-        let (compression, stored) = match string_zstd::compress(transform, side, body) {
-            Some(stored) => (Compression::StringZstd, stored),
-            None => (Compression::Lz4, lz4_flex::compress_prepend_size(body)),
+        let keeps =
+            |len: usize| len != 0 && len < bar && best.as_ref().is_none_or(|(_, _, _, kept, _)| len < kept.len());
+        let (compression, stored) = match string_zstd::compress_if(transform, side, body, keeps) {
+            string_zstd::Relayout::Kept(stored) => (Compression::StringZstd, stored),
+            string_zstd::Relayout::Refused => return,
+            string_zstd::Relayout::Unavailable => {
+                let stored = lz4_flex::compress_prepend_size(body);
+                if !keeps(stored.len()) {
+                    return;
+                }
+                (Compression::Lz4, stored)
+            }
         };
-        if !stored.is_empty()
-            && stored.len() < bar
-            && best.as_ref().is_none_or(|(_, _, _, kept, _)| stored.len() < kept.len())
-        {
-            best = Some((transform, side, compression, stored, body.len() as u64));
-        }
+        best = Some((transform, side, compression, stored, body.len() as u64));
     };
     let mut raw = Writer::new();
     if encode_raw_string(values, &present, &mut raw).is_ok() {
         consider(Transform::RawString, SideStream::None, raw.bytes());
     }
-    if dictionary_trial_worthwhile(&present) {
+    let max_distinct = dictionary_trial_max_distinct(present.len());
+    let prepared = match trial.dictionary {
+        Some(prepared) => prepared.filter(|prepared| prepared.dictionary.len() <= max_distinct),
+        None => prepare_dictionary_within(&present, max_distinct),
+    };
+    if let Some(prepared) = prepared {
         let mut dictionary = Writer::new();
-        if let Ok(side) = encode_dictionary_string_with(values, &present, strategy, shared, false, &mut dictionary) {
+        if let Ok(side) = encode_prepared_dictionary(values, &prepared, strategy, shared, false, &mut dictionary) {
             consider(Transform::DictionaryString, side, dictionary.bytes());
         }
     }
@@ -4192,14 +4246,19 @@ fn string_zstd_candidate(
     })
 }
 
-fn encode_selected_form(
-    data: &ColumnData,
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is an independent selection input threaded from the public entry points"
+)]
+fn encode_selected_form<'a>(
+    data: &'a ColumnData,
     random_access: bool,
     strategy: CascadeStrategy,
     forced: Option<Transform>,
     replay_trailing: Option<Compression>,
     replay_fsst: Option<&FsstTable>,
     shared: Option<&[String]>,
+    trial: &mut StringTrial<'a>,
 ) -> EncodedBlock {
     let forced =
         forced.filter(|transform| transform_matches_kind(*transform, data) || matches!(data, ColumnData::F64(_)));
@@ -4267,8 +4326,13 @@ fn encode_selected_form(
                 transform = Transform::FsstString;
             }
             let mut encoded = match transform {
-                Transform::DictionaryString => encode_dictionary_string(values, &present, strategy, shared, &mut out)
-                    .map(|side| (side, None, Vec::new())),
+                Transform::DictionaryString => {
+                    let prepared = prepare_dictionary(&present);
+                    let encoded = encode_prepared_dictionary(values, &prepared, strategy, shared, true, &mut out)
+                        .map(|side| (side, None, Vec::new()));
+                    trial.dictionary = Some(Some(prepared));
+                    encoded
+                }
                 Transform::FsstString => encode_fsst_string(values, &present, replay_fsst, &mut out),
                 _ => encode_raw_string(values, &present, &mut out).map(|()| (SideStream::None, None, Vec::new())),
             };
@@ -4284,17 +4348,21 @@ fn encode_selected_form(
             if (forced.is_none() || replay_trailing.is_some())
                 && matches!(transform, Transform::FsstString | Transform::FsstPackedString)
                 && encoded.is_ok()
-                && (dictionary_trial_worthwhile(&present) || shared_alphabet_covers(shared, &present))
             {
-                let mut trial = Writer::new();
-                if let Ok(side) = encode_dictionary_string(values, &present, strategy, shared, &mut trial)
-                    && trial.len() < out.len()
-                {
-                    out = trial;
-                    transform = Transform::DictionaryString;
-                    encoded = Ok((side, None, Vec::new()));
-                    dictionary_by_trial = true;
+                let prepared = prepare_dictionary_within(&present, dictionary_trial_max_distinct(present.len()))
+                    .or_else(|| shared_alphabet_covers(shared, &present).then(|| prepare_dictionary(&present)));
+                if let Some(prepared) = &prepared {
+                    let mut body = Writer::new();
+                    if let Ok(side) = encode_prepared_dictionary(values, prepared, strategy, shared, true, &mut body)
+                        && body.len() < out.len()
+                    {
+                        out = body;
+                        transform = Transform::DictionaryString;
+                        encoded = Ok((side, None, Vec::new()));
+                        dictionary_by_trial = true;
+                    }
                 }
+                trial.dictionary = Some(prepared);
             }
             #[expect(
                 clippy::expect_used,
@@ -4303,6 +4371,7 @@ fn encode_selected_form(
             let parts =
                 encoded.expect("string-block arena offsets fit u32: the writer bounds a granule far below that");
             (side, fsst, frame_breaks) = parts;
+            trial.present = Some(present);
             (transform, ValueKind::String)
         }
     };

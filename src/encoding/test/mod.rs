@@ -5774,3 +5774,196 @@ fn alp_keeps_the_sign_of_negative_zero() {
             .all(|(got, want)| got.to_bits() == want.to_bits())
     );
 }
+
+#[test]
+fn packed_fsst_in_place_decode_matches_the_classic_transcode() {
+    let mut values = StringColumn::new();
+    for i in 0..200u64 {
+        if i % 7 == 0 {
+            values.push(None);
+        } else {
+            values.push(Some(&format!("@user{}:example.org", i.wrapping_mul(7919) % 1000)));
+        }
+    }
+    let block = encode_block(&ColumnData::Strings(values), true);
+    assert_eq!(block.pipeline.transform().unwrap(), Transform::FsstPackedString);
+    assert_eq!(block.pipeline.compression().unwrap(), Compression::None);
+    let classic_pipeline = block.pipeline.with_transform(Transform::FsstString);
+    let views_of = |pipeline: PipelineId, body: &[u8]| {
+        decode_string_block_views(pipeline, body)
+            .map(|array| array.map(|array| array.iter().map(|value| value.map(str::to_owned)).collect::<Vec<_>>()))
+    };
+    let assert_same = |body: &[u8]| {
+        let classic = fsst_packed_as_classic(body);
+        let through = |decode: &dyn Fn(&[u8]) -> Result<ColumnData, FormatError>| match &classic {
+            Ok(classic) => decode(classic),
+            Err(error) => Err(error.clone()),
+        };
+        assert_eq!(
+            decode_block(block.pipeline, body),
+            through(&|classic| decode_block(classic_pipeline, classic))
+        );
+        for (start, end) in [(0, 1), (3, 40), (150, 200), (199, 500)] {
+            assert_eq!(
+                decode_block_range(block.pipeline, body, start, end),
+                through(&|classic| decode_block_range(classic_pipeline, classic, start, end)),
+                "range {start}..{end}"
+            );
+        }
+        let classic_views = match &classic {
+            Ok(classic) => views_of(classic_pipeline, classic),
+            Err(error) => Err(error.clone()),
+        };
+        assert_eq!(views_of(block.pipeline, body), classic_views);
+    };
+    assert_same(&block.bytes);
+    assert!(decode_block(block.pipeline, &block.bytes).is_ok());
+    for cut in 0..block.bytes.len() {
+        assert_same(&block.bytes[..cut]);
+    }
+    for position in 0..block.bytes.len() {
+        for byte in [0u8, 1, 0x7f, 0xff] {
+            let mut mutated = block.bytes.clone();
+            mutated[position] = byte;
+            assert_same(&mutated);
+        }
+    }
+}
+
+#[test]
+fn prepared_dictionary_sorts_entries_and_codes_every_row() {
+    let mut state: u64 = 0x5EED_1234_ABCD_0001;
+    for (rows, spread) in [
+        (0usize, 1u64),
+        (1, 1),
+        (50, 3),
+        (4000, 37),
+        (4000, 3500),
+        (3000, 100_000),
+    ] {
+        let owned: Vec<String> = (0..rows)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                format!("v{}", (state >> 33) % spread)
+            })
+            .collect();
+        let present: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let mut expected: Vec<&str> = present.clone();
+        expected.sort_unstable();
+        expected.dedup();
+        let prepared = prepare_dictionary(&present);
+        assert_eq!(prepared.dictionary, expected);
+        let decoded: Vec<&str> = prepared
+            .codes
+            .iter()
+            .map(|&code| prepared.dictionary[code as usize])
+            .collect();
+        assert_eq!(decoded, present);
+        for limit in [0, expected.len().saturating_sub(1), expected.len(), rows] {
+            let within = prepare_dictionary_within(&present, limit);
+            assert_eq!(within.is_some(), expected.len() <= limit, "{rows} rows, limit {limit}");
+            if let Some(within) = within {
+                assert_eq!(within.dictionary, prepared.dictionary);
+                assert_eq!(within.codes, prepared.codes);
+            }
+        }
+    }
+}
+
+#[test]
+fn string_selection_bytes_do_not_depend_on_the_relaid_candidate_sharing_the_dictionary() {
+    let columns: Vec<Vec<Option<String>>> = vec![
+        (0..6000)
+            .map(|row| (row % 13 != 0).then(|| format!("!room{:05}:example.org", row * 31 % 1500)))
+            .collect(),
+        (0..6000)
+            .map(|row| Some(format!("!room{:05}:example.org", row * 7919 % 5900)))
+            .collect(),
+        (0..6000).map(|row| Some(format!("state-{}", row % 9))).collect(),
+        (0..3000)
+            .map(|row| Some(format!("free text number {row} with a tail {}", row * row)))
+            .collect(),
+    ];
+    let mut relaid_dictionaries = 0;
+    for values in &columns {
+        let column: StringColumn = values.iter().map(|value| value.as_deref()).collect();
+        let present = present_values(&column);
+        let data = ColumnData::Strings(column.clone());
+        for strategy in [CascadeStrategy::DecodeOptimized, CascadeStrategy::SizeOptimized] {
+            let block = encode_block_replayed_with(&data, true, strategy, None, None, true).0;
+            assert_eq!(decode_block(block.pipeline, &block.bytes).unwrap(), data);
+            if block.pipeline.compression().unwrap() != Compression::StringZstd
+                || block.pipeline.transform().unwrap() != Transform::DictionaryString
+            {
+                continue;
+            }
+            let mut classic = Writer::new();
+            let side = encode_dictionary_string_with(&column, &present, strategy, None, false, &mut classic).unwrap();
+            assert_eq!(block.pipeline.side_stream().unwrap(), side);
+            assert_eq!(
+                remove_trailing(Compression::StringZstd, &block.bytes).unwrap().as_ref(),
+                classic.bytes()
+            );
+            assert_eq!(
+                block.bytes,
+                string_zstd::compress(Transform::DictionaryString, side, classic.bytes()).unwrap()
+            );
+            relaid_dictionaries += 1;
+        }
+    }
+    assert!(relaid_dictionaries > 0);
+}
+
+#[test]
+fn plain_dictionary_views_validate_entries_like_the_column_decode() {
+    let pipeline = PipelineId::new(Transform::DictionaryString, Compression::None, ValueKind::String);
+    let forged = |offsets: &[u32], data: &[u8], codes: &[u64]| {
+        let mut out = Writer::new();
+        out.put_u32(codes.len() as u32);
+        out.put_u8(0);
+        out.put_u32(offsets.len() as u32 - 1);
+        for &offset in offsets {
+            out.put_u32(offset);
+        }
+        out.put_slice(data);
+        bitpack(codes, 1, &mut out);
+        out.into_bytes()
+    };
+    let views_of = |body: &[u8]| {
+        decode_string_block_views(pipeline, body).map(|array| {
+            array
+                .unwrap()
+                .iter()
+                .map(|value| value.map(str::to_owned))
+                .collect::<Vec<_>>()
+        })
+    };
+    let column_of = |body: &[u8]| {
+        decode_block(pipeline, body).map(|data| {
+            let ColumnData::Strings(values) = data else {
+                unreachable!("a string block decodes to strings")
+            };
+            values.iter().map(|value| value.map(str::to_owned)).collect::<Vec<_>>()
+        })
+    };
+    let leading = forged(&[2, 3, 5], "zza\u{e9}".as_bytes(), &[0, 1, 0]);
+    assert_eq!(
+        views_of(&leading).unwrap(),
+        vec![Some("a".to_owned()), Some("\u{e9}".to_owned()), Some("a".to_owned())]
+    );
+    assert_eq!(views_of(&leading), column_of(&leading));
+    let cases: [(&[u32], &[u8]); 5] = [
+        (&[0, 1, 2], "\u{e9}".as_bytes()),
+        (&[0, 1, 2], b"a\xFF"),
+        (&[0, 2, 1], b"ab"),
+        (&[1, 2, 3], "\u{e9}a".as_bytes()),
+        (&[0, 1, 9], b"ab"),
+    ];
+    for (offsets, data) in cases {
+        let body = forged(offsets, data, &[0, 1, 0]);
+        assert!(views_of(&body).is_err(), "{offsets:?}");
+        assert!(column_of(&body).is_err(), "{offsets:?}");
+    }
+}
