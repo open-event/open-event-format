@@ -5,13 +5,13 @@ use super::constant::{
 use super::seekable_zstd::Window;
 use super::sidecar::{PrefixKey, StringFingerprint};
 use super::{
-    ALP_POWERS, ColumnData, Compression, FASTLANES_VECTOR, PackedStream, PipelineId, SideStream, StringColumn,
-    Transform, ValueKind, decode_block, decode_block_shared_with_body, mask, prefix_sum, read_fsst_compressor,
-    read_packed_stream, unzigzag, zigzag,
+    ALP_POWERS, ColumnData, Compression, DictionaryValues, FASTLANES_VECTOR, PackedStream, PipelineId, SideStream,
+    StringColumn, Transform, ValueKind, decode_block, decode_block_shared_with_body, mask, prefix_sum,
+    read_fsst_compressor, read_packed_stream, unzigzag, zigzag,
 };
 use crate::error::FormatError;
 use crate::file::bytes::{Reader, slice};
-use aho_corasick::{AhoCorasick, MatchKind};
+use aho_corasick::{AhoCorasick, Input, MatchKind};
 use memchr::memmem::Finder;
 use multiversion::multiversion;
 use std::borrow::Cow;
@@ -94,17 +94,27 @@ impl ContainsMatcher {
     }
 
     fn matches_automaton(&self, automaton: &AhoCorasick, value: &[u8]) -> bool {
-        match self.mark_words() {
-            0 | 1 => self.marks_every_needle(automaton, value, &mut [0u64; 1]),
-            words => self.marks_every_needle(automaton, value, &mut vec![0u64; words]),
+        match (self.needles.len(), self.mark_words()) {
+            (1, _) => automaton.is_match(value),
+            (_, 0 | 1) => self.marks_every_needle(automaton, value, &mut [0u64; 1]),
+            (_, words) => self.marks_every_needle(automaton, value, &mut vec![0u64; words]),
         }
     }
 
     fn marks_every_needle(&self, automaton: &AhoCorasick, value: &[u8], seen: &mut [u64]) -> bool {
-        for hit in automaton.find_overlapping_iter(value) {
-            set_bit(seen, hit.pattern().as_usize());
+        let mut missing = self.needles.len();
+        if missing == 0 {
+            return true;
         }
-        all_bits_set(seen, self.needles.len())
+        for hit in automaton.find_overlapping_iter(value) {
+            if set_bit(seen, hit.pattern().as_usize()) {
+                missing -= 1;
+                if missing == 0 {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     fn mark_words(&self) -> usize {
@@ -123,6 +133,15 @@ impl ContainsMatcher {
                 });
                 marks
             }
+            ContainsSearch::Multiple(automaton) if self.needles.len() == 1 => {
+                let mut marks = vec![false; bounds.len().saturating_sub(1)];
+                visit_lone_needle_matches(automaton, text, bounds, |value| {
+                    if let Some(mark) = marks.get_mut(value) {
+                        *mark = true;
+                    }
+                });
+                marks
+            }
             ContainsSearch::Multiple(automaton) => self.mark_arena_automaton(automaton, text, bounds),
         }
     }
@@ -133,6 +152,11 @@ impl ContainsMatcher {
             ContainsSearch::Single(finder) => {
                 let mut count = 0;
                 visit_single_matches(finder, text, bounds, |_| count += 1);
+                count
+            }
+            ContainsSearch::Multiple(automaton) if self.needles.len() == 1 => {
+                let mut count = 0;
+                visit_lone_needle_matches(automaton, text, bounds, |_| count += 1);
                 count
             }
             ContainsSearch::Multiple(automaton) => self
@@ -150,18 +174,43 @@ impl ContainsMatcher {
             return vec![true; count];
         }
         let mut seen = vec![0u64; count * words];
-        for hit in automaton.find_overlapping_iter(text) {
-            let Some(value) = bounds.partition_point(|start| *start <= hit.start()).checked_sub(1) else {
-                continue;
-            };
-            let (Some(start), Some(end)) = (bounds.get(value), bounds.get(value + 1)) else {
-                continue;
-            };
-            if hit.start() >= *start
-                && hit.end() <= *end
-                && let Some(mark) = seen.get_mut(value * words..(value + 1) * words)
-            {
-                set_bit(mark, hit.pattern().as_usize());
+        if bounds.windows(2).any(|pair| matches!(pair, [low, high] if high < low)) {
+            for hit in automaton.find_overlapping_iter(text) {
+                let Some(value) = bounds.partition_point(|start| *start <= hit.start()).checked_sub(1) else {
+                    continue;
+                };
+                let (Some(start), Some(end)) = (bounds.get(value), bounds.get(value + 1)) else {
+                    continue;
+                };
+                if hit.start() >= *start
+                    && hit.end() <= *end
+                    && let Some(mark) = seen.get_mut(value * words..(value + 1) * words)
+                {
+                    set_bit(mark, hit.pattern().as_usize());
+                }
+            }
+        } else {
+            let (mut closing, mut beyond) = (0usize, 0usize);
+            for hit in automaton.find_overlapping_iter(text) {
+                while bounds.get(closing).is_some_and(|bound| *bound < hit.end()) {
+                    closing += 1;
+                }
+                let value = if hit.start() < hit.end() {
+                    closing.checked_sub(1).filter(|value| {
+                        closing < bounds.len() && bounds.get(*value).is_some_and(|start| *start <= hit.start())
+                    })
+                } else {
+                    beyond = beyond.max(closing);
+                    while bounds.get(beyond).is_some_and(|bound| *bound <= hit.end()) {
+                        beyond += 1;
+                    }
+                    beyond.checked_sub(1).filter(|_| beyond < bounds.len())
+                };
+                if let Some(value) = value
+                    && let Some(mark) = seen.get_mut(value * words..(value + 1) * words)
+                {
+                    set_bit(mark, hit.pattern().as_usize());
+                }
             }
         }
         seen.chunks_exact(words)
@@ -190,10 +239,35 @@ fn visit_single_matches(finder: &Finder<'_>, text: &[u8], bounds: &[usize], mut 
     }
 }
 
-fn set_bit(mark: &mut [u64], at: usize) {
-    if let Some(word) = mark.get_mut(at / 64) {
-        *word |= 1u64 << (at % 64);
+fn visit_lone_needle_matches(automaton: &AhoCorasick, text: &[u8], bounds: &[usize], mut visit: impl FnMut(usize)) {
+    let mut search_from = 0;
+    while search_from <= text.len() {
+        let Some(hit) = automaton.find(Input::new(text).span(search_from..text.len())) else {
+            break;
+        };
+        let Some(value) = bounds.partition_point(|bound| *bound <= hit.start()).checked_sub(1) else {
+            search_from = hit.start() + 1;
+            continue;
+        };
+        let Some(&end) = bounds.get(value + 1) else {
+            search_from = hit.start() + 1;
+            continue;
+        };
+        if hit.end() <= end {
+            visit(value);
+        }
+        search_from = end;
     }
+}
+
+fn set_bit(mark: &mut [u64], at: usize) -> bool {
+    let Some(word) = mark.get_mut(at / 64) else {
+        return false;
+    };
+    let bit = 1u64 << (at % 64);
+    let newly_set = *word & bit == 0;
+    *word |= bit;
+    newly_set
 }
 
 fn all_bits_set(mark: &[u64], count: usize) -> bool {
@@ -330,17 +404,7 @@ pub fn count_string_block_shared(
         }
         (Transform::RawString, StringPredicate::Contains(matcher)) => Ok(Some(count_raw_contains(&body, matcher)?)),
         (Transform::DictionaryString, _) if side != SideStream::FileScopeDictionary => {
-            let codes = super::lazy::dictionary_codes_from_body(&body, side, None)?;
-            let test = dictionary_code_test(predicate, codes.dictionary());
-            Ok(Some(
-                codes
-                    .code_counts()
-                    .iter()
-                    .enumerate()
-                    .filter(|(code, _)| test.matches(*code as u64))
-                    .map(|(_, count)| *count as usize)
-                    .sum(),
-            ))
+            Ok(Some(count_dictionary(&body, side, predicate)?))
         }
         _ => Ok(
             filter_string_block_shared_with_body(pipeline, &body, predicate, shared)?
@@ -512,6 +576,59 @@ fn dictionary_code_test<T: AsRef<str>>(predicate: &StringPredicate, dictionary: 
     }
 }
 
+fn block_dictionary_code_test(predicate: &StringPredicate, dictionary: &[&str]) -> CodeTest {
+    if dictionary
+        .windows(2)
+        .all(|pair| matches!(pair, [low, high] if low < high))
+    {
+        return dictionary_code_test(predicate, dictionary);
+    }
+    CodeTest::Set(
+        dictionary
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| predicate.matches_value(Some(entry)))
+            .map(|(index, _)| index as u64)
+            .collect(),
+    )
+}
+
+fn count_dictionary(body: &[u8], side: SideStream, predicate: &StringPredicate) -> Result<usize, FormatError> {
+    let mut reader = Reader::new(body);
+    let nulls = super::NullStream::read(&mut reader)?;
+    let dict_count = reader.u32("dictionary count")? as usize;
+    let values = DictionaryValues::read(&mut reader, dict_count, side)?;
+    let dictionary = values.entries()?;
+    let stream = read_packed_stream(&mut reader)?;
+    if stream.count != nulls.present_count() {
+        return Err(FormatError::Structural {
+            rule: "null bitmap disagrees with present count",
+        });
+    }
+    let mut counts = vec![0usize; dictionary.len()];
+    let mut in_range = true;
+    stream.for_each_vector(|codes| {
+        for &code in codes {
+            match usize::try_from(code).ok().and_then(|code| counts.get_mut(code)) {
+                Some(count) => *count += 1,
+                None => in_range = false,
+            }
+        }
+    });
+    if !in_range {
+        return Err(FormatError::RefOutOfRange {
+            what: "dictionary code",
+        });
+    }
+    let test = block_dictionary_code_test(predicate, &dictionary);
+    Ok(counts
+        .iter()
+        .enumerate()
+        .filter(|(code, _)| test.matches(*code as u64))
+        .map(|(_, count)| *count)
+        .sum())
+}
+
 fn filter_dictionary(body: &[u8], side: SideStream, predicate: &StringPredicate) -> Result<Vec<bool>, FormatError> {
     let mut reader = Reader::new(body);
     let nulls = super::NullStream::read(&mut reader)?;
@@ -528,7 +645,7 @@ fn filter_dictionary(body: &[u8], side: SideStream, predicate: &StringPredicate)
         let data_len = entries.last().map_or(0, |entry| u32::from_le_bytes(*entry) as usize);
         let data = reader.take(data_len, "dictionary data")?;
         let want = term.len();
-        let mut code = None;
+        let mut codes: Vec<u64> = Vec::new();
         let mut start = entries.first().map_or(0, |entry| u32::from_le_bytes(*entry) as usize);
         for (index, entry) in entries.iter().skip(1).enumerate() {
             let end = u32::from_le_bytes(*entry) as usize;
@@ -538,46 +655,32 @@ fn filter_dictionary(body: &[u8], side: SideStream, predicate: &StringPredicate)
                 });
             }
             if end - start == want && data.get(start..end).is_some_and(|value| value == &*term) {
-                code = Some(index as u64);
-                break;
+                codes.push(index as u64);
             }
             start = end;
         }
         let stream = read_packed_stream(&mut reader)?;
-        let present = match code {
-            None => vec![false; stream.count],
-            Some(code) => {
+        let present = match codes.as_slice() {
+            [] => vec![false; stream.count],
+            [code] => {
+                let code = *code;
                 let mut present = vec![false; stream.padded_count()];
                 stream.unpack_into(&mut present, |value| value == code);
+                present.truncate(stream.count);
+                present
+            }
+            codes => {
+                let mut present = vec![false; stream.padded_count()];
+                stream.unpack_into(&mut present, |value| codes.binary_search(&value).is_ok());
                 present.truncate(stream.count);
                 present
             }
         };
         return weave_present(&nulls, present);
     }
-    let owned: Vec<String>;
-    let mut dictionary: Vec<&str> = Vec::with_capacity(reader.capacity_hint(dict_count, 1));
-    if side == SideStream::FsstDictionaryValues {
-        owned = super::read_dictionary_values(&mut reader, dict_count, side)?;
-        dictionary.extend(owned.iter().map(String::as_str));
-    } else {
-        let offsets = super::read_offsets(&mut reader, dict_count)?;
-        let data_len = offsets.last().copied().unwrap_or(0);
-        let data = reader.take(data_len, "dictionary data")?;
-        for pair in offsets.windows(2) {
-            let [start, end] = pair else { continue };
-            if end < start {
-                return Err(FormatError::Structural {
-                    rule: "dictionary offsets must be non-decreasing",
-                });
-            }
-            let entry = slice(data, *start, end - start, "dictionary entry")?;
-            dictionary.push(simdutf8::basic::from_utf8(entry).map_err(|_| FormatError::InvalidUtf8 {
-                what: "dictionary entry",
-            })?);
-        }
-    }
-    let test = dictionary_code_test(predicate, &dictionary);
+    let values = DictionaryValues::read(&mut reader, dict_count, side)?;
+    let dictionary = values.entries()?;
+    let test = block_dictionary_code_test(predicate, &dictionary);
     let stream = read_packed_stream(&mut reader)?;
     let mut present = vec![false; stream.padded_count()];
     stream.unpack_into(&mut present, |code| test.matches(code));
@@ -1148,7 +1251,7 @@ fn weave_present(nulls: &super::NullStream, present: Vec<bool>) -> Result<Vec<bo
         }
         return Ok(present);
     }
-    let mut mask = Vec::with_capacity(nulls.row_count());
+    let mut mask = Vec::with_capacity(super::lazy::bounded_row_count(nulls)?);
     let mut verdicts = present.iter();
     nulls.each_row(|set| {
         if set {
