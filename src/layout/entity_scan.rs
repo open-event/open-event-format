@@ -1,11 +1,11 @@
-use super::event::{overlay_column, read_entity_hashes, read_u64s};
+use super::event::{EnvelopeColumns, overlay_column, read_entity_hashes, read_u64s};
 use super::footer::SortDirection;
 use super::reader::{OeFile, PayloadRead};
 use crate::artifacts::overlay::{LiveOverlaySegment, LiveOverlayStore};
 use crate::columns::column_ids;
 use crate::deletes::{CorrectionMetadata, CorrectionType, DeletionVector};
 use crate::error::{EntityScanError, FormatError};
-use crate::events::variant::VariantValue;
+use crate::events::variant::{KeyDictionary, VariantValue};
 use crate::events::{EventEnvelope, EventId, SequencePoint, TenantId};
 use crate::field_deletion_store::FieldRedactions;
 use arrow_array::UInt64Array;
@@ -110,6 +110,7 @@ impl EntityScan {
         let mut reader = EventReader {
             envelopes: HashMap::new(),
             files: &files,
+            overlay_dictionaries: HashMap::new(),
             redactions: &redactions,
             segments: &segments,
         };
@@ -258,8 +259,9 @@ impl EntityScan {
 }
 
 struct EventReader<'a> {
-    envelopes: HashMap<(usize, u32), Vec<EventEnvelope>>,
+    envelopes: HashMap<(usize, u32), EnvelopeColumns>,
     files: &'a [&'a OeFile],
+    overlay_dictionaries: HashMap<usize, Option<KeyDictionary>>,
     redactions: &'a [Option<FieldRedactions>],
     segments: &'a [&'a LiveOverlaySegment],
 }
@@ -280,14 +282,14 @@ impl EventReader<'_> {
                     .ok_or(FormatError::RefOutOfRange { what: "scanned file" })?;
                 if !self.envelopes.contains_key(&(index, granule_id)) {
                     self.envelopes
-                        .insert((index, granule_id), file.granule_envelopes(granule_id)?);
+                        .insert((index, granule_id), EnvelopeColumns::read(file, granule_id)?);
                 }
                 let envelope = self
                     .envelopes
                     .get(&(index, granule_id))
-                    .and_then(|envelopes| envelopes.get(row_in_granule))
-                    .cloned()
-                    .ok_or(FormatError::RefOutOfRange { what: "row in granule" })?;
+                    .ok_or(FormatError::RefOutOfRange { what: "row in granule" })?
+                    .envelope(file, row_in_granule)
+                    .map_err(|_| FormatError::RefOutOfRange { what: "row in granule" })?;
                 let payload = file.payload(row_ordinal)?;
                 let payload = match self.redactions.get(index).and_then(Option::as_ref) {
                     Some(redactions) => redactions.redact_payload(row_ordinal, payload),
@@ -302,7 +304,7 @@ impl EventReader<'_> {
                 .ok_or(FormatError::RefOutOfRange {
                     what: "overlay segment",
                 })?
-                .event(row),
+                .event_with_dictionary(row, self.overlay_dictionaries.entry(segment).or_default()),
         }
     }
 }

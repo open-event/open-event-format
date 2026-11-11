@@ -122,29 +122,53 @@ fn open_tail(
         offset,
         tenant_id: entry.tenant_id,
     };
+    let suffix_key = key(range.start, range.len);
+    let open_from = |suffix: Arc<[u8]>, cached: bool| -> Result<(u64, Arc<[u8]>, OeFooter), FormatError> {
+        let mut start = range.start;
+        let mut tail = Arc::clone(&suffix);
+        let mut fetched_prefix = None;
+        if !range.exact
+            && let Some(exact_len) = OeFooter::tail_shortfall(&suffix)?
+        {
+            let exact_start = entry.size_bytes - exact_len.min(entry.size_bytes);
+            if exact_start < range.start {
+                let prefix_key = key(exact_start, range.start - exact_start);
+                let prefix: Arc<[u8]> = match cache.filter(|_| cached).and_then(|cache| cache.get(&prefix_key)) {
+                    Some(prefix) => prefix,
+                    None => {
+                        let prefix: Arc<[u8]> =
+                            fetch_exact(source, entry.file_id, prefix_key.offset, prefix_key.len)?.into();
+                        fetched_prefix = Some((prefix_key, Arc::clone(&prefix)));
+                        prefix
+                    }
+                };
+                start = exact_start;
+                tail = [&prefix[..], &suffix[..]].concat().into();
+            }
+        }
+        let footer = open(&tail)?;
+        if let Some(cache) = cache {
+            if !cached {
+                cache.insert(suffix_key, suffix);
+            }
+            if let Some((prefix_key, prefix)) = fetched_prefix {
+                cache.insert(prefix_key, prefix);
+            }
+        }
+        Ok((start, tail, footer))
+    };
     if let Some(cache) = cache
-        && let Some(tail) = cache.get(&key(range.start, range.len))
+        && let Some(suffix) = cache.get(&suffix_key)
     {
-        match open(&tail) {
-            Ok(footer) => return Ok((range.start, tail, footer)),
-            Err(_) => cache.remove(&key(range.start, range.len)),
+        match open_from(suffix, true) {
+            Ok(opened) => return Ok(opened),
+            Err(_) => cache.remove(&suffix_key),
         }
     }
-    let mut start = range.start;
-    let mut tail = fetch_exact(source, entry.file_id, start, range.len)?;
-    if !range.exact
-        && let Some(exact_len) = OeFooter::tail_shortfall(&tail)?
-    {
-        let exact_len = exact_len.min(entry.size_bytes);
-        start = entry.size_bytes - exact_len;
-        tail = fetch_exact(source, entry.file_id, start, exact_len)?;
-    }
-    let footer = open(&tail)?;
-    let tail: Arc<[u8]> = tail.into();
-    if let Some(cache) = cache {
-        cache.insert(key(start, tail.len() as u64), Arc::clone(&tail));
-    }
-    Ok((start, tail, footer))
+    open_from(
+        fetch_exact(source, entry.file_id, range.start, range.len)?.into(),
+        false,
+    )
 }
 
 fn fetch_exact(source: &dyn RangeSource, object: u128, offset: u64, len: u64) -> Result<Vec<u8>, FormatError> {

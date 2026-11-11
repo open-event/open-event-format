@@ -755,3 +755,83 @@ fn selective_scans_and_queries_never_match_or_return_a_redacted_value() {
         assert_eq!(held[1], ![5, 30].contains(&ordinal), "row {ordinal}");
     }
 }
+
+#[test]
+fn time_ordered_scans_match_naive_for_every_limit_and_release_nothing_they_return() {
+    let file = file(400, 16);
+    let deletions = deletions();
+    let mut live: Vec<(i64, u64)> = naive_rows(&file)
+        .into_iter()
+        .filter(|&(at, ordinal)| at % 2 == 0 && !deletions.is_deleted(ordinal))
+        .collect();
+    for order in [ScanOrder::TimeAscending, ScanOrder::TimeDescending] {
+        live.sort_unstable();
+        if order == ScanOrder::TimeDescending {
+            live.reverse();
+        }
+        for limit in [None, Some(0), Some(1), Some(7), Some(64), Some(10_000)] {
+            let request = ScanRequest {
+                deletions: Some(&deletions),
+                limit,
+                order,
+                ..ScanRequest::default()
+            };
+            let (mut rows, stats) = run(&file, &request, true);
+            let mut expected: Vec<(i64, u64)> = live.iter().copied().take(limit.unwrap_or(usize::MAX)).collect();
+            assert_eq!(stats.rows_returned, expected.len(), "{order:?} {limit:?}");
+            rows.sort_unstable();
+            expected.sort_unstable();
+            assert_eq!(rows, expected, "{order:?} {limit:?}");
+        }
+    }
+}
+
+#[test]
+fn a_time_ordered_scan_without_a_limit_hands_batches_over_in_visit_order() {
+    let file = file(200, 16);
+    let request = ScanRequest {
+        order: ScanOrder::TimeDescending,
+        ..ScanRequest::default()
+    };
+    let mut sunk = Vec::new();
+    let stats = file
+        .scan_selective(
+            &[column_ids::OCCURRED_AT],
+            &all_granules(&file),
+            &request,
+            |batch, row| even(batch, row),
+            |selected| {
+                sunk.push((selected.batch.granule_id, selected.rows.len()));
+                Ok(())
+            },
+        )
+        .unwrap();
+    let visited: Vec<u32> = sunk.iter().map(|(granule_id, _)| *granule_id).collect();
+    let read: Vec<u32> = stats
+        .granules_read
+        .iter()
+        .copied()
+        .filter(|granule_id| visited.contains(granule_id))
+        .collect();
+    assert_eq!(visited, read);
+    assert_eq!(sunk.iter().map(|(_, rows)| rows).sum::<usize>(), stats.rows_returned);
+    assert!(sunk.iter().all(|(_, rows)| *rows > 0));
+}
+
+#[test]
+fn execute_query_statistics_match_the_per_granule_fold() {
+    let file = file(300, 16);
+    for entry in &file.footer().granules {
+        let pages: Vec<&PageStats> = file
+            .footer()
+            .page_stats
+            .iter()
+            .filter(|stats| stats.granule_id == entry.granule_id)
+            .collect();
+        assert!(!pages.is_empty());
+        assert_eq!(
+            fold_page_stats(entry, pages.into_iter()).statistics,
+            file.granule_statistics(entry).statistics
+        );
+    }
+}

@@ -4,9 +4,9 @@ use super::constant::{
 };
 use crate::error::{FormatError, LogReadError};
 use crate::file::bytes::{Reader, Writer};
-use crate::file::constant::CHUNK_GROUP_BYTES;
+use crate::file::constant::{CHUNK_GROUP_BYTES, TREE_TRAILER_MAGIC};
 use crate::file::integrity::{
-    attach_outboard_tree, crc64_matches, crc64_nvme, hash_tree, parse_outboard_object, verify_object_range,
+    BuiltOutboard, build_outboard_tree_and_root, crc64_matches, crc64_nvme, parse_outboard_object, verify_object_range,
 };
 
 #[derive(Debug)]
@@ -62,12 +62,14 @@ impl LogObjectWriter {
         self.bytes.put_u32(LOG_TRAILER_SENTINEL);
         self.bytes.put_u32(self.record_count);
         self.bytes.put_slice(&LOG_MAGIC);
-        let content = self.bytes.into_bytes();
-        let root = *hash_tree(&content).as_bytes();
-        SealedLogObject {
-            bytes: attach_outboard_tree(content, CHUNK_GROUP_BYTES),
-            root,
+        let mut bytes = self.bytes.into_bytes();
+        let BuiltOutboard { root, tree } = build_outboard_tree_and_root(&bytes, CHUNK_GROUP_BYTES);
+        if let Some(tree) = tree {
+            bytes.extend_from_slice(&tree);
+            bytes.extend_from_slice(&(tree.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(&TREE_TRAILER_MAGIC);
         }
+        SealedLogObject { bytes, root }
     }
 }
 
