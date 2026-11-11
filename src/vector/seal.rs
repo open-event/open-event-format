@@ -25,6 +25,7 @@ impl std::fmt::Debug for WrappingKey {
 pub(crate) struct FileKeys {
     pub(crate) data_key: Zeroizing<[u8; KEY_LEN]>,
     pub(crate) nonce_prefix: [u8; NONCE_PREFIX_LEN],
+    pub(crate) version: u16,
 }
 
 impl FileKeys {
@@ -33,7 +34,19 @@ impl FileKeys {
         let mut nonce_prefix = [0u8; NONCE_PREFIX_LEN];
         getrandom::fill(data_key.as_mut()).map_err(|_| VectorError::Random)?;
         getrandom::fill(&mut nonce_prefix).map_err(|_| VectorError::Random)?;
-        Ok(FileKeys { data_key, nonce_prefix })
+        Ok(FileKeys {
+            data_key,
+            nonce_prefix,
+            version: SEGMENT_VERSION,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn random_shared_nonce() -> Result<Self, VectorError> {
+        Ok(FileKeys {
+            version: SEGMENT_VERSION_SHARED_NONCE,
+            ..Self::random()?
+        })
     }
 
     pub(crate) fn seal(&self, index: u64, plaintext: &[u8]) -> Result<Vec<u8>, VectorError> {
@@ -49,11 +62,16 @@ impl FileKeys {
             .ok_or(VectorError::Authentication { what: "block" })
     }
 
-    fn nonce(&self, index: u64) -> [u8; 12] {
-        let mut nonce = [0u8; 12];
+    pub(crate) fn nonce(&self, index: u64) -> [u8; BLOCK_NONCE_LEN] {
+        let mut nonce = [0u8; BLOCK_NONCE_LEN];
+        let index = index.to_le_bytes();
+        let random = match self.version {
+            SEGMENT_VERSION_SHARED_NONCE => BLOCK_NONCE_LEN,
+            _ => NONCE_RANDOM_LEN,
+        };
         nonce
             .iter_mut()
-            .zip(self.nonce_prefix.iter().chain(index.to_le_bytes().iter()))
+            .zip(self.nonce_prefix.iter().take(random).chain(index.iter()))
             .for_each(|(slot, byte)| {
                 *slot = *byte;
             });
@@ -63,7 +81,7 @@ impl FileKeys {
     fn aad(&self, index: u64) -> Vec<u8> {
         let mut aad = Vec::with_capacity(4 + 2 + NONCE_PREFIX_LEN + 8);
         aad.extend_from_slice(SEGMENT_MAGIC);
-        aad.extend_from_slice(&SEGMENT_VERSION.to_le_bytes());
+        aad.extend_from_slice(&self.version.to_le_bytes());
         aad.extend_from_slice(&self.nonce_prefix);
         aad.extend_from_slice(&index.to_le_bytes());
         aad
@@ -77,7 +95,7 @@ impl FileKeys {
             .ok_or(VectorError::Authentication { what: "wrap data key" })?;
         let mut header = Vec::with_capacity(HEADER_LEN);
         header.extend_from_slice(SEGMENT_MAGIC);
-        header.extend_from_slice(&SEGMENT_VERSION.to_le_bytes());
+        header.extend_from_slice(&self.version.to_le_bytes());
         header.extend_from_slice(&0u16.to_le_bytes());
         header.extend_from_slice(&self.nonce_prefix);
         header.extend_from_slice(&wrap_nonce);
@@ -93,7 +111,7 @@ impl FileKeys {
             }));
         }
         let version = u16::from_le_bytes([header.get(4).copied().unwrap_or(0), header.get(5).copied().unwrap_or(0)]);
-        if version != SEGMENT_VERSION {
+        if version != SEGMENT_VERSION && version != SEGMENT_VERSION_SHARED_NONCE {
             return Err(VectorError::Format(crate::error::FormatError::UnsupportedVersion {
                 field: "vector segment version",
                 found: u32::from(version),
@@ -109,6 +127,7 @@ impl FileKeys {
         let mut keys = FileKeys {
             data_key: Zeroizing::new([0u8; KEY_LEN]),
             nonce_prefix,
+            version,
         };
         let opened = AeadScheme::XChaCha20Poly1305
             .open(wrapping.bytes(), wrap_nonce, &keys.wrap_aad(), wrapped)
@@ -122,7 +141,7 @@ impl FileKeys {
     fn wrap_aad(&self) -> Vec<u8> {
         let mut aad = Vec::with_capacity(4 + 2 + NONCE_PREFIX_LEN + 8);
         aad.extend_from_slice(SEGMENT_MAGIC);
-        aad.extend_from_slice(&SEGMENT_VERSION.to_le_bytes());
+        aad.extend_from_slice(&self.version.to_le_bytes());
         aad.extend_from_slice(&self.nonce_prefix);
         aad.extend_from_slice(b"datakey\0");
         aad

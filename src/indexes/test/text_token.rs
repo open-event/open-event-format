@@ -560,3 +560,28 @@ fn back_to_back_dense_sparse_and_empty_builds_leave_no_stale_trigrams() {
         .unwrap();
     assert_eq!(on_another_thread, reference_build(&["omega"], true).encode());
 }
+
+#[test]
+fn repeated_values_build_the_same_index_as_their_distinct_set() {
+    let distinct = ["Login Succeeded", "payment.failed for user-17", "naïve café", "abc", ""];
+    for include_ngrams in [false, true] {
+        let reference = TextTokenIndex::build_from_values(&distinct, include_ngrams);
+        let mut repeated = Vec::new();
+        for round in 0..3 {
+            for value in distinct {
+                repeated.extend(std::iter::repeat_n(value.to_owned(), 1 + round * 40));
+            }
+        }
+        let index = TextTokenIndex::build_from_iter(repeated.iter().map(String::as_str), include_ngrams);
+        assert_eq!(index, reference);
+        assert_eq!(index.encode(), reference.encode());
+    }
+    let index = TextTokenIndex::build_from_values(&["alpha", "alpha", "beta", "alpha", "gamma"], false);
+    for token in ["alpha", "beta", "gamma"] {
+        assert!(index.might_contain_token(token));
+    }
+    assert_eq!(
+        index,
+        TextTokenIndex::build_from_values(&["alpha", "beta", "gamma"], false)
+    );
+}

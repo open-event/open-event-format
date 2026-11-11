@@ -5,6 +5,7 @@ use crate::indexes::{Exactness, stable_hash, stable_hash_ascii_lowercase};
 use hashbrown::HashSet;
 use std::borrow::Cow;
 use std::cell::RefCell;
+use std::hash::{BuildHasherDefault, Hasher};
 
 const TEXT_TOKEN_MAGIC: u32 = 0x5454_4b31;
 
@@ -50,8 +51,12 @@ impl TextTokenIndex {
         let mut scratch = BUILD_SCRATCH
             .with(|slot| slot.borrow_mut().take())
             .unwrap_or_else(BuildScratch::new);
+        let mut previous = None;
         for text in values {
-            scratch.insert_value(text, include_ngrams);
+            if previous != Some(text) {
+                scratch.insert_value(text, include_ngrams);
+                previous = Some(text);
+            }
         }
         let filter = scratch.build_filter();
         if scratch.other_hashes.capacity() <= MAX_RETAINED_TOKEN_HASHES {
@@ -148,9 +153,28 @@ fn is_ascii_token_separator(byte: u8) -> bool {
     matches!(byte, b'\t' | b'\n' | 0x0B | 0x0C | b'\r' | b' ') || (byte.is_ascii_punctuation() && byte != b'\'')
 }
 
+#[derive(Default)]
+struct MixedKeyHasher(u64);
+
+impl Hasher for MixedKeyHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        self.0 = bytes
+            .iter()
+            .fold(self.0, |hash, byte| hash.rotate_left(8) ^ u64::from(*byte));
+    }
+
+    fn write_u64(&mut self, key: u64) {
+        self.0 = key;
+    }
+}
+
 struct BuildScratch {
     occupied_words: [u64; TRIGRAM_SUMMARY_WORDS],
-    other_hashes: HashSet<u64>,
+    other_hashes: HashSet<u64, BuildHasherDefault<MixedKeyHasher>>,
     trigram_count: usize,
     trigrams: Vec<u64>,
 }
@@ -159,7 +183,7 @@ impl BuildScratch {
     fn new() -> Self {
         BuildScratch {
             occupied_words: [0; TRIGRAM_SUMMARY_WORDS],
-            other_hashes: HashSet::new(),
+            other_hashes: HashSet::default(),
             trigram_count: 0,
             trigrams: vec![0; TRIGRAM_BITMAP_WORDS],
         }

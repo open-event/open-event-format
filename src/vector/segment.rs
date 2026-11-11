@@ -11,6 +11,7 @@ use arrow_array::types::{Float16Type, Float32Type, UInt8Type};
 use arrow_array::{ArrayRef, FixedSizeListArray, PrimitiveArray};
 use arrow_buffer::{Buffer, ScalarBuffer};
 use arrow_schema::Field;
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use zeroize::Zeroizing;
@@ -36,8 +37,16 @@ pub fn representation_column_id(element: VectorElement) -> u32 {
 }
 
 pub fn write_segment(spec: &SegmentSpec, input: &SegmentInput, wrapping: &WrappingKey) -> Result<Vec<u8>, VectorError> {
+    write_segment_sealed_by(spec, input, wrapping, &FileKeys::random()?)
+}
+
+pub(crate) fn write_segment_sealed_by(
+    spec: &SegmentSpec,
+    input: &SegmentInput,
+    wrapping: &WrappingKey,
+    keys: &FileKeys,
+) -> Result<Vec<u8>, VectorError> {
     validate(spec, input)?;
-    let keys = FileKeys::random()?;
     let rows = input.event_ids.len();
     let granules: Vec<(usize, usize)> = if rows == 0 {
         vec![(0, 0)]
@@ -380,6 +389,10 @@ pub trait SegmentSource {
     fn byte_len(&self) -> Result<u64, VectorError>;
 
     fn read_range(&self, offset: u64, len: usize) -> Result<Vec<u8>, VectorError>;
+
+    fn borrow_range(&self, _offset: u64, _len: usize) -> Option<&[u8]> {
+        None
+    }
 }
 
 impl<T: AsRef<[u8]>> SegmentSource for T {
@@ -393,6 +406,11 @@ impl<T: AsRef<[u8]>> SegmentSource for T {
             .get(start..start.checked_add(len).ok_or_else(truncated)?)
             .map(<[u8]>::to_vec)
             .ok_or_else(truncated)
+    }
+
+    fn borrow_range(&self, offset: u64, len: usize) -> Option<&[u8]> {
+        let start = usize::try_from(offset).ok()?;
+        self.as_ref().get(start..start.checked_add(len)?)
     }
 }
 
@@ -683,10 +701,10 @@ impl<S: SegmentSource> SegmentReader<S> {
         for granule in 0..self.granule_count() {
             let rows = self.granule_rows(granule) as u64;
             let wanted = filter.is_none_or(|filter| {
-                filter
-                    .ranges()
-                    .iter()
-                    .any(|range| range.start < first_row + rows && range.end > first_row)
+                let ranges = filter.ranges();
+                ranges
+                    .get(ranges.partition_point(|range| range.end <= first_row))
+                    .is_some_and(|range| range.start < first_row + rows)
             });
             if wanted && rows > 0 {
                 let plaintext = self.open_block(column, granule)?;
@@ -816,10 +834,11 @@ impl<S: SegmentSource> SegmentReader<S> {
         let (block, _) = column.blocks.get(granule).ok_or_else(|| VectorError::InvalidInput {
             rule: format!("granule {granule} past the segment's last"),
         })?;
-        let sealed = self.source.read_range(
-            block.offset,
-            usize::try_from(block.sealed_len).map_err(|_| truncated())?,
-        )?;
+        let sealed_len = usize::try_from(block.sealed_len).map_err(|_| truncated())?;
+        let sealed = match self.source.borrow_range(block.offset, sealed_len) {
+            Some(sealed) => Cow::Borrowed(sealed),
+            None => Cow::Owned(self.source.read_range(block.offset, sealed_len)?),
+        };
         self.blocks_opened.fetch_add(1, Ordering::Relaxed);
         self.keys.open(block.index, &sealed)
     }

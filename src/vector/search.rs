@@ -83,19 +83,38 @@ pub fn search_segments_with_deletes<S: SegmentSource>(
             .then(left.1.row.cmp(&right.1.row))
     });
     hits.truncate(search.k);
-    hits.into_iter()
-        .map(|(index, row)| {
-            let segment = segments.get(index).ok_or(VectorError::InvalidInput {
+    let mut by_segment: Vec<usize> = (0..hits.len()).collect();
+    by_segment.sort_by_key(|position| hits.get(*position).map(|(index, row)| (*index, row.row)));
+    let segment_of = |position: &usize| hits.get(*position).map(|(index, _)| *index);
+    let mut event_ids = vec![String::new(); hits.len()];
+    for positions in by_segment.chunk_by(|left, right| segment_of(left) == segment_of(right)) {
+        let segment = positions
+            .first()
+            .and_then(segment_of)
+            .and_then(|index| segments.get(index))
+            .ok_or(VectorError::InvalidInput {
                 rule: "segment index".to_owned(),
             })?;
-            Ok(SearchHit {
-                event_id: segment.event_ids(&[row.row])?.into_iter().next().unwrap_or_default(),
-                row: row.row,
-                score: row.score,
-                segment: index,
-            })
+        let rows: Vec<u64> = positions
+            .iter()
+            .filter_map(|position| hits.get(*position).map(|(_, row)| row.row))
+            .collect();
+        for (position, event_id) in positions.iter().zip(segment.event_ids(&rows)?) {
+            if let Some(slot) = event_ids.get_mut(*position) {
+                *slot = event_id;
+            }
+        }
+    }
+    Ok(hits
+        .into_iter()
+        .zip(event_ids)
+        .map(|((index, row), event_id)| SearchHit {
+            event_id,
+            row: row.row,
+            score: row.score,
+            segment: index,
         })
-        .collect()
+        .collect())
 }
 
 fn row_filter<S: SegmentSource>(

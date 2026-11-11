@@ -55,8 +55,12 @@ and SHALL return the best `k` rows, ties to the lower row.
 
 ### Requirement: Whole-file encryption
 Every block and the footer SHALL be sealed with the pinned AEAD under the file's random data key, each on a nonce made
-from the file's nonce prefix and the block's index, with the index bound as associated data. Only magic, version, the
-nonce prefix and the data key wrapped under a caller-supplied key SHALL be in the clear.
+from the file's nonce prefix and the block's index, with the index bound as associated data. The nonce SHALL be the
+first four bytes of the nonce prefix followed by the block's 64-bit little-endian index, so no two blocks of a file
+share a nonce. Only magic, version, the nonce prefix and the data key wrapped under a caller-supplied key SHALL be in
+the clear. A writer SHALL write version 2. A reader MAY open a version 1 file, whose blocks were all sealed on the
+leading twelve bytes of the nonce prefix, and SHALL NOT write one; the version is bound as associated data, so a file
+cannot be relabelled from one version to the other.
 
 #### Scenario: No plaintext in the file
 - **WHEN** a segment is written
@@ -69,6 +73,10 @@ nonce prefix and the data key wrapped under a caller-supplied key SHALL be in th
 #### Scenario: Tampering
 - **WHEN** a block is altered, swapped or the file truncated, or the wrong key is used
 - **THEN** opening or reading fails
+
+#### Scenario: Unique nonces
+- **WHEN** two blocks of one file hold identical plaintext
+- **THEN** their sealed bytes differ
 
 ### Requirement: Segment manifest
 The sealed footer SHALL carry a manifest of model, window (room, first and last event), row count, producer device,

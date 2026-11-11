@@ -3,6 +3,7 @@ use super::segment::{SegmentReader, SegmentSource};
 use crate::deletes::{DeletionVector, decode_deletion_vector, encode_deletion_vector};
 use crate::file::bytes::{Reader, Writer};
 use crate::indexes::bitmap::RoaringRangeBitmap;
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, Default)]
 pub struct SegmentDeletes {
@@ -63,6 +64,7 @@ impl SegmentDeletes {
 
 impl<S: SegmentSource> SegmentReader<S> {
     pub fn rows_for_event_ids(&self, event_ids: &[&str]) -> Result<Vec<u64>, VectorError> {
+        let wanted: HashSet<&str> = event_ids.iter().copied().collect();
         let mut rows = Vec::new();
         for granule in 0..self.granule_count() {
             let first = self.granule_first_row(granule);
@@ -70,7 +72,7 @@ impl<S: SegmentSource> SegmentReader<S> {
             rows.extend(
                 ids.iter()
                     .enumerate()
-                    .filter(|(_, id)| event_ids.contains(&id.as_str()))
+                    .filter(|(_, id)| wanted.contains(id.as_str()))
                     .map(|(local, _)| first + local as u64),
             );
         }

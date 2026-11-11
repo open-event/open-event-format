@@ -1,7 +1,10 @@
 pub const GRANULE_ROWS: usize = 4096;
 pub const BLOCK_ALIGNMENT: usize = 64;
 pub const SEGMENT_MAGIC: &[u8; 4] = b"OEFV";
-pub const SEGMENT_VERSION: u16 = 1;
+pub const SEGMENT_VERSION: u16 = 2;
+pub const SEGMENT_VERSION_SHARED_NONCE: u16 = 1;
+pub const BLOCK_NONCE_LEN: usize = 12;
+pub const NONCE_RANDOM_LEN: usize = BLOCK_NONCE_LEN - 8;
 pub const KEY_LEN: usize = 32;
 pub const NONCE_PREFIX_LEN: usize = 16;
 pub const WRAP_NONCE_LEN: usize = 24;
