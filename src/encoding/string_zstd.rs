@@ -1,6 +1,7 @@
 use super::decompressor::Decompressor;
 use super::{
-    Compression, FASTLANES_LANES, FASTLANES_VECTOR, NullStream, SideStream, Transform, bitpack, bitunpack, read_offsets,
+    Compression, FASTLANES_LANES, FASTLANES_VECTOR, MAX_BLOCK_VALUES, NullStream, SideStream, Transform, bitpack,
+    bitunpack, read_offsets,
 };
 use crate::error::FormatError;
 use crate::file::bytes::{Reader, Writer};
@@ -147,6 +148,11 @@ fn unrelay(tag: u8, relaid: &[u8], classic_len: usize, plain: &mut Vec<u8>) -> R
             if width > 64 {
                 return Err(FormatError::Structural {
                     rule: "bit width beyond 64",
+                });
+            }
+            if width == 0 && count > MAX_BLOCK_VALUES {
+                return Err(FormatError::Structural {
+                    rule: "zero-width bitpack count beyond the block bound",
                 });
             }
             let planes = usize::from(width).div_ceil(8);
@@ -362,6 +368,11 @@ fn parse(tag: u8, relaid: &[u8], classic_len: usize) -> Result<Relaid<'_>, Forma
             if width > 64 {
                 return Err(FormatError::Structural {
                     rule: "bit width beyond 64",
+                });
+            }
+            if width == 0 && count > MAX_BLOCK_VALUES {
+                return Err(FormatError::Structural {
+                    rule: "zero-width bitpack count beyond the block bound",
                 });
             }
             let planes = usize::from(width).div_ceil(8);

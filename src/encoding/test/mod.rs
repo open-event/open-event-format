@@ -1139,6 +1139,13 @@ fn null_stream_refuses_malformed_input() {
     assert!(read(&stream(8, 9, &[])).is_err(), "unknown form tag");
     assert!(read(&stream(u32::MAX, 0, &[])).is_err(), "amplified all-present count");
     assert!(read(&stream(u32::MAX, 1, &[])).is_err(), "amplified all-absent count");
+    assert!(
+        read(&stream(u32::MAX, 2, &0u32.to_le_bytes())).is_err(),
+        "amplified run-form count"
+    );
+    let bounded = [1u32.to_le_bytes().as_slice(), &run(0, 4)].concat();
+    assert!(read(&stream(MAX_BLOCK_VALUES as u32, 2, &bounded)).is_ok());
+    assert!(read(&stream(MAX_BLOCK_VALUES as u32 + 1, 2, &bounded)).is_err());
     let empty_run = [2u32.to_le_bytes().as_slice(), &run(3, 3)].concat();
     assert!(read(&stream(8, 2, &empty_run)).is_err(), "empty run");
     let beyond = [1u32.to_le_bytes().as_slice(), &run(0, 9)].concat();
@@ -1197,7 +1204,7 @@ fn raw_null_stream_borrows_the_input_bitmap_and_decodes_into_owned_output() {
 fn reference_null_stream_read<'a>(reader: &mut Reader<'a>) -> Result<NullStream<'a>, FormatError> {
     let row_count = reader.u32("string row count")? as usize;
     let form = match reader.u8("null stream form")? {
-        0 | 1 if row_count > MAX_BLOCK_VALUES => {
+        0..=2 if row_count > MAX_BLOCK_VALUES => {
             return Err(FormatError::Structural {
                 rule: "null stream row count beyond the block bound",
             });
@@ -5715,4 +5722,55 @@ fn occurred_residual_round_trips_and_refuses_malformed_inner_blocks() {
         body.extend_from_slice(&block.bytes[4..]);
         assert!(resolve_occurred_residual(&body, &occurred).is_err());
     }
+}
+
+#[test]
+fn a_run_form_null_stream_with_an_amplified_row_count_is_refused_by_string_decodes() {
+    let mut body = Writer::new();
+    body.put_u32(u32::MAX);
+    body.put_u8(2);
+    body.put_u32(0);
+    body.put_u32(0);
+    body.put_u32(0);
+    let body = body.into_bytes();
+    let pipeline = PipelineId::new(Transform::RawString, Compression::None, ValueKind::String);
+    assert!(decode_block(pipeline, &body).is_err());
+    assert!(decode_string_block_views(pipeline, &body).is_err());
+}
+
+#[test]
+fn alp_keeps_the_sign_of_negative_zero() {
+    let mut values: Vec<f64> = (0..3000).map(|row| f64::from(row % 400) / 4.0 - 20.0).collect();
+    for row in [0, 1, 500, 1023, 1024, 2999] {
+        values[row] = -0.0;
+    }
+    values[2] = 0.0;
+    let data = ColumnData::F64(values.clone());
+    let bits: Vec<u64> = values.iter().map(|value| value.to_bits()).collect();
+    for strategy in [CascadeStrategy::DecodeOptimized, CascadeStrategy::SizeOptimized] {
+        let block = encode_block_forced_for_conformance(&data, true, strategy, Transform::Alp).unwrap();
+        assert_eq!(block.pipeline.transform().unwrap(), Transform::Alp);
+        let ColumnData::F64(decoded) = decode_block(block.pipeline, &block.bytes).unwrap() else {
+            unreachable!("a float block decodes to floats")
+        };
+        let decoded_bits: Vec<u64> = decoded.iter().map(|value| value.to_bits()).collect();
+        assert_eq!(decoded_bits, bits, "{strategy:?}: full decode");
+        for (start, end) in [(0, 3), (499, 502), (1020, 1030), (2990, 3000)] {
+            let ColumnData::F64(range) = decode_block_range(block.pipeline, &block.bytes, start, end).unwrap() else {
+                unreachable!("a float block decodes to floats")
+            };
+            let range_bits: Vec<u64> = range.iter().map(|value| value.to_bits()).collect();
+            assert_eq!(range_bits, bits[start..end], "{strategy:?}: range {start}..{end}");
+        }
+    }
+    let chosen = encode_block(&data, true);
+    let ColumnData::F64(decoded) = decode_block(chosen.pipeline, &chosen.bytes).unwrap() else {
+        unreachable!("a float block decodes to floats")
+    };
+    assert!(
+        decoded
+            .iter()
+            .zip(&values)
+            .all(|(got, want)| got.to_bits() == want.to_bits())
+    );
 }

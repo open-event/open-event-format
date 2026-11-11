@@ -976,7 +976,7 @@ fn alp_try(value: f64, power: f64) -> Option<i64> {
     }
     let rounded = scaled.round();
     let as_int = rounded as i64;
-    if (as_int as f64) / power == value {
+    if ((as_int as f64) / power).to_bits() == value.to_bits() {
         Some(as_int)
     } else {
         None
@@ -996,7 +996,7 @@ fn alp_probe_chunk(values: &[f64], power: f64, zigzags: &mut [u64], encodable: &
             0.0
         };
         let rounded = truncated + adjust;
-        let ok = in_range && (rounded / power) == *value;
+        let ok = in_range && (rounded / power).to_bits() == value.to_bits();
         let as_int = rounded as i64;
         *zigzag_slot = if ok { zigzag(as_int) } else { 0 };
         *encodable_slot = ok;
@@ -1804,7 +1804,7 @@ impl<'a> NullStream<'a> {
     fn read(reader: &mut Reader<'a>) -> Result<Self, FormatError> {
         let row_count = reader.u32("string row count")? as usize;
         let form = match reader.u8("null stream form")? {
-            0 | 1 if row_count > MAX_BLOCK_VALUES => {
+            0..=2 if row_count > MAX_BLOCK_VALUES => {
                 return Err(FormatError::Structural {
                     rule: "null stream row count beyond the block bound",
                 });
