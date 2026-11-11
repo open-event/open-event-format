@@ -1494,3 +1494,69 @@ fn rows_for_range_carry_declared_relationships_after_the_replay_is_dropped() {
         );
     }
 }
+
+#[test]
+fn a_publication_carries_the_heads_index_artifacts_and_vector_segments_into_the_next_generation() {
+    let (world, range) = ingest(3);
+    let artifact = crate::lifecycle::IndexArtifactRef {
+        artifact_blake3: [7; 32],
+        column_id: 1,
+        covered_file_id: 0xA,
+        kind: crate::indexes::artifact::ArtifactKind::BinaryFuse,
+        object_key: "idx/a".to_owned(),
+    };
+    let retirement = crate::lifecycle::Retirement {
+        file_id: 0xA,
+        generation: 1,
+        since_nanos: 5,
+    };
+    let segment = crate::vector::VectorSegmentEntry {
+        deletes: None,
+        segment_id: 0xB,
+    };
+    let mut published = SimulatedPublishedSet::new();
+    published
+        .put_generation(ManifestGeneration {
+            footer_mirror: Some(crate::lifecycle::FooterMirrorObject {
+                blake3: [0; 32],
+                path: "mirror/1".to_owned(),
+                size_bytes: 1,
+            }),
+            generation: 1,
+            index_artifacts: vec![artifact.clone()],
+            retirements: vec![retirement],
+            vector_segments: vec![segment.clone()],
+            ..Default::default()
+        })
+        .unwrap();
+    published.advance_head(0, 1).unwrap();
+
+    let result = OePublisher::new()
+        .publish_range(
+            &world.storage,
+            ShardId(0),
+            1,
+            1,
+            None,
+            range,
+            &build_config(),
+            &mut published,
+            &SimObjectStore::new(),
+            &mut RecordingObserver::default(),
+            &mut NoopPeerNotices::default(),
+            &world.clock,
+            &SerialEncodeExecutor,
+        )
+        .unwrap();
+
+    let (head_id, head) = published.head().unwrap();
+    assert_eq!(head_id, 2);
+    assert_eq!(head.files, vec![result.entry]);
+    assert_eq!(head.index_artifacts, vec![artifact]);
+    assert_eq!(head.vector_segments, vec![segment]);
+    assert_eq!(head.retirements, vec![retirement]);
+    assert_eq!(
+        head.footer_mirror, None,
+        "the file set changed, so the mirror is dropped"
+    );
+}

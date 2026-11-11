@@ -3,10 +3,12 @@ use super::constant::{AUDIT_COMPACTION_REFUSED, LINEAR_LOOKUP_MAX_ENTRIES};
 use super::publish::{MAX_REBASE_ATTEMPTS, OePublisher, PeerNotices, PublishFailure, Published};
 use super::upload::upload_oe;
 use crate::clock::Clock;
+use crate::deletion_store::StoredDeletionVector;
 use crate::error::PublishError;
 use crate::events::{SequenceRange, TenantId};
+use crate::field_deletion_store::StoredFieldDeletionVector;
 use crate::invariants::PublishedSet;
-use crate::layout::{Profile, decode_header};
+use crate::layout::{OeHeader, Profile, decode_header};
 use crate::lifecycle::{FileType, GraphFileSummary, ManifestGeneration, OeFileEntry, PartState, Retirement};
 use crate::object_store::{ObjectStore, constant::MIN_MULTIPART_PART_BYTES, oe_object_key};
 use hashbrown::{HashMap, HashSet};
@@ -45,12 +47,62 @@ impl OePublisher {
         let (_, head) = published.head().map_err(PublishFailure::Publish)?;
         let coverage = merged_coverage(&head, inputs, config.tenant_id)?;
         self.verify_staged(&built, config, &coverage)?;
-        verify_rows_preserved(&built, &head, inputs, config.tenant_id, objects)?;
+        let merged = inputs
+            .iter()
+            .map(|input| MergedInput::fetch(&head, *input, config.tenant_id, objects))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.publish_merged_onto(built, config, &head, &merged, published, objects, notices, clock)
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the compaction publish wires every interface exactly once"
+    )]
+    pub(super) fn publish_merged(
+        &mut self,
+        built: BuiltOe,
+        config: &OeBuildConfig,
+        inputs: &[MergedInput],
+        published: &mut dyn PublishedSet,
+        objects: &dyn ObjectStore,
+        notices: &mut dyn PeerNotices,
+        clock: &dyn Clock,
+    ) -> Result<Published, PublishFailure> {
+        let (_, head) = published.head().map_err(PublishFailure::Publish)?;
+        self.publish_merged_onto(built, config, &head, inputs, published, objects, notices, clock)
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the compaction publish wires every interface exactly once"
+    )]
+    fn publish_merged_onto(
+        &mut self,
+        built: BuiltOe,
+        config: &OeBuildConfig,
+        head: &ManifestGeneration,
+        inputs: &[MergedInput],
+        published: &mut dyn PublishedSet,
+        objects: &dyn ObjectStore,
+        notices: &mut dyn PeerNotices,
+        clock: &dyn Clock,
+    ) -> Result<Published, PublishFailure> {
+        if built.footer.profile == Profile::Audit {
+            return Err(PublishFailure::Verification(AUDIT_COMPACTION_REFUSED));
+        }
+        let file_ids: Vec<u128> = inputs.iter().map(|input| input.file_id).collect();
+        let coverage = merged_coverage(head, &file_ids, config.tenant_id)?;
+        self.verify_staged(&built, config, &coverage)?;
+        verify_rows_preserved(&built, inputs, config.tenant_id)?;
+        let tenant_id = config.tenant_id;
         publish_in_place_of(
             built,
             config,
             coverage,
-            |_| Ok(inputs.to_vec()),
+            |head| {
+                deletions_unchanged(head, inputs, tenant_id)?;
+                Ok(file_ids.clone())
+            },
             published,
             objects,
             notices,
@@ -209,6 +261,11 @@ pub struct GraphRewriteOutput {
     pub inputs: Vec<u128>,
 }
 
+pub(super) struct MergedGraphOutput {
+    pub built: BuiltOe,
+    pub inputs: Vec<MergedInput>,
+}
+
 impl OePublisher {
     pub fn publish_graph_rewrite(
         &mut self,
@@ -225,7 +282,7 @@ impl OePublisher {
             ));
         }
         let (_, head) = published.head().map_err(PublishFailure::Publish)?;
-        let mut staged = Vec::with_capacity(outputs.len());
+        let mut merged = Vec::with_capacity(outputs.len());
         for output in outputs {
             if output.built.footer.profile != Profile::Graph {
                 return Err(PublishFailure::Verification(
@@ -234,7 +291,63 @@ impl OePublisher {
             }
             let coverage = merged_coverage(&head, &output.inputs, config.tenant_id)?;
             self.verify_staged(&output.built, config, &coverage)?;
-            verify_rows_preserved(&output.built, &head, &output.inputs, config.tenant_id, objects)?;
+            let inputs = output
+                .inputs
+                .iter()
+                .map(|input| MergedInput::fetch(&head, *input, config.tenant_id, objects))
+                .collect::<Result<Vec<_>, _>>()?;
+            verify_rows_preserved(&output.built, &inputs, config.tenant_id)?;
+            merged.push(MergedGraphOutput {
+                built: output.built,
+                inputs,
+            });
+        }
+        self.publish_graph_rewrite_onto(merged, config, &head, published, objects, notices, clock)
+    }
+
+    pub(super) fn publish_merged_graph_rewrite(
+        &mut self,
+        outputs: Vec<MergedGraphOutput>,
+        config: &OeBuildConfig,
+        published: &mut dyn PublishedSet,
+        objects: &dyn ObjectStore,
+        notices: &mut dyn PeerNotices,
+        clock: &dyn Clock,
+    ) -> Result<Vec<Published>, PublishFailure> {
+        let (_, head) = published.head().map_err(PublishFailure::Publish)?;
+        self.publish_graph_rewrite_onto(outputs, config, &head, published, objects, notices, clock)
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the graph rewrite publish wires every interface exactly once"
+    )]
+    fn publish_graph_rewrite_onto(
+        &mut self,
+        outputs: Vec<MergedGraphOutput>,
+        config: &OeBuildConfig,
+        head: &ManifestGeneration,
+        published: &mut dyn PublishedSet,
+        objects: &dyn ObjectStore,
+        notices: &mut dyn PeerNotices,
+        clock: &dyn Clock,
+    ) -> Result<Vec<Published>, PublishFailure> {
+        if outputs.is_empty() {
+            return Err(PublishFailure::Verification(
+                "a graph rewrite needs at least one output",
+            ));
+        }
+        let mut staged = Vec::with_capacity(outputs.len());
+        for output in outputs {
+            if output.built.footer.profile != Profile::Graph {
+                return Err(PublishFailure::Verification(
+                    "a graph rewrite publishes graph files only",
+                ));
+            }
+            let file_ids: Vec<u128> = output.inputs.iter().map(|input| input.file_id).collect();
+            let coverage = merged_coverage(head, &file_ids, config.tenant_id)?;
+            self.verify_staged(&output.built, config, &coverage)?;
+            verify_rows_preserved(&output.built, &output.inputs, config.tenant_id)?;
             staged.push((output, coverage));
         }
         let mut entries = Vec::with_capacity(staged.len());
@@ -247,7 +360,7 @@ impl OePublisher {
             )?;
             entries.push(output_entry(&output.built, config, *coverage));
         }
-        let finish = |generation: u64, staged: Vec<(GraphRewriteOutput, SequenceRange)>, entries: Vec<OeFileEntry>| {
+        let finish = |generation: u64, staged: Vec<(MergedGraphOutput, SequenceRange)>, entries: Vec<OeFileEntry>| {
             staged
                 .into_iter()
                 .zip(entries)
@@ -265,6 +378,9 @@ impl OePublisher {
             if entries.iter().all(|entry| head.files.contains(entry)) {
                 return Ok(finish(head_id, staged, entries));
             }
+            for (output, _) in &staged {
+                deletions_unchanged(&head, &output.inputs, config.tenant_id)?;
+            }
             let next_id = head_id + 1;
             let now = clock.now_nanos();
             let mut next = ManifestGeneration {
@@ -276,14 +392,14 @@ impl OePublisher {
                 let entry = next
                     .files
                     .iter_mut()
-                    .find(|entry| entry.file_id == *input && entry.part_state == PartState::Active)
+                    .find(|entry| entry.file_id == input.file_id && entry.part_state == PartState::Active)
                     .ok_or(PublishFailure::Verification(
                         "a compaction input is no longer an active file",
                     ))?;
                 debug_assert!(entry.part_state.can_transition_to(PartState::Outdated));
                 entry.part_state = PartState::Outdated;
                 next.retirements.push(Retirement {
-                    file_id: *input,
+                    file_id: input.file_id,
                     generation: next_id,
                     since_nanos: now,
                 });
@@ -495,25 +611,81 @@ fn merged_coverage(
     Ok(merged)
 }
 
-fn verify_rows_preserved(
-    built: &BuiltOe,
-    head: &crate::lifecycle::ManifestGeneration,
-    inputs: &[u128],
-    tenant_id: TenantId,
-    objects: &dyn ObjectStore,
-) -> Result<(), PublishFailure> {
-    let mut row_count = 0u64;
-    let mut any_deleted = false;
-    let mut bounds: Option<((u64, u64), (u64, u64))> = None;
-    for input in inputs {
+#[derive(Debug, Clone)]
+pub(super) struct MergedInput {
+    pub deletion_vector: Option<StoredDeletionVector>,
+    pub field_deletion_vectors: Vec<StoredFieldDeletionVector>,
+    pub file_id: u128,
+    pub header: OeHeader,
+}
+
+impl MergedInput {
+    pub(super) fn read(entry: &OeFileEntry, header: &OeHeader) -> Self {
+        Self {
+            deletion_vector: entry.deletion_vector.clone(),
+            field_deletion_vectors: entry.field_deletion_vectors.clone(),
+            file_id: entry.file_id,
+            header: header.clone(),
+        }
+    }
+
+    fn fetch(
+        head: &ManifestGeneration,
+        file_id: u128,
+        tenant_id: TenantId,
+        objects: &dyn ObjectStore,
+    ) -> Result<Self, PublishFailure> {
         let stored = objects
-            .get(&oe_object_key(tenant_id, *input))
+            .get(&oe_object_key(tenant_id, file_id))
             .map_err(PublishFailure::Storage)?
             .ok_or(PublishFailure::Verification(
                 "a compaction input's stored file is missing",
             ))?;
         let header = decode_header(&stored.bytes).map_err(PublishFailure::Format)?;
-        if header.file_id != *input || header.tenant_id != tenant_id {
+        let entry = head
+            .files
+            .iter()
+            .find(|entry| entry.file_id == file_id && entry.tenant_id == tenant_id);
+        Ok(Self {
+            deletion_vector: entry.and_then(|entry| entry.deletion_vector.clone()),
+            field_deletion_vectors: entry.map_or_else(Vec::new, |entry| entry.field_deletion_vectors.clone()),
+            file_id,
+            header,
+        })
+    }
+}
+
+fn deletions_unchanged(
+    head: &ManifestGeneration,
+    inputs: &[MergedInput],
+    tenant_id: TenantId,
+) -> Result<(), PublishFailure> {
+    for input in inputs {
+        let entry = head
+            .files
+            .iter()
+            .find(|entry| entry.file_id == input.file_id && entry.tenant_id == tenant_id)
+            .ok_or(PublishFailure::Verification(
+                "a compaction input is no longer an active file",
+            ))?;
+        if entry.deletion_vector != input.deletion_vector
+            || entry.field_deletion_vectors != input.field_deletion_vectors
+        {
+            return Err(PublishFailure::Verification(
+                "a compaction input's deleted rows or redacted fields changed after the merge read them",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_rows_preserved(built: &BuiltOe, inputs: &[MergedInput], tenant_id: TenantId) -> Result<(), PublishFailure> {
+    let mut row_count = 0u64;
+    let mut any_deleted = false;
+    let mut bounds: Option<((u64, u64), (u64, u64))> = None;
+    for input in inputs {
+        let header = &input.header;
+        if header.file_id != input.file_id || header.tenant_id != tenant_id {
             return Err(PublishFailure::Verification(
                 "a compaction input's stored file is a different file",
             ));
@@ -521,12 +693,7 @@ fn verify_rows_preserved(
         let first = (header.min_epoch, header.min_sequence);
         let last = (header.max_epoch, header.max_sequence);
         row_count = row_count.saturating_add(header.row_count);
-        let deleted = head
-            .files
-            .iter()
-            .find(|entry| entry.file_id == *input && entry.tenant_id == tenant_id)
-            .and_then(|entry| entry.deletion_vector.as_ref())
-            .map_or(0, |vector| vector.deleted_count);
+        let deleted = input.deletion_vector.as_ref().map_or(0, |vector| vector.deleted_count);
         row_count = row_count.saturating_sub(deleted);
         any_deleted |= deleted > 0;
         bounds = Some(bounds.map_or((first, last), |(low, high)| (low.min(first), high.max(last))));

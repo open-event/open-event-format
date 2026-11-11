@@ -173,3 +173,78 @@ fn the_backlog_rekeys_tenant_key_payloads_once_their_subject_is_resolved() {
         SubjectPayloadRead::Tombstone
     );
 }
+
+#[test]
+fn rekeying_a_file_keeps_its_deleted_rows_and_redacted_fields_out_of_the_rewrite() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = FixedClock::at(START_NANOS);
+    let keys = FileSubjectKeyStore::open(dir.path().join("keys"), TenantDek::new([4; 32])).unwrap();
+    let backlog = FileErasureBacklog::open(dir.path().join("backlog.log"));
+    let objects = SimObjectStore::new();
+    let mut published = SimulatedPublishedSet::new();
+
+    let rows = rows_of(1..=4);
+    let built = build_oe_file(rows.clone(), &build_config()).unwrap();
+    publish_built(&built, 1, 4, &mut published, &objects);
+    for row in &rows {
+        backlog
+            .record_unresolved(built.file_id, row.event.envelope.event_id)
+            .unwrap();
+    }
+    let (head_id, mut next) = published.head().unwrap();
+    next.generation = head_id + 1;
+    let mut deleted = crate::deletes::DeletionVector::new();
+    deleted.mark_deleted(2);
+    assert!(next.publish_deletions(built.file_id, &deleted, None).unwrap().is_some());
+    let mut redacted = crate::deletes::FieldDeletionVector::new(vec!["body".to_owned()]);
+    redacted.mark_affected(1);
+    assert!(
+        next.publish_field_deletions(built.file_id, &redacted)
+            .unwrap()
+            .is_some()
+    );
+    published.put_generation(next).unwrap();
+    published.advance_head(head_id, head_id + 1).unwrap();
+    backlog.resolve(rows[0].event.envelope.event_id, subject(10)).unwrap();
+    backlog.resolve(rows[2].event.envelope.event_id, subject(11)).unwrap();
+
+    let report = rekey_backlog_file(
+        &mut OePublisher::default(),
+        built.file_id,
+        &backlog,
+        &keys,
+        &build_config(),
+        &mut published,
+        &objects,
+        &mut NoopPeerNotices::default(),
+        &clock,
+    )
+    .unwrap();
+    assert_eq!(report.sealed, vec![rows[0].event.envelope.event_id]);
+    assert!(report.dropped.is_empty());
+
+    let (_, head) = published.head().unwrap();
+    let output_id = report.output_file_id.unwrap();
+    let entry = head.files.iter().find(|entry| entry.file_id == output_id).unwrap();
+    assert_eq!(entry.deletion_vector, None);
+    assert!(entry.field_deletion_vectors.is_empty());
+    let stored = objects.object(&oe_object_key(entry.tenant_id, output_id)).unwrap();
+    let file = OeFile::open(stored, Some(&entry.file_seal)).unwrap();
+    assert_eq!(file.header().row_count, 3, "the deleted row is physically gone");
+    let read = reads(&file, &keys);
+    assert_eq!(read[0], SubjectPayloadRead::Opened(payload_of(1)));
+    let SubjectPayloadRead::Plain(crate::layout::reader::PayloadRead::Value(VariantValue::Object(fields))) = &read[1]
+    else {
+        panic!("an object payload");
+    };
+    assert_eq!(
+        fields.get("body"),
+        Some(&VariantValue::Null),
+        "the redacted field stays redacted"
+    );
+    assert_eq!(fields.get("n"), Some(&VariantValue::Int(2)));
+    assert_eq!(
+        read[2],
+        SubjectPayloadRead::Plain(crate::layout::reader::PayloadRead::Value(payload_of(4)))
+    );
+}

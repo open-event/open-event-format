@@ -2,7 +2,7 @@ use super::build::{BuildLifecycle, BuildRow, OeBuildConfig, OeRow, SharedStrings
 use super::compaction::rebuild_graph_input;
 use super::graph_renumber::{RenumberSource, renumber_graph};
 use super::publish::{OePublisher, PeerNotices, PublishFailure, Published};
-use super::retire::GraphRewriteOutput;
+use super::retire::{MergedGraphOutput, MergedInput};
 use crate::artifacts::batch::{EventInput, PayloadInput};
 use crate::clock::Clock;
 use crate::columns::column_ids;
@@ -412,9 +412,11 @@ pub fn execute_compaction(
         ..config.clone()
     };
     let mut rows = Vec::new();
+    let mut inputs = Vec::with_capacity(entries.len());
     if graph_inputs == 0 {
         for entry in &entries {
             let file = open_stored_input(entry.file_id, &entry.file_seal, &config, objects)?;
+            inputs.push(MergedInput::read(entry, file.header()));
             let deletes = entry
                 .load_deletion_vector_from(objects)
                 .map_err(PublishFailure::Format)?;
@@ -455,10 +457,12 @@ pub fn execute_compaction(
         let mut sources = Vec::with_capacity(entries.len());
         for entry in &entries {
             let file = open_stored_input(entry.file_id, &entry.file_seal, &config, objects)?;
+            inputs.push(MergedInput::read(entry, file.header()));
             let redactions = entry.load_field_deletion_vectors().map_err(PublishFailure::Format)?;
             rows.extend(read_build_rows_redacted(&file, &redactions).map_err(PublishFailure::Format)?);
             sources.push(file);
         }
+        inputs.sort_by_key(|input| job.file_ids.iter().position(|file_id| *file_id == input.file_id));
         let mut later_entries: Vec<&OeFileEntry> = head
             .files
             .iter()
@@ -480,7 +484,7 @@ pub fn execute_compaction(
         config.profile = Profile::Graph;
     }
     let built = build_oe_file(rows, &config).map_err(PublishFailure::Format)?;
-    publisher.publish_compaction(built, &config, &job.file_ids, published, objects, notices, clock)
+    publisher.publish_merged(built, &config, &inputs, published, objects, notices, clock)
 }
 
 #[expect(
@@ -557,27 +561,44 @@ fn execute_graph_renumbering(
         }
     }
 
-    let source = |entry: &OeFileEntry| -> Result<RenumberSource, PublishFailure> {
-        let file = open_stored_input(entry.file_id, &entry.file_seal, config, objects)?;
-        let deleted = entry
-            .load_deletion_vector_from(objects)
-            .map_err(PublishFailure::Format)?;
-        let redactions = entry.load_field_deletion_vectors().map_err(PublishFailure::Format)?;
-        let rows = read_build_rows_redacted(&file, &redactions).map_err(PublishFailure::Format)?;
-        Ok(RenumberSource { deleted, file, rows })
-    };
+    let source =
+        |entry: &OeFileEntry, opened: Option<OeFile>| -> Result<(RenumberSource, MergedInput), PublishFailure> {
+            let file = match opened {
+                Some(file) => file,
+                None => open_stored_input(entry.file_id, &entry.file_seal, config, objects)?,
+            };
+            let input = MergedInput::read(entry, file.header());
+            let deleted = entry
+                .load_deletion_vector_from(objects)
+                .map_err(PublishFailure::Format)?;
+            let redactions = entry.load_field_deletion_vectors().map_err(PublishFailure::Format)?;
+            let rows = read_build_rows_redacted(&file, &redactions).map_err(PublishFailure::Format)?;
+            Ok((RenumberSource { deleted, file, rows }, input))
+        };
     let mut groups: Vec<Vec<RenumberSource>> = Vec::new();
-    let mut group_inputs: Vec<Vec<u128>> = Vec::new();
-    for entry in earlier.iter().filter(|entry| min_sn(entry) >= region_start) {
-        groups.push(vec![source(entry)?]);
-        group_inputs.push(vec![entry.file_id]);
+    let mut group_inputs: Vec<Vec<MergedInput>> = Vec::new();
+    for (index, entry) in earlier.iter().enumerate() {
+        if min_sn(entry) < region_start {
+            continue;
+        }
+        let opened = opened_earlier.get_mut(index).and_then(Option::take);
+        let (renumbered, input) = source(entry, opened)?;
+        groups.push(vec![renumbered]);
+        group_inputs.push(vec![input]);
     }
     let merged_index = groups.len();
-    groups.push(entries.iter().map(|entry| source(entry)).collect::<Result<_, _>>()?);
-    group_inputs.push(entries.iter().map(|entry| entry.file_id).collect());
+    let (merged_sources, merged_inputs): (Vec<_>, Vec<_>) = entries
+        .iter()
+        .map(|entry| source(entry, None))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .unzip();
+    groups.push(merged_sources);
+    group_inputs.push(merged_inputs);
     for entry in &later {
-        groups.push(vec![source(entry)?]);
-        group_inputs.push(vec![entry.file_id]);
+        let (renumbered, input) = source(entry, None)?;
+        groups.push(vec![renumbered]);
+        group_inputs.push(vec![input]);
     }
     let renumbered = renumber_graph(groups).map_err(PublishFailure::Format)?;
     let mut outputs = Vec::with_capacity(renumbered.files.len());
@@ -587,7 +608,7 @@ fn execute_graph_renumbering(
             profile: Profile::Graph,
             ..config.clone()
         };
-        outputs.push(GraphRewriteOutput {
+        outputs.push(MergedGraphOutput {
             built: build_oe_file(file.rows, &config).map_err(PublishFailure::Format)?,
             inputs,
         });
@@ -597,7 +618,7 @@ fn execute_graph_renumbering(
         ..config.clone()
     };
     publisher
-        .publish_graph_rewrite(outputs, &config, published, objects, notices, clock)?
+        .publish_merged_graph_rewrite(outputs, &config, published, objects, notices, clock)?
         .into_iter()
         .nth(merged_index)
         .ok_or(PublishFailure::Verification(
