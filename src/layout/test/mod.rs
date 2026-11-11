@@ -366,3 +366,151 @@ fn the_entity_hash_columns_elided_bit_is_known_but_declared_only_by_files_that_u
     assert!(crate::compat::check_features(required_features::ENTITY_HASH_COLUMNS_ELIDED, 0).is_ok());
     assert_eq!(required_features::ENTITY_HASH_COLUMNS_ELIDED & ((1 << 35) - 1), 0);
 }
+
+fn encode_presence_bit_by_bit(presence: &[u8], row_count: u32, out: &mut Writer) {
+    if presence.is_empty() {
+        out.put_u8(super::presence_forms::EMPTY);
+        return;
+    }
+    let rows = row_count as usize;
+    let is_set = |row: usize| presence.get(row / 8).is_some_and(|byte| byte & (1 << (row % 8)) != 0);
+    let set: Vec<usize> = (0..rows).filter(|&row| is_set(row)).collect();
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for &row in &set {
+        match runs.last_mut() {
+            Some((start, len)) if *start + *len == row => *len += 1,
+            _ => runs.push((row, 1)),
+        }
+    }
+    if set.len() == rows {
+        out.put_u8(super::presence_forms::ALL_PRESENT);
+        return;
+    }
+    if set.is_empty() {
+        out.put_u8(super::presence_forms::ALL_ABSENT);
+        return;
+    }
+    let raw_size = 4 + presence.len();
+    let runs_size = 4 + runs.len() * 8;
+    let positions_size = 4 + set.len() * 4;
+    if raw_size <= runs_size && raw_size <= positions_size {
+        out.put_u8(super::presence_forms::RAW);
+        out.put_u32(presence.len() as u32);
+        out.put_slice(presence);
+    } else if runs_size <= positions_size {
+        out.put_u8(super::presence_forms::SET_RUNS);
+        out.put_u32(runs.len() as u32);
+        for (start, len) in runs {
+            out.put_u32(start as u32);
+            out.put_u32(len as u32);
+        }
+    } else {
+        out.put_u8(super::presence_forms::SET_POSITIONS);
+        out.put_u32(set.len() as u32);
+        for row in set {
+            out.put_u32(row as u32);
+        }
+    }
+}
+
+#[test]
+fn presence_encoding_matches_the_bit_by_bit_reference() {
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut cases: Vec<(Vec<u8>, u32)> = vec![
+        (vec![0xFF], 0),
+        (vec![0xFF], 1),
+        (vec![0xFF; 8], 64),
+        (vec![0xFF; 8], 63),
+        (vec![0xFF; 9], 65),
+        (vec![0xFF; 16], 128),
+        (vec![0xFF; 16], 200),
+        (vec![0x80; 16], 128),
+        (vec![0x01; 16], 128),
+        (vec![0, 0, 0, 0, 0, 0, 0, 0x80, 0x01], 72),
+        (vec![0, 0, 0, 0, 0, 0, 0, 0x80, 0xFF, 0xFF], 80),
+        (vec![0xFF; 4], 4096),
+    ];
+    for bytes in [1usize, 2, 7, 8, 9, 15, 16, 17, 63, 64, 65, 200, 512, 1024] {
+        for density in [1u64, 2, 8, 64, 512] {
+            for clustered in [false, true] {
+                let mut bitmap = vec![0u8; bytes];
+                let mut on = false;
+                for row in 0..bytes * 8 {
+                    let flip = next() % density == 0;
+                    on = if clustered { on ^ flip } else { flip };
+                    if on {
+                        bitmap[row / 8] |= 1 << (row % 8);
+                    }
+                }
+                for rows in [
+                    bytes * 8,
+                    bytes * 8 - 1,
+                    bytes * 8 - 7,
+                    (bytes * 8).saturating_sub(64),
+                    bytes * 4,
+                    bytes * 8 + 5,
+                    bytes * 8 + 100,
+                ] {
+                    cases.push((bitmap.clone(), rows as u32));
+                }
+            }
+        }
+    }
+    for (bitmap, rows) in cases {
+        let mut fast = Writer::new();
+        super::encode_presence(&bitmap, rows, &mut fast);
+        let mut reference = Writer::new();
+        encode_presence_bit_by_bit(&bitmap, rows, &mut reference);
+        assert_eq!(
+            fast.into_bytes(),
+            reference.into_bytes(),
+            "{} bitmap bytes over {rows} rows",
+            bitmap.len()
+        );
+    }
+}
+
+#[test]
+fn presence_forms_that_rebuild_a_bitmap_refuse_a_row_count_beyond_the_block_bound() {
+    use crate::file::bytes::Reader;
+
+    let over = (super::MAX_ELIDED_BLOCK_ROWS + 1) as u32;
+    let mut runs = vec![super::presence_forms::SET_RUNS];
+    runs.extend_from_slice(&0u32.to_le_bytes());
+    let mut positions = vec![super::presence_forms::SET_POSITIONS];
+    positions.extend_from_slice(&0u32.to_le_bytes());
+    for bytes in [
+        vec![super::presence_forms::ALL_PRESENT],
+        vec![super::presence_forms::ALL_ABSENT],
+        runs,
+        positions,
+    ] {
+        for rows in [over, u32::MAX] {
+            assert!(matches!(
+                super::decode_presence(&mut Reader::new(&bytes), rows),
+                Err(FormatError::Structural {
+                    rule: "presence row count beyond the block bound"
+                })
+            ));
+        }
+        assert!(super::decode_presence(&mut Reader::new(&bytes), super::MAX_ELIDED_BLOCK_ROWS as u32).is_ok());
+    }
+    assert!(
+        super::decode_presence(&mut Reader::new(&[super::presence_forms::EMPTY]), u32::MAX)
+            .unwrap()
+            .is_empty()
+    );
+
+    let mut forged_runs = vec![super::presence_forms::SET_RUNS];
+    forged_runs.extend_from_slice(&u32::MAX.to_le_bytes());
+    assert!(super::decode_presence_ranges(&mut Reader::new(&forged_runs), u32::MAX, true).is_err());
+    let mut forged_positions = vec![super::presence_forms::SET_POSITIONS];
+    forged_positions.extend_from_slice(&u32::MAX.to_le_bytes());
+    assert!(super::decode_presence_ranges(&mut Reader::new(&forged_positions), u32::MAX, true).is_err());
+}
