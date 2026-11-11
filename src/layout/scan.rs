@@ -281,7 +281,7 @@ impl OeFile {
     }
 
     pub(crate) fn block_page_stats(&self, column_id: u32, granule_id: u32) -> Option<&PageStats> {
-        self.page_stats_index.get(&(column_id, granule_id))
+        self.index.page_stats_index.get(&(column_id, granule_id))
     }
 
     pub(crate) fn granule_entry(&self, granule_id: u32) -> Option<&GranuleEntry> {

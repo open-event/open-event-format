@@ -1424,14 +1424,14 @@ enum Marks {
 }
 
 #[derive(Debug, Clone, Default)]
-struct FileIndex {
+pub(super) struct FileIndex {
     embedding_row_offsets: HashMap<(u32, u32), EmbeddingRowOffsets>,
     entity_hash_filters_by_granule: HashMap<u32, usize>,
     freetext_row_offsets: HashMap<(u32, u32), FreetextRowOffsets>,
     granule_stripe_base: HashMap<u32, u64>,
     initial_aliased_extents: Vec<(u64, u64)>,
     page_marks: BTreeMap<(u32, u32, u32, u32), PageDirectoryEntry>,
-    page_stats_index: HashMap<(u32, u32), PageStats>,
+    pub(super) page_stats_index: HashMap<(u32, u32), PageStats>,
     payload_granule_index: HashMap<u32, PayloadGranule>,
     shared_alphabets: HashMap<u32, Arc<Vec<String>>>,
     snapshot_first_keys_in_order: bool,
@@ -1496,7 +1496,7 @@ pub struct OeFile {
     graph_edges: DashMap<u32, GraphEdgesSlot, ahash::RandomState>,
     graph_edges_bytes: AtomicU64,
     header: OeHeader,
-    index: Arc<FileIndex>,
+    pub(super) index: Arc<FileIndex>,
     inflated_residuals: DashMap<(u32, u32), InflatedResidualSlot, ahash::RandomState>,
     inflated_residuals_bytes: AtomicU64,
     lazy_stripes: Option<Arc<StripeVerification>>,
