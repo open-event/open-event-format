@@ -1,10 +1,10 @@
 use crate::events::TenantId;
 #[cfg(target_arch = "wasm32")]
 use aes_gcm::{Aes256Gcm, Nonce as AesNonce};
-use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+use chacha20poly1305::aead::{Aead, AeadInOut, KeyInit, Payload};
 use chacha20poly1305::{Key as XChaChaKey, XChaCha20Poly1305, XNonce};
 #[cfg(not(target_arch = "wasm32"))]
-use hardware_rust_crypto::aes_gcm::HardwareAes256Gcm;
+use hardware_rust_crypto::aes_gcm::{HardwareAes256Gcm, HardwareAes256GcmKeyState};
 use hashbrown::{HashMap, HashSet};
 use hkdf::Hkdf;
 use sha2::Sha256;
@@ -22,6 +22,17 @@ mod state_chunk;
 mod subject_fields;
 mod subject_keys;
 mod subject_payload;
+
+/// Longest nonce any [`AeadScheme`] takes (XChaCha20-Poly1305's 24 bytes).
+pub const MAX_NONCE_LEN: usize = 24;
+
+/// Byte length of the authentication tag both [`AeadScheme`]s append.
+pub const AEAD_TAG_LEN: usize = 16;
+
+/// Byte length of a content-key block seal of `plaintext_len` bytes: nonce, ciphertext, tag and 8-byte epoch.
+pub fn sealed_len(scheme: AeadScheme, plaintext_len: usize) -> usize {
+    scheme.nonce_len() + plaintext_len + AEAD_TAG_LEN + size_of::<u64>()
+}
 
 const MASTER_KEY_TENANT_DEK_INFO: &[u8] = b"open-event/master-key/tenant-dek/aes-256-gcm/v1";
 
@@ -43,10 +54,13 @@ fn derive_block_subkey(
     block_id: u64,
     key_epoch: u64,
 ) -> Option<zeroize::Zeroizing<[u8; KEY_LEN]>> {
-    let mut info = Vec::with_capacity(CONTENT_KEY_BLOCK_SEAL_INFO.len() + size_of::<u64>() * 2);
-    info.extend_from_slice(CONTENT_KEY_BLOCK_SEAL_INFO);
-    info.extend_from_slice(&block_id.to_le_bytes());
-    info.extend_from_slice(&key_epoch.to_le_bytes());
+    const INFO_LEN: usize = CONTENT_KEY_BLOCK_SEAL_INFO.len() + size_of::<u64>() * 2;
+    let mut info = [0u8; INFO_LEN];
+    let (label, ids) = info.split_at_mut(CONTENT_KEY_BLOCK_SEAL_INFO.len());
+    label.copy_from_slice(CONTENT_KEY_BLOCK_SEAL_INFO);
+    let (block, epoch) = ids.split_at_mut(size_of::<u64>());
+    block.copy_from_slice(&block_id.to_le_bytes());
+    epoch.copy_from_slice(&key_epoch.to_le_bytes());
     derive_wrapping_key(content_key, &info)
 }
 
@@ -103,6 +117,40 @@ impl AeadScheme {
         }
     }
 
+    /// Seals `data` in place: it leaves as ciphertext of the same length and the tag is returned. Same bytes as
+    /// [`seal`](Self::seal) split into ciphertext and tag, without allocating.
+    pub(crate) fn seal_in_place(
+        self,
+        key: &[u8; KEY_LEN],
+        nonce: &[u8],
+        aad: &[u8],
+        data: &mut [u8],
+    ) -> Option<[u8; AEAD_TAG_LEN]> {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            AeadScheme::AesGcm256 => HardwareAes256GcmKeyState::new(key)
+                .ok()?
+                .seal_in_place_detached(nonce, aad, data)
+                .ok(),
+            #[cfg(target_arch = "wasm32")]
+            AeadScheme::AesGcm256 => {
+                let nonce: [u8; 12] = nonce.try_into().ok()?;
+                let tag = Aes256Gcm::new(&(*key).into())
+                    .encrypt_inout_detached(&AesNonce::from(nonce), aad, data.into())
+                    .ok()?;
+                tag.as_slice().try_into().ok()
+            }
+            AeadScheme::XChaCha20Poly1305 => {
+                let nonce: [u8; 24] = nonce.try_into().ok()?;
+                let key: XChaChaKey = (*key).into();
+                let tag = XChaCha20Poly1305::new(&key)
+                    .encrypt_inout_detached(&XNonce::from(nonce), aad, data.into())
+                    .ok()?;
+                tag.as_slice().try_into().ok()
+            }
+        }
+    }
+
     pub(crate) fn open(self, key: &[u8; KEY_LEN], nonce: &[u8], aad: &[u8], ciphertext: &[u8]) -> Option<Vec<u8>> {
         match self {
             #[cfg(not(target_arch = "wasm32"))]
@@ -135,6 +183,18 @@ pub struct BlockNonce {
 }
 
 impl BlockNonce {
+    /// The nonce for `(block_id, key_epoch)` in a stack array: its first [`nonce_len`](AeadScheme::nonce_len) bytes are
+    /// what [`derive`](Self::derive) returns for any scheme.
+    pub fn derive_array(block_id: u64, key_epoch: u64) -> [u8; MAX_NONCE_LEN] {
+        let mut bytes = [0u8; MAX_NONCE_LEN];
+        let (block, rest) = bytes.split_at_mut(size_of::<u64>());
+        block.copy_from_slice(&block_id.to_le_bytes());
+        if let Some(epoch) = rest.first_chunk_mut::<8>() {
+            *epoch = key_epoch.to_le_bytes();
+        }
+        bytes
+    }
+
     pub fn derive(scheme: AeadScheme, block_id: u64, key_epoch: u64) -> Self {
         let mut bytes = Vec::with_capacity(scheme.nonce_len().max(size_of::<u64>() * 2));
         bytes.extend_from_slice(&block_id.to_le_bytes());
@@ -240,6 +300,7 @@ impl ContentKey {
         Self(zeroize::Zeroizing::new(key_material))
     }
 
+    #[cfg(test)]
     pub(crate) fn seal(
         &self,
         block_id: u64,
@@ -248,13 +309,43 @@ impl ContentKey {
         plaintext: &[u8],
         scheme: AeadScheme,
     ) -> Option<Vec<u8>> {
-        let subkey = derive_block_subkey(&self.0, block_id, key_epoch)?;
-        let nonce = BlockNonce::derive(scheme, block_id, key_epoch);
-        let ciphertext = scheme.seal(&subkey, &nonce.bytes, &block_seal_aad(block_id, file_id), plaintext)?;
-        let mut sealed = nonce.bytes;
-        sealed.extend_from_slice(&ciphertext);
-        sealed.extend_from_slice(&key_epoch.to_le_bytes());
+        let mut sealed = Vec::new();
+        self.seal_into(block_id, file_id, key_epoch, &[plaintext], scheme, &mut sealed)?;
         Some(sealed)
+    }
+
+    /// Appends the sealed blob for the concatenation of `plaintext_parts` to `out`: nonce, the parts copied once and
+    /// encrypted in place, tag, then epoch. On `None`, `out` is truncated back to its original length.
+    pub(crate) fn seal_into(
+        &self,
+        block_id: u64,
+        file_id: u128,
+        key_epoch: u64,
+        plaintext_parts: &[&[u8]],
+        scheme: AeadScheme,
+        out: &mut Vec<u8>,
+    ) -> Option<()> {
+        let start = out.len();
+        let subkey = derive_block_subkey(&self.0, block_id, key_epoch)?;
+        let nonce_array = BlockNonce::derive_array(block_id, key_epoch);
+        let nonce = nonce_array.get(..scheme.nonce_len())?;
+        let plaintext_len: usize = plaintext_parts.iter().map(|part| part.len()).sum();
+        out.reserve(sealed_len(scheme, plaintext_len));
+        out.extend_from_slice(nonce);
+        let body_start = out.len();
+        for part in plaintext_parts {
+            out.extend_from_slice(part);
+        }
+        let tag = out
+            .get_mut(body_start..)
+            .and_then(|body| scheme.seal_in_place(&subkey, nonce, &block_seal_aad(block_id, file_id), body));
+        let Some(tag) = tag else {
+            out.truncate(start);
+            return None;
+        };
+        out.extend_from_slice(&tag);
+        out.extend_from_slice(&key_epoch.to_le_bytes());
+        Some(())
     }
 
     pub fn open(&self, block_id: u64, file_id: u128, sealed: &[u8], scheme: AeadScheme) -> Option<Vec<u8>> {
@@ -371,6 +462,21 @@ impl SealedContentKey {
     }
 
     pub fn encrypt(&mut self, block_id: u64, file_id: u128, plaintext: &[u8]) -> Option<Vec<u8>> {
+        let mut sealed = Vec::with_capacity(sealed_len(self.scheme, plaintext.len()));
+        self.encrypt_into(block_id, file_id, &[plaintext], &mut sealed)?;
+        Some(sealed)
+    }
+
+    /// [`encrypt`](Self::encrypt) of the concatenation of `plaintext_parts`, appended to `out` and encrypted in place,
+    /// so a caller can write its own header and the sealed blob into one pre-sized buffer. On `None`, `out` is
+    /// unchanged.
+    pub fn encrypt_into(
+        &mut self,
+        block_id: u64,
+        file_id: u128,
+        plaintext_parts: &[&[u8]],
+        out: &mut Vec<u8>,
+    ) -> Option<()> {
         let mut state = self.lock_state();
         if state.key_epoch >= self.epoch_limit {
             return None;
@@ -380,11 +486,10 @@ impl SealedContentKey {
             state.key_epoch = next_epoch;
             state.sealed_blocks.clear();
         }
-        let sealed = self
-            .content_key
-            .seal(block_id, file_id, state.key_epoch, plaintext, self.scheme)?;
+        self.content_key
+            .seal_into(block_id, file_id, state.key_epoch, plaintext_parts, self.scheme, out)?;
         state.sealed_blocks.insert(block_id);
-        Some(sealed)
+        Some(())
     }
 
     pub fn decrypt(&self, block_id: u64, file_id: u128, sealed: &[u8]) -> Option<Vec<u8>> {

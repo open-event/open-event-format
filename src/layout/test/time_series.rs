@@ -90,7 +90,7 @@ fn row(i: u64, sample: Sample) -> OeRow {
                 tenant_id: TenantId::new_test_id(5),
                 trace_id_hash_low: 0,
             },
-            payload: PayloadInput::Variant(VariantValue::Object(payload)),
+            payload: PayloadInput::Variant(VariantValue::object(payload)),
             provenance: None,
             relationships: None,
             source_delivery: None,

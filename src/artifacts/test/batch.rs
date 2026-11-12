@@ -37,7 +37,7 @@ pub(crate) fn sample_events(count: usize) -> Vec<EventInput> {
                     schema_version: 3,
                     flags: EventFlags(0),
                 },
-                payload: PayloadInput::Variant(VariantValue::Object(payload_fields)),
+                payload: PayloadInput::Variant(VariantValue::object(payload_fields)),
                 source_schema: None,
                 source_delivery: Some(format!("delivery-{i}")),
                 connector_delivery_hash_low: 21,
@@ -141,13 +141,13 @@ fn an_already_encoded_payload_builds_the_same_batch_as_its_value_tree() {
 #[test]
 fn a_nested_already_encoded_payload_transcodes_to_the_same_bytes() {
     let mut nested = BTreeMap::new();
-    nested.insert("zeta".to_owned(), VariantValue::String("z".repeat(300)));
+    nested.insert("zeta".to_owned().into(), VariantValue::String("z".repeat(300)));
     nested.insert(
-        "alpha".to_owned(),
+        "alpha".to_owned().into(),
         VariantValue::Array(vec![
             VariantValue::Int(-9_000_000_000),
             VariantValue::Double(1.5),
-            VariantValue::Object(BTreeMap::from([(
+            VariantValue::object(BTreeMap::from([(
                 "deep".to_owned(),
                 VariantValue::Binary(vec![1, 2, 3]),
             )])),
@@ -533,4 +533,46 @@ fn side_table_refs_are_zero_without_a_section_and_absent_for_events_without_entr
             (2, 4 + first_set_len as u32),
         ]
     );
+}
+
+#[test]
+fn a_built_frame_converts_from_its_events_exactly_as_from_its_decoded_batch() {
+    use super::super::overlay;
+    let mut events = sample_events(4);
+    events[1].payload = PayloadInput::ExternalRef("oej://tenant/7/blob/1".to_owned());
+    events[2].payload = PayloadInput::None;
+    let frame_bytes = frame::build_frame(
+        &FrameBuildInput {
+            flags: 0,
+            tenant_id: TenantId::new_test_id(7),
+            writer_id: 3,
+            epoch: 1,
+            first_sequence: 10,
+            last_sequence: 13,
+            event_count: 4,
+            durable_batch_id: 900,
+            writer_local_batch_id: 1,
+            schema_generation: 1,
+            dictionary_generation_hint: 0,
+            created_at_physical: 1,
+            committed_at_physical: 2,
+        },
+        &build_batch(&events, 1, 0).unwrap(),
+    )
+    .unwrap();
+    let (header, payload) = frame::decode_frame(&frame_bytes).unwrap();
+    let decoded = decode_batch(payload, header.event_count).unwrap();
+    let via_decode = overlay::convert_frame(&header, &decoded, 1, 0, None, |_, _| false)
+        .unwrap()
+        .unwrap();
+    let via_events = overlay::convert_built_frame(&header, &events, payload, 1, 0, None, |_, _| false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(format!("{:?}", via_decode.batch), format!("{:?}", via_events.batch));
+    assert_eq!(via_decode.meta.payload_arena, via_events.meta.payload_arena);
+    assert_eq!(via_decode.meta.variant_dictionary, via_events.meta.variant_dictionary);
+    for row in 0..4 {
+        assert_eq!(via_decode.event(row).unwrap(), via_events.event(row).unwrap());
+    }
+    assert!(overlay::convert_built_frame(&header, &events[..3], payload, 1, 0, None, |_, _| false).is_err());
 }

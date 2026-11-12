@@ -56,7 +56,7 @@ fn row(i: u64) -> OeRow {
                 schema_version: 1,
                 flags: EventFlags(0),
             },
-            payload: PayloadInput::Variant(VariantValue::Object(payload)),
+            payload: PayloadInput::Variant(VariantValue::object(payload)),
             source_schema: None,
             source_delivery: None,
             connector_delivery_hash_low: i,
@@ -799,7 +799,7 @@ fn a_time_ordered_scan_without_a_limit_hands_batches_over_in_visit_order() {
             &[column_ids::OCCURRED_AT],
             &all_granules(&file),
             &request,
-            |batch, row| even(batch, row),
+            even,
             |selected| {
                 sunk.push((selected.batch.granule_id, selected.rows.len()));
                 Ok(())

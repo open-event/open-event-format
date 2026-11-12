@@ -116,7 +116,7 @@ fn file_with_stripes(stripes: usize) -> Vec<u8> {
         config.targets.stripe_target_bytes = low.midpoint(high);
         let built = oe::writer::build::build_oe_file(rows.clone(), &config).unwrap();
         match built.footer.stripes.len().cmp(&stripes) {
-            std::cmp::Ordering::Equal => return built.bytes,
+            std::cmp::Ordering::Equal => return std::sync::Arc::unwrap_or_clone(built.bytes),
             std::cmp::Ordering::Greater => low = config.targets.stripe_target_bytes + 1,
             std::cmp::Ordering::Less => high = config.targets.stripe_target_bytes - 1,
         }

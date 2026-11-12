@@ -78,5 +78,5 @@ pub fn signed_event_payload(content: &str, tags: &[&[&str]]) -> VariantValue {
                 .collect(),
         ),
     );
-    VariantValue::Object(fields)
+    VariantValue::Object(fields.into_iter().map(|(k, v)| (k.into(), v)).collect())
 }

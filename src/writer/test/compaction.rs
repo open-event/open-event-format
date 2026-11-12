@@ -178,7 +178,7 @@ fn row(i: u64, note: &str) -> OeRow {
                 schema_version: 2,
                 flags: EventFlags(0),
             },
-            payload: PayloadInput::Variant(VariantValue::Object(payload)),
+            payload: PayloadInput::Variant(VariantValue::object(payload)),
             source_schema: None,
             source_delivery: None,
             connector_delivery_hash_low: i,
@@ -269,7 +269,7 @@ fn plan_rewrite_reuses_unchanged_stripes_of_a_real_file_byte_identically() {
 
     let spliced = splice(&source, &replacement, &plan);
     assert_eq!(
-        spliced, replacement.bytes,
+        spliced, *replacement.bytes,
         "the spliced file is byte-identical to a full rewrite"
     );
 
@@ -308,7 +308,7 @@ fn plan_rewrite_reuses_a_relocated_stripe_from_its_new_offset() {
     );
 
     let spliced = splice(&source, &replacement, &plan);
-    assert_eq!(spliced, replacement.bytes);
+    assert_eq!(spliced, *replacement.bytes);
     OeFile::open(spliced, Some(&replacement.file_seal)).unwrap();
 }
 
@@ -341,7 +341,7 @@ fn plan_rewrite_rebuilds_a_changed_stripe() {
             .any(|d| matches!(d, StripeDisposition::Rebuild { .. })),
         "the changed stripe is rebuilt"
     );
-    assert_eq!(splice(&source, &replacement, &plan), replacement.bytes);
+    assert_eq!(splice(&source, &replacement, &plan), *replacement.bytes);
 }
 
 fn signed_row(author: &SimulatedEventAuthor, i: u64, note: &str) -> OeRow {
@@ -418,7 +418,7 @@ fn a_signed_event_re_verifies_offline_from_a_compacted_file_that_reused_its_stri
 
     let compacted = splice(&source, &replacement, &plan);
     assert_eq!(
-        compacted, replacement.bytes,
+        compacted, *replacement.bytes,
         "a spliced compaction is byte-identical to a full rewrite"
     );
     let file = OeFile::open(compacted, Some(&replacement.file_seal)).expect("the compacted file opens");
@@ -482,7 +482,7 @@ fn graph_event_id(sn: u64) -> Vec<u8> {
 fn graph_row(sn: u64, body: &str) -> BuildRow {
     let mut row = source_form_row(
         sn,
-        VariantValue::Object(BTreeMap::from([(
+        VariantValue::object(BTreeMap::from([(
             "body".to_owned(),
             VariantValue::String(body.to_owned()),
         )])),

@@ -6,6 +6,7 @@ use crate::events::sim::{SimulatedEventAuthor, signed_event_payload};
 use crate::events::variant::VariantValue;
 use crate::events::{EventEnvelope, EventFlags, EventId, StreamId, TimestampValue};
 use crate::invariants::io::ThreadPoolEncodeExecutor;
+use crate::invariants::sim::SerialEncodeExecutor;
 use crate::layout::graph::RowEdges;
 use crate::layout::reader::{OeFile, OeFooter, PayloadRead, SpeculativeTail, tail_range};
 use crate::typed_id::TypedIdTestExt;
@@ -55,7 +56,7 @@ fn row(i: u64) -> OeRow {
                 schema_version: 2,
                 flags: EventFlags(0),
             },
-            payload: PayloadInput::Variant(VariantValue::Object(payload)),
+            payload: PayloadInput::Variant(VariantValue::object(payload)),
             source_schema: None,
             source_delivery: None,
             connector_delivery_hash_low: i,
@@ -68,7 +69,7 @@ fn row(i: u64) -> OeRow {
 
 #[test]
 fn normalized_field_identities_reuse_shapes_without_interning_unused_nested_keys() {
-    let nested = VariantValue::Object(BTreeMap::from([("nested-only".to_owned(), VariantValue::Int(1))]));
+    let nested = VariantValue::object(BTreeMap::from([("nested-only".to_owned(), VariantValue::Int(1))]));
     let first = BTreeMap::from([
         ("amount".to_owned(), VariantValue::Int(1)),
         ("details".to_owned(), nested.clone()),
@@ -227,7 +228,7 @@ fn payloads_that_change_shape_row_to_row_route_by_their_own_shape() {
             if i.is_multiple_of(5)
                 && let PayloadInput::Variant(VariantValue::Object(fields)) = &mut shifting.event.payload
             {
-                fields.insert("middle".to_owned(), VariantValue::Int(500 + i as i64));
+                fields.insert("middle".to_owned().into(), VariantValue::Int(500 + i as i64));
             }
             shifting
         })
@@ -295,7 +296,7 @@ fn payloads_that_change_shape_row_to_row_route_by_their_own_shape() {
 fn benchmark_string_paths_against_stable_field_ids() {
     let payloads: Vec<VariantValue> = (0..100_000)
         .map(|row| {
-            VariantValue::Object(BTreeMap::from([
+            VariantValue::object(BTreeMap::from([
                 ("amount".to_owned(), VariantValue::Int(row)),
                 ("kind".to_owned(), VariantValue::String(format!("k{}", row % 4))),
                 ("note".to_owned(), VariantValue::String(format!("event {row}"))),
@@ -431,9 +432,9 @@ fn update_reuses_unchanged_blocks_and_matches_a_full_rewrite() {
         let PayloadInput::Variant(VariantValue::Object(payload)) = &mut row.event.payload else {
             panic!("test rows carry object payloads");
         };
-        payload.insert("amount".to_owned(), VariantValue::Int(90_000 + ordinal as i64));
+        payload.insert("amount".to_owned().into(), VariantValue::Int(90_000 + ordinal as i64));
         payload.insert(
-            "note".to_owned(),
+            "note".to_owned().into(),
             VariantValue::String(format!("corrected note {ordinal}")),
         );
     }
@@ -565,7 +566,7 @@ fn sparse_config() -> OeBuildConfig {
     cfg
 }
 
-fn payload_of(row: &mut OeRow) -> &mut BTreeMap<String, VariantValue> {
+fn payload_of(row: &mut OeRow) -> &mut BTreeMap<crate::events::variant::VariantKey, VariantValue> {
     let PayloadInput::Variant(VariantValue::Object(payload)) = &mut row.event.payload else {
         panic!("test rows carry object payloads");
     };
@@ -575,25 +576,28 @@ fn payload_of(row: &mut OeRow) -> &mut BTreeMap<String, VariantValue> {
 fn mutate(row: &mut OeRow, rng: &mut Lcg, wide: bool, ordinal: usize) {
     match rng.below(if wide { 6 } else { 3 }) {
         0 => {
-            payload_of(row).insert("amount".to_owned(), VariantValue::Int(rng.below(1_000_000) as i64));
+            payload_of(row).insert(
+                "amount".to_owned().into(),
+                VariantValue::Int(rng.below(1_000_000) as i64),
+            );
         }
         1 => {
             let note = format!("rewritten note {ordinal} {}", rng.next());
-            payload_of(row).insert("note".to_owned(), VariantValue::String(note));
+            payload_of(row).insert("note".to_owned().into(), VariantValue::String(note));
         }
         2 => row.event.envelope.dedupe_hash_low = rng.next(),
         3 => {
             let kind = format!("k{}", rng.below(4));
-            payload_of(row).insert("kind".to_owned(), VariantValue::String(kind));
+            payload_of(row).insert("kind".to_owned().into(), VariantValue::String(kind));
         }
         4 => {
             let payload = payload_of(row);
             if payload.remove("rare").is_none() {
-                payload.insert("rare".to_owned(), VariantValue::Bool(true));
+                payload.insert("rare".to_owned().into(), VariantValue::Bool(true));
             }
         }
         _ => {
-            payload_of(row).insert("extra".to_owned(), VariantValue::Int(ordinal as i64));
+            payload_of(row).insert("extra".to_owned().into(), VariantValue::Int(ordinal as i64));
         }
     }
 }
@@ -717,7 +721,7 @@ fn a_tail_granule_change_builds_only_itself_and_its_segment_head() {
     let mut after = before.clone();
     let ordinals: Vec<usize> = (320..336).step_by(3).collect();
     for &ordinal in &ordinals {
-        payload_of(&mut after[ordinal]).insert("amount".to_owned(), VariantValue::Int(-(ordinal as i64)));
+        payload_of(&mut after[ordinal]).insert("amount".to_owned().into(), VariantValue::Int(-(ordinal as i64)));
     }
     let changes = changes_for(&before, &after, &ordinals);
     let plan = plan_reuse(&source, &after, &changes, &cfg)
@@ -792,13 +796,13 @@ fn changes_only_update_refuses_what_needs_the_full_rows() {
     assert!(refused(|row| row.event.envelope.actor_id = Some("actor-9".to_owned())).is_some());
     assert!(
         refused(|row| {
-            payload_of(row).insert("kind".to_owned(), VariantValue::String("k9".to_owned()));
+            payload_of(row).insert("kind".to_owned().into(), VariantValue::String("k9".to_owned()));
         })
         .is_some()
     );
     assert!(
         refused(|row| {
-            payload_of(row).insert("extra".to_owned(), VariantValue::Int(1));
+            payload_of(row).insert("extra".to_owned().into(), VariantValue::Int(1));
         })
         .is_some()
     );
@@ -813,7 +817,7 @@ fn changes_only_update_refuses_what_needs_the_full_rows() {
 
 fn row_with_blob(i: u64) -> OeRow {
     let mut built = row(i);
-    payload_of(&mut built).insert("blob".to_owned(), VariantValue::Binary(vec![i as u8; 8]));
+    payload_of(&mut built).insert("blob".to_owned().into(), VariantValue::Binary(vec![i as u8; 8]));
     built
 }
 
@@ -841,7 +845,7 @@ fn a_residual_that_moves_a_stripe_boundary_falls_back_to_the_ordinary_update() {
     assert_ne!(source.footer.granules[1].stripe_id, source.footer.granules[2].stripe_id);
 
     let mut after = before.clone();
-    payload_of(&mut after[3]).insert("blob".to_owned(), VariantValue::Binary(vec![7; 200]));
+    payload_of(&mut after[3]).insert("blob".to_owned().into(), VariantValue::Binary(vec![7; 200]));
     let changes = changes_for(&before, &after, &[3]);
     assert!(
         plan_reuse(&source, &after, &changes, &cfg)
@@ -869,7 +873,7 @@ fn a_residual_that_moves_a_byte_cut_falls_back_to_the_ordinary_update() {
     assert!(source.footer.granules.iter().all(|granule| granule.row_count < 1_000));
 
     let mut after = before.clone();
-    payload_of(&mut after[1]).insert("blob".to_owned(), VariantValue::Binary(vec![7; 1_500]));
+    payload_of(&mut after[1]).insert("blob".to_owned().into(), VariantValue::Binary(vec![7; 1_500]));
     let changes = changes_for(&before, &after, &[1]);
     assert!(
         plan_reuse(&source, &after, &changes, &cfg)
@@ -885,7 +889,7 @@ fn a_residual_that_moves_a_byte_cut_falls_back_to_the_ordinary_update() {
     assert!(update_oe_file_from_source_changes_with_executor(&source, &changes, &cfg, &SerialEncodeExecutor).is_err());
 
     let mut after = before.clone();
-    payload_of(&mut after[1]).insert("blob".to_owned(), VariantValue::Binary(vec![7; 9]));
+    payload_of(&mut after[1]).insert("blob".to_owned().into(), VariantValue::Binary(vec![7; 9]));
     let changes = changes_for(&before, &after, &[1]);
     let updated =
         update_oe_file_from_changes_with_executor(&source, after.clone(), &changes, &cfg, &SerialEncodeExecutor)
@@ -914,7 +918,7 @@ fn authenticated_footer_proves_a_remote_stripe_range() {
             let PayloadInput::Variant(VariantValue::Object(ref mut payload)) = built.event.payload else {
                 unreachable!()
             };
-            payload.insert("note".to_owned(), VariantValue::String(note));
+            payload.insert("note".to_owned().into(), VariantValue::String(note));
             built
         })
         .collect();
@@ -1185,7 +1189,7 @@ fn a_column_declared_substring_searchable_carries_trigrams() {
                 unreachable!("row payload is a variant object");
             };
             map.insert(
-                "title".to_owned(),
+                "title".to_owned().into(),
                 VariantValue::String(format!("quarterly revenue report {i}")),
             );
             r
@@ -1670,7 +1674,7 @@ fn mixed_scale_decimals_normalize_to_the_largest_scale() {
             let PayloadInput::Variant(VariantValue::Object(ref mut map)) = r.event.payload else {
                 unreachable!("row payload is a variant object");
             };
-            map.insert("price".to_owned(), VariantValue::Decimal { scale, unscaled });
+            map.insert("price".to_owned().into(), VariantValue::Decimal { scale, unscaled });
             r
         })
         .collect();
@@ -1812,10 +1816,10 @@ fn residuals_larger_than_the_arena_estimate_still_round_trip() {
             let PayloadInput::Variant(VariantValue::Object(fields)) = &mut built.event.payload else {
                 panic!("the generated payload is an object");
             };
-            fields.insert("essay".to_owned(), VariantValue::String("x".repeat(4096)));
+            fields.insert("essay".to_owned().into(), VariantValue::String("x".repeat(4096)));
             fields.insert(
-                "details".to_owned(),
-                VariantValue::Object(BTreeMap::from([
+                "details".to_owned().into(),
+                VariantValue::object(BTreeMap::from([
                     ("depth".to_owned(), VariantValue::Int(index as i64)),
                     (
                         "tags".to_owned(),
@@ -1850,8 +1854,8 @@ fn repeated_residuals_share_one_copy_and_still_round_trip() {
         };
         fields.clear();
         fields.insert(
-            "details".to_owned(),
-            VariantValue::Object(BTreeMap::from([
+            "details".to_owned().into(),
+            VariantValue::object(BTreeMap::from([
                 ("group".to_owned(), VariantValue::Int(group as i64)),
                 (
                     "tags".to_owned(),
@@ -2065,11 +2069,11 @@ fn profiled_build_preserves_bytes_and_reports_each_phase_once() {
 fn corrupted_file_refuses() {
     let rows: Vec<OeRow> = (0..8).map(row).collect();
     let built = build_oe_file(rows.clone(), &config()).unwrap();
-    let mut corrupted = built.bytes.clone();
+    let mut corrupted = built.bytes.to_vec();
     let stripe_offset = built.footer.stripes[0].file_offset as usize;
     corrupted[stripe_offset] ^= 0xFF;
     assert!(OeFile::open(corrupted, None).is_err());
-    let mut tampered = built.bytes.clone();
+    let mut tampered = built.bytes.to_vec();
     let last = tampered.len() - 20;
     tampered[last] ^= 0x01;
     assert!(OeFile::open(tampered, Some(&built.file_seal)).is_err());
@@ -2389,7 +2393,7 @@ fn mixed_scale_shredded_decimals_round_trip_exactly() {
             let PayloadInput::Variant(VariantValue::Object(ref mut map)) = r.event.payload else {
                 unreachable!("row payload is a variant object");
             };
-            map.insert("price".to_owned(), VariantValue::Decimal { scale, unscaled });
+            map.insert("price".to_owned().into(), VariantValue::Decimal { scale, unscaled });
             r
         })
         .collect();
@@ -2432,7 +2436,7 @@ fn large_mantissa_decimal_round_trips_without_saturating() {
         let PayloadInput::Variant(VariantValue::Object(ref mut map)) = r.event.payload else {
             unreachable!("row payload is a variant object");
         };
-        map.insert("price".to_owned(), VariantValue::Decimal { scale, unscaled });
+        map.insert("price".to_owned().into(), VariantValue::Decimal { scale, unscaled });
         rows.push(r);
     }
     for i in 2..8u64 {
@@ -2441,7 +2445,7 @@ fn large_mantissa_decimal_round_trips_without_saturating() {
             unreachable!("row payload is a variant object");
         };
         map.insert(
-            "price".to_owned(),
+            "price".to_owned().into(),
             VariantValue::Decimal {
                 scale: 3,
                 unscaled: i128::from(i),
@@ -2482,7 +2486,7 @@ fn timestamp_field_round_trips_as_timestamp_including_mixed_int_path() {
             } else {
                 VariantValue::Int(500 + i as i64)
             };
-            map.insert("when".to_owned(), value);
+            map.insert("when".to_owned().into(), value);
             r
         })
         .collect();
@@ -2518,8 +2522,8 @@ fn float_stays_residual_while_double_and_int_shred() {
             let PayloadInput::Variant(VariantValue::Object(ref mut map)) = r.event.payload else {
                 unreachable!("row payload is a variant object");
             };
-            map.insert("ratio".to_owned(), VariantValue::Float(1.5 + i as f32));
-            map.insert("score".to_owned(), VariantValue::Double(2.5 + i as f64));
+            map.insert("ratio".to_owned().into(), VariantValue::Float(1.5 + i as f32));
+            map.insert("score".to_owned().into(), VariantValue::Double(2.5 + i as f64));
             r
         })
         .collect();
@@ -2559,7 +2563,7 @@ fn promoted_decimal_that_overflows_on_rescale_is_rejected() {
             let PayloadInput::Variant(VariantValue::Object(ref mut map)) = r.event.payload else {
                 unreachable!("row payload is a variant object");
             };
-            map.insert("price".to_owned(), VariantValue::Decimal { scale, unscaled });
+            map.insert("price".to_owned().into(), VariantValue::Decimal { scale, unscaled });
             r
         })
         .collect();
@@ -2591,7 +2595,7 @@ fn payload_heavy_rows_cut_granules_on_bytes_instead_of_tripping_the_stripe_clamp
             let PayloadInput::Variant(VariantValue::Object(ref mut map)) = r.event.payload else {
                 unreachable!("row payload is a variant object");
             };
-            map.insert(format!("body_{i}"), VariantValue::String(body.clone()));
+            map.insert(format!("body_{i}").into(), VariantValue::String(body.clone()));
             r
         })
         .collect();
@@ -2621,7 +2625,7 @@ fn oversized_freetext_arena_is_caught_by_the_stripe_clamp() {
             let PayloadInput::Variant(VariantValue::Object(ref mut map)) = r.event.payload else {
                 unreachable!("row payload is a variant object");
             };
-            map.insert("note".to_owned(), VariantValue::String("y".repeat(64 * 1024)));
+            map.insert("note".to_owned().into(), VariantValue::String("y".repeat(64 * 1024)));
             r
         })
         .collect();
@@ -2816,8 +2820,8 @@ fn a_point_read_into_a_seekable_residual_arena_inflates_one_frame_not_the_whole_
             let mut row = row(index);
             if let PayloadInput::Variant(VariantValue::Object(payload)) = &mut row.event.payload {
                 payload.insert(
-                    "detail".to_owned(),
-                    VariantValue::Object(
+                    "detail".to_owned().into(),
+                    VariantValue::object(
                         (0..4)
                             .map(|field| {
                                 (
@@ -2825,7 +2829,7 @@ fn a_point_read_into_a_seekable_residual_arena_inflates_one_frame_not_the_whole_
                                     VariantValue::String(format!("row {index} field {field} of the payload")),
                                 )
                             })
-                            .collect(),
+                            .collect::<Vec<(String, VariantValue)>>(),
                     ),
                 );
             }
@@ -3180,7 +3184,7 @@ fn hot_but_sparse_paths_store_as_sparse_shredded_columns() {
             if i % 4 == 0
                 && let PayloadInput::Variant(VariantValue::Object(fields)) = &mut sparse_row.event.payload
             {
-                fields.insert("burst".to_owned(), VariantValue::Int(9_000 + i as i64));
+                fields.insert("burst".to_owned().into(), VariantValue::Int(9_000 + i as i64));
             }
             sparse_row
         })
@@ -3225,7 +3229,10 @@ fn the_sparse_key_budget_leaves_overflow_paths_residual() {
             if let PayloadInput::Variant(VariantValue::Object(fields)) = &mut sparse_row.event.payload {
                 for key in 0..20u64 {
                     if i % 4 == key % 4 {
-                        fields.insert(format!("sparse-{key:02}"), VariantValue::Int((i * 100 + key) as i64));
+                        fields.insert(
+                            format!("sparse-{key:02}").into(),
+                            VariantValue::Int((i * 100 + key) as i64),
+                        );
                     }
                 }
             }
@@ -3298,7 +3305,7 @@ fn kind_alphabet_for_granules(granule_kinds: &[&[&str]]) -> Option<Vec<String>> 
                 let mut kind_row = row(i);
                 if let PayloadInput::Variant(VariantValue::Object(fields)) = &mut kind_row.event.payload {
                     fields.insert(
-                        "kind".to_owned(),
+                        "kind".to_owned().into(),
                         VariantValue::String(kinds[offset as usize % kinds.len()].to_owned()),
                     );
                 }
@@ -3455,7 +3462,7 @@ fn a_streamed_build_is_byte_identical_to_the_materialized_one() {
         expected_start = offset + len as u64;
     }
     assert_eq!(expected_start, streamed.total_len);
-    assert_eq!(streamed_bytes, materialized.bytes);
+    assert_eq!(streamed_bytes, *materialized.bytes);
     assert_eq!(streamed.file_id, materialized.file_id);
     assert_eq!(streamed.file_seal, materialized.file_seal);
     assert_eq!(streamed.file_crc64_nvme, materialized.file_crc64_nvme);
@@ -3477,31 +3484,31 @@ fn benchmark_granule_construction_over_mostly_residual_payloads() {
                 unreachable!("row payload is a variant object");
             };
             fields.remove("rare");
-            fields.insert("ratio".to_owned(), VariantValue::Float(1.5 + i as f32));
-            fields.insert("weight".to_owned(), VariantValue::Float(0.25 * i as f32));
+            fields.insert("ratio".to_owned().into(), VariantValue::Float(1.5 + i as f32));
+            fields.insert("weight".to_owned().into(), VariantValue::Float(0.25 * i as f32));
             fields.insert(
-                "detail".to_owned(),
-                VariantValue::Object(BTreeMap::from([
+                "detail".to_owned().into(),
+                VariantValue::object(BTreeMap::from([
                     ("channel".to_owned(), VariantValue::String("web".to_owned())),
                     ("retries".to_owned(), VariantValue::Int(i as i64 % 3)),
                 ])),
             );
             fields.insert(
-                "meta".to_owned(),
-                VariantValue::Object(BTreeMap::from([(
+                "meta".to_owned().into(),
+                VariantValue::object(BTreeMap::from([(
                     "locale".to_owned(),
                     VariantValue::String("en-gb".to_owned()),
                 )])),
             );
             fields.insert(
-                "tags".to_owned(),
+                "tags".to_owned().into(),
                 VariantValue::Array(vec![
                     VariantValue::String("a".to_owned()),
                     VariantValue::String("b".to_owned()),
                 ]),
             );
             fields.insert(
-                "history".to_owned(),
+                "history".to_owned().into(),
                 VariantValue::Array(vec![VariantValue::Int(i as i64)]),
             );
             wide
@@ -3623,14 +3630,14 @@ fn a_payload_field_list_out_of_key_order_is_refused() {
 
 #[test]
 fn every_variant_kind_round_trips_through_the_normalized_representation() {
-    let nested = VariantValue::Object(BTreeMap::from([
+    let nested = VariantValue::object(BTreeMap::from([
         ("depth".to_owned(), VariantValue::Int(2)),
         (
             "tags".to_owned(),
             VariantValue::Array(vec![VariantValue::String("a".to_owned()), VariantValue::Null]),
         ),
     ]));
-    let every_kind = VariantValue::Object(BTreeMap::from([
+    let every_kind = VariantValue::object(BTreeMap::from([
         (
             "array".to_owned(),
             VariantValue::Array(vec![VariantValue::Int(1), VariantValue::Bool(false)]),
@@ -3668,7 +3675,7 @@ fn every_variant_kind_round_trips_through_the_normalized_representation() {
         PayloadInput::Variant(VariantValue::String("bare".to_owned())),
         PayloadInput::ExternalRef("blob://payload/1".to_owned()),
         PayloadInput::None,
-        PayloadInput::Variant(VariantValue::Object(BTreeMap::from([(
+        PayloadInput::Variant(VariantValue::object(BTreeMap::from([(
             "int".to_owned(),
             VariantValue::Int(5),
         )]))),
@@ -4238,7 +4245,7 @@ fn updates_over_a_compressed_entity_alphabet_reuse_only_while_it_is_unchanged() 
 fn with_payload_edit(
     before: &[OeRow],
     ordinal: usize,
-    edit: impl FnOnce(&mut BTreeMap<String, VariantValue>),
+    edit: impl FnOnce(&mut BTreeMap<crate::events::variant::VariantKey, VariantValue>),
 ) -> Vec<OeRow> {
     let mut after = before.to_vec();
     edit(payload_of(&mut after[ordinal]));
@@ -4261,7 +4268,7 @@ fn an_update_that_changes_a_shredded_values_kind_rebuilds_the_residual() {
     let source = build_oe_file(ints.clone(), &cfg).unwrap();
     assert!(source.footer.shredded.iter().any(|entry| entry.path == "amount"));
     let text = with_payload_edit(&ints, 21, |payload| {
-        payload.insert("amount".to_owned(), VariantValue::String("unknown".to_owned()));
+        payload.insert("amount".to_owned().into(), VariantValue::String("unknown".to_owned()));
     });
 
     assert_update_matches_a_fresh_build(ints.clone(), text.clone(), &cfg);
@@ -4277,7 +4284,7 @@ fn an_update_that_makes_a_free_text_field_a_non_string_rebuilds_the_residual() {
     let cfg = sparse_config();
     let strings: Vec<OeRow> = (0..64).map(row).collect();
     let number = with_payload_edit(&strings, 40, |payload| {
-        payload.insert("note".to_owned(), VariantValue::Int(7));
+        payload.insert("note".to_owned().into(), VariantValue::Int(7));
     });
 
     assert_update_matches_a_fresh_build(strings.clone(), number.clone(), &cfg);
@@ -4291,7 +4298,7 @@ fn an_update_that_changes_a_shredded_decimals_scale_rebuilds_the_residual() {
         .map(|i| {
             let mut priced = row(i);
             payload_of(&mut priced).insert(
-                "price".to_owned(),
+                "price".to_owned().into(),
                 VariantValue::Decimal {
                     scale: 2,
                     unscaled: 100 + i128::from(i),
@@ -4302,9 +4309,9 @@ fn an_update_that_changes_a_shredded_decimals_scale_rebuilds_the_residual() {
         .collect();
     let source = build_oe_file(priced.clone(), &cfg).unwrap();
     assert!(source.footer.shredded.iter().any(|entry| entry.path == "price"));
-    let rescale = |payload: &mut BTreeMap<String, VariantValue>| {
+    let rescale = |payload: &mut BTreeMap<crate::events::variant::VariantKey, VariantValue>| {
         payload.insert(
-            "price".to_owned(),
+            "price".to_owned().into(),
             VariantValue::Decimal {
                 scale: 3,
                 unscaled: 4_321,
@@ -4370,7 +4377,7 @@ fn an_inbox_update_maps_changes_to_granules_by_the_files_entity_order() {
     );
     let mut after = before.clone();
     after[changed].event.envelope.dedupe_hash_low += 10_000;
-    payload_of(&mut after[changed]).insert("amount".to_owned(), VariantValue::Int(77_777));
+    payload_of(&mut after[changed]).insert("amount".to_owned().into(), VariantValue::Int(77_777));
     let full = build_oe_file(after.clone(), &cfg).unwrap();
 
     let updated = update_oe_file_with_executor(&source, &before, after.clone(), &cfg, &SerialEncodeExecutor).unwrap();
@@ -4424,7 +4431,7 @@ fn a_payload_wider_than_the_shredded_id_range_keeps_the_overflow_in_the_residual
             let mut wide = row(i);
             let payload = payload_of(&mut wide);
             for field in 0..1_100i64 {
-                payload.insert(format!("f{field:04}"), VariantValue::Int(field + i as i64));
+                payload.insert(format!("f{field:04}").into(), VariantValue::Int(field + i as i64));
             }
             wide
         })
@@ -4485,12 +4492,12 @@ fn residual_keys_are_gathered_across_rows_of_differing_field_sets() {
             let payload = payload_of(&mut varied);
             match i % 4 {
                 0 => {
-                    payload.insert("only_some".to_owned(), VariantValue::Bool(i % 8 == 0));
+                    payload.insert("only_some".to_owned().into(), VariantValue::Bool(i % 8 == 0));
                 }
                 1 => {
                     payload.insert(
-                        "nested".to_owned(),
-                        VariantValue::Object(BTreeMap::from([(format!("inner{}", i % 3), VariantValue::Int(1))])),
+                        "nested".to_owned().into(),
+                        VariantValue::object(BTreeMap::from([(format!("inner{}", i % 3), VariantValue::Int(1))])),
                     );
                 }
                 _ => {}

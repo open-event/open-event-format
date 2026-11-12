@@ -184,7 +184,7 @@ fn publish_in_place_of(
         if head.files.contains(&output) {
             return Ok(Published {
                 entry: output,
-                file_bytes: built.bytes,
+                file_bytes: std::sync::Arc::unwrap_or_clone(built.bytes),
                 generation: head_id,
             });
         }
@@ -217,7 +217,7 @@ fn publish_in_place_of(
             notices.oe_published(&output);
             return Ok(Published {
                 entry: output,
-                file_bytes: built.bytes,
+                file_bytes: std::sync::Arc::unwrap_or_clone(built.bytes),
                 generation: next_id,
             });
         }
@@ -366,7 +366,7 @@ impl OePublisher {
                 .zip(entries)
                 .map(|((output, _), entry)| Published {
                     entry,
-                    file_bytes: output.built.bytes,
+                    file_bytes: std::sync::Arc::unwrap_or_clone(output.built.bytes),
                     generation,
                 })
                 .collect()

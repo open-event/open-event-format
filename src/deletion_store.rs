@@ -1,13 +1,16 @@
 use crate::corrections::CorrectionResolver;
 use crate::deletes::{
     CorrectionMetadata, DeletionAggregateDelta, DeletionVector, DeletionVectorEncoding, DeletionVectorRef,
-    RowPositionDomain, check_decodable_row_count, decode_deletion_vector, encode_deletion_vector,
+    RowPositionDomain, check_decodable_run_count, decode_deletion_vector, encode_deletion_vector,
 };
 use crate::error::{EntityScanError, FormatError};
 use crate::events::{EventId, SequencePoint, SequenceRange, TenantId};
+use crate::field_deletion_store::FieldRedactions;
 use crate::layout::entity_scan::DeletesAndCorrections;
 use crate::lifecycle::{ManifestGeneration, OeFileEntry};
 use crate::object_store::{ObjectStore, PutOutcome};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 const STORED_DELETION_VECTOR_CONTEXT: &str = "oe 2026 stored deletion vector v1";
 
@@ -87,7 +90,7 @@ impl StoredDeletionVector {
             None => (DeletionVector::new(), 1),
         };
         merged.union_with(additions);
-        check_decodable_row_count(&merged)?;
+        check_decodable_run_count(&merged)?;
         let (_, encoded) = encode_deletion_vector(&merged);
         let mut stored = Self {
             blake3: [0; 32],
@@ -390,45 +393,108 @@ impl ManifestGeneration {
     }
 }
 
+type FileKey = (TenantId, u128);
+type VectorMemo = Mutex<HashMap<(FileKey, u64), Option<Arc<DeletionVector>>>>;
+type RedactionMemo = Mutex<HashMap<(FileKey, Vec<u64>), Arc<FieldRedactions>>>;
+
+/// [`DeletesAndCorrections`] over one manifest generation. Entries are indexed by `(tenant, file_id)` on first use,
+/// and loaded vectors are memoised by `(tenant, file_id, generation)` (immutable per generation), so repeated scans
+/// through the same value neither rescan the manifest nor re-fetch, re-hash or re-decode a vector.
 pub struct ManifestDeletes<'a> {
     pub corrections: &'a CorrectionResolver,
     pub manifest: &'a ManifestGeneration,
     pub objects: Option<&'a dyn ObjectStore>,
+    index: OnceLock<HashMap<FileKey, usize>>,
+    vectors: VectorMemo,
+    redactions: RedactionMemo,
+}
+
+impl<'a> ManifestDeletes<'a> {
+    pub fn new(
+        corrections: &'a CorrectionResolver,
+        manifest: &'a ManifestGeneration,
+        objects: Option<&'a dyn ObjectStore>,
+    ) -> Self {
+        Self {
+            corrections,
+            manifest,
+            objects,
+            index: OnceLock::new(),
+            vectors: Mutex::new(HashMap::new()),
+            redactions: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn entry(&self, tenant_id: TenantId, file_id: u128) -> Option<&'a OeFileEntry> {
+        let manifest = self.manifest;
+        let index = self.index.get_or_init(|| {
+            let mut index = HashMap::with_capacity(manifest.files.len());
+            for (position, entry) in manifest.files.iter().enumerate() {
+                index.entry((entry.tenant_id, entry.file_id)).or_insert(position);
+            }
+            index
+        });
+        index
+            .get(&(tenant_id, file_id))
+            .and_then(|&position| manifest.files.get(position))
+    }
 }
 
 impl DeletesAndCorrections for ManifestDeletes<'_> {
-    fn deletion_vector(&self, tenant_id: TenantId, file_id: u128) -> Result<Option<DeletionVector>, EntityScanError> {
-        let Some(entry) = self
-            .manifest
-            .files
-            .iter()
-            .find(|entry| entry.file_id == file_id && entry.tenant_id == tenant_id)
-        else {
+    fn deletion_vector(
+        &self,
+        tenant_id: TenantId,
+        file_id: u128,
+    ) -> Result<Option<Arc<DeletionVector>>, EntityScanError> {
+        let Some(entry) = self.entry(tenant_id, file_id) else {
             return Ok(None);
         };
-        Ok(match self.objects {
+        let generation = entry
+            .deletion_vector
+            .as_ref()
+            .map_or(0, |stored| stored.deletion_vector_generation);
+        let key = ((tenant_id, file_id), generation);
+        if let Some(cached) = self.vectors.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+            return Ok(cached.clone());
+        }
+        let loaded = match self.objects {
             Some(objects) => entry.load_deletion_vector_from(objects)?,
             None => entry.load_deletion_vector()?,
-        })
+        }
+        .map(Arc::new);
+        self.vectors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, loaded.clone());
+        Ok(loaded)
     }
 
     fn field_redactions(
         &self,
         tenant_id: TenantId,
         file_id: u128,
-    ) -> Result<Option<crate::field_deletion_store::FieldRedactions>, EntityScanError> {
-        let Some(entry) = self
-            .manifest
-            .files
-            .iter()
-            .find(|entry| entry.file_id == file_id && entry.tenant_id == tenant_id)
-        else {
+    ) -> Result<Option<Arc<FieldRedactions>>, EntityScanError> {
+        let Some(entry) = self.entry(tenant_id, file_id) else {
             return Ok(None);
         };
         if entry.field_deletion_vectors.is_empty() {
             return Ok(None);
         }
-        Ok(Some(entry.load_field_deletion_vectors()?))
+        let generations: Vec<u64> = entry
+            .field_deletion_vectors
+            .iter()
+            .map(|stored| stored.deletion_vector_generation)
+            .collect();
+        let key = ((tenant_id, file_id), generations);
+        if let Some(cached) = self.redactions.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+            return Ok(Some(cached.clone()));
+        }
+        let loaded = Arc::new(entry.load_field_deletion_vectors()?);
+        self.redactions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, loaded.clone());
+        Ok(Some(loaded))
     }
 
     fn is_correction(&self, _tenant_id: TenantId, point: SequencePoint) -> Result<bool, EntityScanError> {

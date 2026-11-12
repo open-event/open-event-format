@@ -3,9 +3,9 @@ use super::queue::{CommitQueue, PendingRecord, QueueRegion, peek_steal_raw};
 use super::reserve::{FORCE_COMMIT_IDLE_NANOS, SequenceAllocator};
 use super::retry::{RetryReceipt, SafeRetryStore, StatusClass};
 use crate::artifacts::FRAME_HEADER_LEN;
-use crate::artifacts::batch::{EventInput, build_batch, decode_batch};
+use crate::artifacts::batch::{EventInput, build_batch};
 use crate::artifacts::frame::{FLAG_VOID_RECORD, FrameBuildInput, build_frame, precheck_header};
-use crate::artifacts::overlay::{LiveOverlayStore, convert_frame};
+use crate::artifacts::overlay::{LiveOverlayStore, convert_built_frame};
 use crate::artifacts::watermark::WatermarkTracker;
 use crate::error::FormatError;
 use crate::events::{SequencePoint, SequenceRange, TenantId};
@@ -258,8 +258,8 @@ impl WorkerCommitPipeline {
         if let Err(error) = storage.sync(self.shard) {
             let (absent, present): (Vec<StagedFrame>, Vec<StagedFrame>) = frames.into_iter().partition(|frame| {
                 storage
-                    .read(self.shard, frame.offset, frame.bytes.len() as u32)
-                    .is_ok_and(|stored| stored != frame.bytes)
+                    .read_matches(self.shard, frame.offset, &frame.bytes)
+                    .is_ok_and(|matches| !matches)
             });
             for frame in &absent {
                 self.queue.abort_flush(frame.region);
@@ -272,10 +272,10 @@ impl WorkerCommitPipeline {
 
         for frame in &frames {
             let verified = storage
-                .read(self.shard, frame.offset, frame.bytes.len() as u32)
+                .read_matches(self.shard, frame.offset, &frame.bytes)
                 .map_err(FlushError::Storage)
-                .and_then(|stored| {
-                    if stored == frame.bytes {
+                .and_then(|matches| {
+                    if matches {
                         Ok(())
                     } else {
                         Err(FlushError::Format(FormatError::Structural {
@@ -313,7 +313,7 @@ impl WorkerCommitPipeline {
         };
         if state == CommitState::Committed {
             for frame in &frames {
-                self.publish_to_overlay(&frame.bytes, overlay)?;
+                self.publish_to_overlay(frame, overlay)?;
             }
         }
         Ok(FlushResult {
@@ -424,15 +424,23 @@ impl WorkerCommitPipeline {
         receipts
     }
 
-    fn publish_to_overlay(&self, frame_bytes: &[u8], overlay: &mut LiveOverlayStore) -> Result<(), FlushError> {
+    fn publish_to_overlay(&self, frame: &StagedFrame, overlay: &mut LiveOverlayStore) -> Result<(), FlushError> {
+        let frame_bytes = frame.bytes.as_slice();
         let header = precheck_header(frame_bytes).map_err(FlushError::Format)?;
         let payload = frame_bytes
             .get(FRAME_HEADER_LEN as usize..)
             .and_then(|rest| rest.get(..header.payload_len as usize))
             .ok_or(FlushError::Format(FormatError::Truncated { what: "frame payload" }))?;
-        let decoded = decode_batch(payload, header.event_count).map_err(FlushError::Format)?;
-        let segment = convert_frame(&header, &decoded, u64::from(self.shard.0), 0, None, |_, _| false)
-            .map_err(FlushError::Format)?;
+        let segment = convert_built_frame(
+            &header,
+            &frame.events,
+            payload,
+            u64::from(self.shard.0),
+            0,
+            None,
+            |_, _| false,
+        )
+        .map_err(FlushError::Format)?;
         if let Some(segment) = segment {
             overlay.publish(segment);
         }

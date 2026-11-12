@@ -329,6 +329,25 @@ fn read_at(file: &File, extent: u64, offset: u64, len: u32) -> Result<Vec<u8>, S
     Ok(bytes)
 }
 
+const READ_MATCH_CHUNK: usize = 64 * 1024;
+
+fn matches_at(file: &File, extent: u64, offset: u64, expected: &[u8]) -> Result<bool, StorageError> {
+    if offset.checked_add(expected.len() as u64).is_none_or(|end| end > extent) {
+        return Err(StorageError::OutOfBounds);
+    }
+    let mut buffer = vec![0; expected.len().min(READ_MATCH_CHUNK)];
+    let mut position = offset;
+    for chunk in expected.chunks(READ_MATCH_CHUNK) {
+        let stored = buffer.get_mut(..chunk.len()).ok_or(StorageError::OutOfBounds)?;
+        read_exact_at(file, stored, position).map_err(io_error("journal read"))?;
+        if stored != chunk {
+            return Ok(false);
+        }
+        position += chunk.len() as u64;
+    }
+    Ok(true)
+}
+
 impl JournalStorage for FileJournalStorage {
     fn append(&mut self, shard: ShardId, frame: &[u8]) -> Result<u64, StorageError> {
         if !frame.len().is_multiple_of(FRAME_ALIGN as usize) {
@@ -385,6 +404,13 @@ impl JournalStorage for FileJournalStorage {
             return read_at(&open.file, open.extent, offset, len);
         }
         self.with_reader(shard, |file, extent| read_at(file, extent, offset, len))
+    }
+
+    fn read_matches(&self, shard: ShardId, offset: u64, expected: &[u8]) -> Result<bool, StorageError> {
+        if let Some(open) = self.shards.get(&shard) {
+            return matches_at(&open.file, open.extent, offset, expected);
+        }
+        self.with_reader(shard, |file, extent| matches_at(file, extent, offset, expected))
     }
 
     fn extent(&self, shard: ShardId) -> Result<u64, StorageError> {

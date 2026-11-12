@@ -8,7 +8,7 @@ fn store(dir: &std::path::Path) -> FileSubjectKeyStore {
 }
 
 fn object(fields: &[(&str, VariantValue)]) -> VariantValue {
-    VariantValue::Object(fields.iter().map(|(k, v)| ((*k).to_owned(), v.clone())).collect())
+    VariantValue::object(fields.iter().map(|(k, v)| ((*k).to_owned(), v.clone())))
 }
 
 fn transfer() -> VariantValue {

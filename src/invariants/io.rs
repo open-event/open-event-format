@@ -65,6 +65,10 @@ impl super::EncodeExecutor for ThreadPoolEncodeExecutor {
     }
 
     fn run_jobs(&self, job_count: usize, job: &(dyn Fn(usize) + Sync)) {
-        (0..job_count).into_par_iter().for_each(job);
+        if job_count <= 1 || rayon::current_num_threads() <= 1 {
+            (0..job_count).for_each(job);
+        } else {
+            (0..job_count).into_par_iter().for_each(job);
+        }
     }
 }

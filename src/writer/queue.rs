@@ -104,6 +104,7 @@ fn encode_pending_into(
     put_optional_string(out, record.event.source_delivery.as_deref());
     match &record.event.payload {
         PayloadInput::Encoded(payload) => {
+            VariantRef::new(&payload.bytes).validate(&payload.dictionary)?;
             out.put_u8(1);
             put_encoded_payload(out, &payload.dictionary, &payload.bytes);
         }
@@ -157,6 +158,16 @@ fn peek_tenant_epoch(bytes: &[u8]) -> Option<(TenantId, u64)> {
 }
 
 pub fn decode_pending(bytes: &[u8]) -> Result<PendingRecord, FormatError> {
+    decode_pending_checked(bytes, true)
+}
+
+/// Decodes a record this queue encoded itself: its payload was validated when it was encoded (callers' encoded
+/// payloads are checked in `encode_pending_into`, values are encoded here), so the variant walk is skipped.
+fn decode_own_pending(bytes: &[u8]) -> Result<PendingRecord, FormatError> {
+    decode_pending_checked(bytes, false)
+}
+
+fn decode_pending_checked(bytes: &[u8], validate_payload: bool) -> Result<PendingRecord, FormatError> {
     let mut reader = Reader::new(bytes);
     let tenant_id = TenantId::from_uuid(Uuid::from_u128(reader.u128("tenant_id")?));
     let epoch = reader.u64("epoch")?;
@@ -195,7 +206,9 @@ pub fn decode_pending(bytes: &[u8]) -> Result<PendingRecord, FormatError> {
             let dictionary = KeyDictionary::from_sorted_unique(keys)?;
             let len = reader.u32("payload length")? as usize;
             let bytes = reader.take(len, "payload value")?;
-            VariantRef::new(bytes).validate(&dictionary)?;
+            if validate_payload {
+                VariantRef::new(bytes).validate(&dictionary)?;
+            }
             PayloadInput::Encoded(EncodedPayload {
                 bytes: bytes.to_vec(),
                 dictionary,
@@ -528,7 +541,7 @@ impl CommitQueue {
             if peek_tenant_epoch(bytes).is_some_and(|front| front != (tenant_id, epoch)) {
                 break;
             }
-            records.push(decode_pending(bytes).map_err(|_| QueueError::Codec)?);
+            records.push(decode_own_pending(bytes).map_err(|_| QueueError::Codec)?);
             cursor += (LEN_HEADER + len).next_multiple_of(RECORD_ALIGN);
         }
         Ok((QueueRegion { start, end: cursor }, records))
@@ -568,7 +581,9 @@ impl CommitQueue {
             return Ok(None);
         };
         self.admit_placed(records.len(), total_len, |index, out| {
-            out.put_slice(records.get(index).ok_or(QueueError::Codec)?);
+            let record = records.get(index).ok_or(QueueError::Codec)?;
+            decode_pending(record).map_err(|_| QueueError::Codec)?;
+            out.put_slice(record);
             Ok(())
         })
     }

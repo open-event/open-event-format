@@ -28,7 +28,7 @@ fn audit_config(chain_start: [u8; 32]) -> OeBuildConfig {
 
 fn audit_row(i: u64) -> BuildRow {
     let payload = match i % 4 {
-        0 => VariantValue::Object(BTreeMap::from([
+        0 => VariantValue::object(BTreeMap::from([
             ("actor".to_owned(), VariantValue::String(format!("user-{i}"))),
             ("approved".to_owned(), VariantValue::Bool(i.is_multiple_of(3))),
             (
@@ -42,9 +42,9 @@ fn audit_row(i: u64) -> BuildRow {
                 VariantValue::Array(vec![VariantValue::String("break-glass".to_owned())]),
             ),
         ])),
-        1 => VariantValue::Object(BTreeMap::from([(
+        1 => VariantValue::object(BTreeMap::from([(
             "key".to_owned(),
-            VariantValue::Object(BTreeMap::from([("id".to_owned(), VariantValue::Uuid(u128::from(i)))])),
+            VariantValue::object(BTreeMap::from([("id".to_owned(), VariantValue::Uuid(u128::from(i)))])),
         )])),
         2 => VariantValue::String(format!("signature check {i}")),
         _ => VariantValue::Int(i as i64),
@@ -130,7 +130,7 @@ fn a_file_whose_payload_fields_are_stored_as_columns_verifies() {
         .map(|i| {
             source_form_row(
                 i,
-                VariantValue::Object(BTreeMap::from([
+                VariantValue::object(BTreeMap::from([
                     (
                         "amount".to_owned(),
                         VariantValue::Decimal {

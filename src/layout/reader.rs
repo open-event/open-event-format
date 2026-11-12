@@ -1490,6 +1490,10 @@ pub struct OeFile {
     column_cache_bytes: AtomicU64,
     decoded_cache_budget: u64,
     dictionary_decodes: AtomicU64,
+    /// The last granule's decoded envelope columns, so per-row `envelope`/`event` calls in one granule decode once.
+    pub(super) envelope_columns: std::sync::Mutex<Option<(u32, Arc<super::event::EnvelopeColumns>)>>,
+    /// The last granule's EVENT_ID column, so per-row event-id lookups in one granule decode it once.
+    pub(crate) event_ids: std::sync::Mutex<Option<(u32, Arc<[u128]>)>>,
     footer: Arc<Footer>,
     granule_dictionaries: DashMap<u32, DictionarySlot, ahash::RandomState>,
     granule_dictionaries_bytes: AtomicU64,
@@ -1512,28 +1516,30 @@ pub struct OeFile {
 }
 
 impl OeFile {
-    pub fn open(bytes: Vec<u8>, expected_seal: Option<&[u8; SEAL_LEN]>) -> Result<Self, FormatError> {
+    pub fn open(bytes: impl Into<Arc<Vec<u8>>>, expected_seal: Option<&[u8; SEAL_LEN]>) -> Result<Self, FormatError> {
         Self::open_with_keys(bytes, expected_seal, None)
     }
 
     pub fn open_with_keys(
-        bytes: Vec<u8>,
+        bytes: impl Into<Arc<Vec<u8>>>,
         expected_seal: Option<&[u8; SEAL_LEN]>,
         footer_dek: Option<&[u8; FOOTER_DEK_LEN]>,
     ) -> Result<Self, FormatError> {
-        Self::open_inner(bytes, expected_seal, footer_dek, false)
+        Self::open_inner(bytes.into(), expected_seal, footer_dek, false)
     }
 
+    /// Every open takes a `Vec<u8>` or an already-shared `Arc<Vec<u8>>`; shared bytes are kept by reference, so
+    /// opening a file the caller holds in memory (such as a [`BuiltOe`](crate::writer::build::BuiltOe)) copies nothing.
     pub fn open_lazy(
-        bytes: Vec<u8>,
+        bytes: impl Into<Arc<Vec<u8>>>,
         expected_seal: Option<&[u8; SEAL_LEN]>,
         footer_dek: Option<&[u8; FOOTER_DEK_LEN]>,
     ) -> Result<Self, FormatError> {
-        Self::open_inner(bytes, expected_seal, footer_dek, true)
+        Self::open_inner(bytes.into(), expected_seal, footer_dek, true)
     }
 
     fn open_inner(
-        bytes: Vec<u8>,
+        bytes: Arc<Vec<u8>>,
         expected_seal: Option<&[u8; SEAL_LEN]>,
         footer_dek: Option<&[u8; FOOTER_DEK_LEN]>,
         lazy: bool,
@@ -1631,7 +1637,7 @@ impl OeFile {
             None
         };
         Self::assemble(
-            FileBytes::Local(Arc::new(bytes)),
+            FileBytes::Local(bytes),
             header,
             footer,
             usable_optional_features,
@@ -1882,6 +1888,8 @@ impl OeFile {
             column_cache_bytes: AtomicU64::new(0),
             decoded_cache_budget,
             dictionary_decodes: AtomicU64::new(0),
+            envelope_columns: std::sync::Mutex::new(None),
+            event_ids: std::sync::Mutex::new(None),
             granule_dictionaries: DashMap::default(),
             granule_dictionaries_bytes: AtomicU64::new(0),
             graph_edges: DashMap::default(),
@@ -3390,12 +3398,12 @@ impl OeFile {
         if let VariantValue::Object(fields) = &mut value {
             for entry in &self.footer.shredded {
                 if let Some(shredded) = self.shredded_value_for_row(entry.column_id, granule, row_in_granule)? {
-                    fields.insert(entry.path.clone(), shredded);
+                    fields.insert(entry.path.as_str().into(), shredded);
                 }
             }
             for entry in &self.footer.freetext {
                 if let Some(text) = self.freetext_value_for_row(entry.column_id, granule, row_in_granule)? {
-                    fields.insert(entry.declared_field.clone(), text);
+                    fields.insert(entry.declared_field.as_str().into(), text);
                 }
             }
         }
@@ -3439,12 +3447,12 @@ impl OeFile {
         if let VariantValue::Object(fields) = &mut value {
             for entry in &self.footer.shredded {
                 if let Some(shredded) = self.field_value_in_group(group, entry.column_id, row_in_granule)? {
-                    fields.insert(entry.path.clone(), shredded);
+                    fields.insert(entry.path.as_str().into(), shredded);
                 }
             }
             for entry in &self.footer.freetext {
                 if let Some(text) = self.freetext_value_in_group(group, entry.column_id, row_in_granule)? {
-                    fields.insert(entry.declared_field.clone(), text);
+                    fields.insert(entry.declared_field.as_str().into(), text);
                 }
             }
         }

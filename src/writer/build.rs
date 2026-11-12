@@ -29,7 +29,7 @@ use crate::indexes::ndv::NdvSketch;
 use crate::indexes::probabilistic::SplitBlockBloomFilter;
 use crate::indexes::text_token::TextTokenIndex;
 use crate::invariants::EncodeExecutor;
-use crate::invariants::sim::SerialEncodeExecutor;
+use crate::invariants::io::ThreadPoolEncodeExecutor;
 use crate::layout::footer::{
     ClusteringEntry, ColumnDescriptor, ColumnKind, ColumnMark, EntityHashFilterEntry, ExactCounts, FileDictionaries,
     Footer, FreetextEntry, FreetextRowOffsets, GranuleEntry, GraphBlockEntry, GraphDirectory, InboxRecipientEntry,
@@ -38,7 +38,7 @@ use crate::layout::footer::{
     StripeNdvEntry, StripeProofEntry, TextTokenEntry, TextTokenOffsetsEntry, encode_stripe_marks_pages,
 };
 use crate::layout::graph::{ChainCover, EventIdIndex, GraphInput, encode_graph_blocks, state_root_entries};
-use crate::layout::reader::{OeFile, PayloadRead};
+use crate::layout::reader::{OeFile, PayloadRead, PayloadRef};
 use crate::layout::snapshot::SnapshotKeyIndex;
 use crate::layout::time_series::{FloatAggregate, RollupBucket, TimeSeriesRollups};
 use crate::layout::{
@@ -428,7 +428,8 @@ pub struct BuiltOe {
     pub entity_summary: crate::indexes::entity_summary::EntitySummary,
     pub reused_source_block_bytes: u64,
     pub reused_source_blocks: u64,
-    pub bytes: Vec<u8>,
+    /// Shared so a reader over a file the writer holds needs no copy of it.
+    pub bytes: Arc<Vec<u8>>,
     pub file_seal: [u8; 32],
     pub file_crc64_nvme: u64,
     pub file_id: u128,
@@ -752,7 +753,7 @@ fn collect_key_names<'a>(value: &'a VariantValue, out: &mut Vec<&'a str>) {
         }
         VariantValue::Object(fields) => {
             for (key, field_value) in fields {
-                out.push(key.as_str());
+                out.push(key);
                 collect_key_names(field_value, out);
             }
         }
@@ -1168,7 +1169,16 @@ impl NormalizedBatch {
         for row in rows {
             let payload = match std::mem::replace(&mut row.payload, BuildPayload::None) {
                 BuildPayload::Encoded(encoded) => {
-                    shared.build_payload(VariantRef::new(&encoded.bytes).decode(&encoded.dictionary)?)
+                    let value = VariantRef::new(&encoded.bytes);
+                    match value.decode_object_fields(&encoded.dictionary)? {
+                        Some(fields) => BuildPayload::Object(
+                            fields
+                                .into_iter()
+                                .map(|(name, value)| (shared.share(name), value))
+                                .collect(),
+                        ),
+                        None => BuildPayload::Whole(value.decode(&encoded.dictionary)?),
+                    }
                 }
                 payload => payload,
             };
@@ -2080,7 +2090,7 @@ fn plan_source_update<'a>(
         });
     };
 
-    let file = OeFile::open_lazy(source.bytes.clone(), Some(&source.file_seal), None)?;
+    let file = OeFile::open_lazy(Arc::clone(&source.bytes), Some(&source.file_seal), None)?;
     let u64_column = |column_id: u32, granule_id: u32| -> Result<Vec<u64>, FormatError> {
         match file.read_column(column_id, granule_id)?.data {
             ColumnData::U64(values) => Ok(values),
@@ -2097,9 +2107,13 @@ fn plan_source_update<'a>(
             continue;
         }
         built.push((*granule, rows.len()));
-        let payloads = (0..u64::from(granule.row_count))
-            .map(|row| file.payload(granule.first_row_ordinal + row))
-            .collect::<Result<Vec<PayloadRead>, FormatError>>()?;
+        // One batched read per granule: flags, key dictionary and shredded blocks resolved once, not per row.
+        let refs: Vec<PayloadRef> = (0..u64::from(granule.row_count))
+            .map(|row| PayloadRef {
+                row_ordinal: granule.first_row_ordinal + row,
+            })
+            .collect();
+        let payloads = file.read_payloads(&refs)?.payloads;
         let sequence = u64_column(column_ids::SEQUENCE, granule.granule_id)?;
         let dedupe_low = u64_column(column_ids::DEDUPE_HASH_LOW, granule.granule_id)?;
         let dedupe_high = u64_column(column_ids::DEDUPE_HASH_HIGH, granule.granule_id)?;
@@ -2203,8 +2217,12 @@ fn plan_update_reuse<'a>(
     )
 }
 
+/// Builds a file on the global rayon pool: granules, blocks, footer metadata
+/// and stripe layout run as parallel jobs, and the bytes match
+/// [`build_oe_file_with_executor`] with [`crate::invariants::sim::SerialEncodeExecutor`]. On a
+/// one-thread pool the jobs run inline.
 pub fn build_oe_file<R: BuildInput>(rows: Vec<R>, config: &OeBuildConfig) -> Result<BuiltOe, FormatError> {
-    build_oe_file_with_executor(rows, config, &SerialEncodeExecutor)
+    build_oe_file_with_executor(rows, config, &ThreadPoolEncodeExecutor)
 }
 
 pub fn build_oe_file_with_executor<R: BuildInput>(
@@ -5033,7 +5051,7 @@ fn build_oe_file_sealed_in_order(
         entity_summary,
         reused_source_block_bytes,
         reused_source_blocks,
-        bytes: file,
+        bytes: Arc::new(file),
         file_seal,
         file_crc64_nvme,
         file_id,

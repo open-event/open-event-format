@@ -60,6 +60,7 @@ impl StoredFieldDeletionVector {
 
     pub fn load(&self, expected_file_id: u128) -> Result<FieldDeletionVector, FormatError> {
         let rows = self.load_rows(expected_file_id)?;
+        check_decodable_row_count(&rows)?;
         let mut vector = FieldDeletionVector::new(self.redacted_columns.clone());
         rows.iter().for_each(|row| vector.mark_affected(row));
         Ok(vector)

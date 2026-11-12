@@ -8,16 +8,89 @@ use super::{
 use crate::error::FormatError;
 use crate::file::bytes::{Reader, slice};
 use crate::indexes::rank_select::BitRankDirectory;
-use std::borrow::Cow;
 
 const NULL_CODE: u32 = u32::MAX;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DictionaryCodes<'a> {
     codes: Vec<u32>,
-    dictionary: Cow<'a, [String]>,
+    dictionary: BlockDictionary<'a>,
     sorted: bool,
 }
+
+/// The dictionary a [`DictionaryCodes`] projection indexes, in code order: the column's file-scope alphabet, borrowed,
+/// or the block's own entries held in one text arena (one allocation for the whole dictionary, not one per entry).
+#[derive(Debug, Clone)]
+pub enum BlockDictionary<'a> {
+    /// The column's file-scope alphabet, borrowed from the caller.
+    Shared(&'a [String]),
+    /// The block-local entries, every one present, in one arena.
+    Local(StringColumn),
+}
+
+impl<'a> BlockDictionary<'a> {
+    /// Number of entries.
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Shared(entries) => entries.len(),
+            Self::Local(entries) => entries.len(),
+        }
+    }
+
+    /// Whether the dictionary has no entries.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Entry `code`, or `None` past the last one.
+    pub fn get(&self, code: usize) -> Option<&str> {
+        match self {
+            Self::Shared(entries) => entries.get(code).map(String::as_str),
+            Self::Local(entries) => entries.get(code).flatten(),
+        }
+    }
+
+    /// Every entry, in code order.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &str> + '_ {
+        (0..self.len()).map(|code| self.get(code).unwrap_or_default())
+    }
+
+    /// Binary-searches the sorted entries for `needle`, as [`slice::binary_search`] does.
+    pub fn binary_search(&self, needle: &str) -> Result<usize, usize> {
+        let (mut low, mut high) = (0usize, self.len());
+        while low < high {
+            let mid = low + (high - low) / 2;
+            match self.get(mid).unwrap_or_default().cmp(needle) {
+                std::cmp::Ordering::Less => low = mid + 1,
+                std::cmp::Ordering::Greater => high = mid,
+                std::cmp::Ordering::Equal => return Ok(mid),
+            }
+        }
+        Err(low)
+    }
+
+    /// Detaches the dictionary from the alphabet it may borrow.
+    pub fn into_owned(self) -> BlockDictionary<'static> {
+        match self {
+            Self::Shared(entries) => {
+                let mut local = StringColumn::with_capacity(entries.len(), entries.iter().map(String::len).sum());
+                for entry in entries {
+                    local.push(Some(entry));
+                }
+                BlockDictionary::Local(local)
+            }
+            Self::Local(entries) => BlockDictionary::Local(entries),
+        }
+    }
+}
+
+impl PartialEq for BlockDictionary<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.len() == other.len() && self.iter().eq(other.iter())
+    }
+}
+
+impl Eq for BlockDictionary<'_> {}
 
 impl<'a> DictionaryCodes<'a> {
     pub fn len(&self) -> usize {
@@ -28,7 +101,7 @@ impl<'a> DictionaryCodes<'a> {
         self.codes.is_empty()
     }
 
-    pub fn dictionary(&self) -> &[String] {
+    pub fn dictionary(&self) -> &BlockDictionary<'a> {
         &self.dictionary
     }
 
@@ -42,11 +115,7 @@ impl<'a> DictionaryCodes<'a> {
     }
 
     pub fn value(&self, row: usize) -> Option<Option<&str>> {
-        Some(
-            self.code(row)?
-                .and_then(|code| self.dictionary.get(code as usize))
-                .map(String::as_str),
-        )
+        Some(self.code(row)?.and_then(|code| self.dictionary.get(code as usize)))
     }
 
     pub fn code_counts(&self) -> Vec<u64> {
@@ -68,7 +137,7 @@ impl<'a> DictionaryCodes<'a> {
                 .map(|&code| equal.get(code as usize).copied().unwrap_or(false))
                 .collect();
         }
-        match self.dictionary.binary_search_by(|entry| entry.as_str().cmp(needle)) {
+        match self.dictionary.binary_search(needle) {
             Ok(index) => {
                 let target = index as u32;
                 self.codes.iter().map(|&code| code == target).collect()
@@ -97,7 +166,7 @@ impl<'a> DictionaryCodes<'a> {
     pub fn into_owned(self) -> DictionaryCodes<'static> {
         DictionaryCodes {
             codes: self.codes,
-            dictionary: Cow::Owned(self.dictionary.into_owned()),
+            dictionary: self.dictionary.into_owned(),
             sorted: self.sorted,
         }
     }
@@ -133,14 +202,19 @@ pub(super) fn dictionary_codes_from_body<'a>(
 ) -> Result<DictionaryCodes<'a>, FormatError> {
     let mut reader = Reader::new(body);
     let nulls = NullStream::read(&mut reader)?;
-    let dictionary: Cow<'a, [String]> = if side == SideStream::FileScopeDictionary {
-        Cow::Borrowed(shared.ok_or(FormatError::Structural {
+    let dictionary = if side == SideStream::FileScopeDictionary {
+        BlockDictionary::Shared(shared.ok_or(FormatError::Structural {
             rule: "shared-scope dictionary block without its file alphabet",
         })?)
     } else {
         let dict_count = reader.u32("dictionary count")? as usize;
         let values = DictionaryValues::read(&mut reader, dict_count, side)?;
-        Cow::Owned(values.entries()?.into_iter().map(str::to_owned).collect())
+        let entries = values.entries()?;
+        let mut local = StringColumn::with_capacity(entries.len(), entries.iter().map(|entry| entry.len()).sum());
+        for entry in entries {
+            local.push(Some(entry));
+        }
+        BlockDictionary::Local(local)
     };
     if dictionary.len() >= NULL_CODE as usize {
         return Err(FormatError::Structural {
@@ -173,8 +247,9 @@ pub(super) fn dictionary_codes_from_body<'a>(
         });
     }
     let sorted = dictionary
-        .windows(2)
-        .all(|pair| matches!(pair, [low, high] if low < high));
+        .iter()
+        .zip(dictionary.iter().skip(1))
+        .all(|(low, high)| low < high);
     Ok(DictionaryCodes {
         codes,
         dictionary,

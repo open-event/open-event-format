@@ -57,12 +57,7 @@ pub fn seal_subject_field_rows(
         let VariantValue::Object(sealed) = sealed else {
             unreachable!("seal_subject_fields keeps an object an object")
         };
-        row.payload = BuildPayload::Object(
-            sealed
-                .into_iter()
-                .map(|(name, value)| (FieldName::from(name.as_str()), value))
-                .collect(),
-        );
+        row.payload = BuildPayload::Object(sealed.into_iter().collect());
     }
     Ok(())
 }
@@ -71,7 +66,7 @@ fn object_value(fields: &[(FieldName, VariantValue)]) -> VariantValue {
     VariantValue::Object(
         fields
             .iter()
-            .map(|(name, value)| (name.to_string(), value.clone()))
+            .map(|(name, value)| (name.clone(), value.clone()))
             .collect(),
     )
 }

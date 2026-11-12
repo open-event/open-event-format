@@ -6,7 +6,7 @@ use crate::encoding::ColumnData;
 use crate::error::{FormatError, StorageError, SubjectPayloadError};
 use crate::events::EventId;
 use crate::events::variant::{VariantRef, VariantValue};
-use crate::file::bytes::{Reader, Writer};
+use crate::file::bytes::Reader;
 use crate::layout::reader::{OeFile, PayloadRead};
 
 pub trait SubjectKeyStore {
@@ -42,19 +42,22 @@ pub fn seal_subject_payload(
             rule: "a sealed payload's key dictionary fits in u32 bytes",
         })
     })?;
-    let mut plaintext = Writer::with_capacity(4 + dictionary.len() + payload.bytes.len());
-    plaintext.put_u32(dictionary_len);
-    plaintext.put_slice(&dictionary);
-    plaintext.put_slice(&payload.bytes);
+    // One buffer sized for the whole stored form (magic, subject, sealed blob); the plaintext is copied in once and
+    // encrypted where it lies.
+    let plaintext_len = 4 + dictionary.len() + payload.bytes.len();
+    let mut stored =
+        Vec::with_capacity(SEALED_PAYLOAD_MAGIC.len() + 16 + super::sealed_len(key.scheme(), plaintext_len));
+    stored.extend_from_slice(SEALED_PAYLOAD_MAGIC);
+    stored.extend_from_slice(&subject.uuid().as_u128().to_le_bytes());
     let event_id = event_id.uuid().as_u128();
-    let sealed = key
-        .encrypt(seal_block_id(event_id), event_id, plaintext.bytes())
-        .ok_or(SubjectPayloadError::SealRefused)?;
-    let mut stored = Writer::with_capacity(SEALED_PAYLOAD_MAGIC.len() + 16 + sealed.len());
-    stored.put_slice(SEALED_PAYLOAD_MAGIC);
-    stored.put_u128(subject.uuid().as_u128());
-    stored.put_slice(&sealed);
-    Ok(stored.into_bytes())
+    key.encrypt_into(
+        seal_block_id(event_id),
+        event_id,
+        &[&dictionary_len.to_le_bytes(), &dictionary, &payload.bytes],
+        &mut stored,
+    )
+    .ok_or(SubjectPayloadError::SealRefused)?;
+    Ok(stored)
 }
 
 pub fn read_subject_payload(
@@ -93,12 +96,7 @@ pub(crate) fn row_event_id(file: &OeFile, row_ordinal: u64) -> Result<u128, Form
         .ok_or(FormatError::RefOutOfRange {
             what: "row ordinal beyond granule directory",
         })?;
-    let read = file.read_column(column_ids::EVENT_ID, granule.granule_id)?;
-    let ColumnData::U128(event_ids) = &read.data else {
-        return Err(FormatError::Structural {
-            rule: "the event id column holds 128-bit ids",
-        });
-    };
+    let event_ids = granule_event_ids(file, granule.granule_id)?;
     row_ordinal
         .checked_sub(granule.first_row_ordinal)
         .and_then(|row| usize::try_from(row).ok())
@@ -138,3 +136,25 @@ pub(crate) fn decode_plaintext(plaintext: &[u8]) -> Result<VariantValue, FormatE
 #[cfg(test)]
 #[path = "test/subject_payload.rs"]
 mod tests;
+
+/// The EVENT_ID column of `granule_id`, decoded once and reused while consecutive rows stay in the same granule.
+fn granule_event_ids(file: &OeFile, granule_id: u32) -> Result<std::sync::Arc<[u128]>, FormatError> {
+    if let Some((cached_id, ids)) = file
+        .event_ids
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        && *cached_id == granule_id
+    {
+        return Ok(ids.clone());
+    }
+    let read = file.read_column(column_ids::EVENT_ID, granule_id)?;
+    let ColumnData::U128(event_ids) = &read.data else {
+        return Err(FormatError::Structural {
+            rule: "the event id column holds 128-bit ids",
+        });
+    };
+    let ids: std::sync::Arc<[u128]> = event_ids.as_slice().into();
+    *file.event_ids.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((granule_id, ids.clone()));
+    Ok(ids)
+}

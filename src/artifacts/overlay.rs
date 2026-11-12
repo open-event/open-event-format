@@ -1,4 +1,4 @@
-use super::batch::{DecodedBatch, DecodedEvent};
+use super::batch::{DecodedBatch, DecodedEvent, EventInput, built_batch_sections};
 use super::frame::OejFrameHeaderV1;
 use super::segment::{ReplayOutcome, ReplayedFrame};
 use super::{BLAKE3_LEN, FRAME_HEADER_LEN};
@@ -119,6 +119,96 @@ pub fn select_representation(_epoch: u64, _first_sequence: u64) -> OverlayRepres
     OverlayRepresentation::Arrow
 }
 
+/// One overlay row's columns, borrowed from either a decoded batch or the events a frame was built from.
+pub(crate) struct OverlayRow<'a> {
+    pub account_id: Option<&'a str>,
+    pub account_id_hash_low: u64,
+    pub actor_id: Option<&'a str>,
+    pub actor_id_hash_low: u64,
+    pub dedupe_hash_high: u64,
+    pub dedupe_hash_low: u64,
+    pub entity_id: Option<&'a str>,
+    pub entity_id_hash_high: u64,
+    pub entity_id_hash_low: u64,
+    pub entity_type: &'a str,
+    pub event_id: u128,
+    pub event_type: &'a str,
+    pub flags: u32,
+    pub ingested_at_physical: i64,
+    pub occurred_at_physical: i64,
+    pub payload_flags: u32,
+    pub payload_len: u32,
+    pub payload_offset: u32,
+    pub provenance: Option<&'a SignedEventProvenance>,
+    pub schema_version: u32,
+    pub source: &'a str,
+    pub stream_id: u64,
+    pub stream_sequence: u64,
+    pub trace_id_hash_low: u64,
+}
+
+impl<'a> OverlayRow<'a> {
+    fn from_decoded(event: &'a DecodedEvent<'a>) -> Self {
+        let fixed = &event.fixed;
+        Self {
+            account_id: event.account_id,
+            account_id_hash_low: fixed.account_id_hash_low,
+            actor_id: event.actor_id,
+            actor_id_hash_low: fixed.actor_id_hash_low,
+            dedupe_hash_high: fixed.dedupe_hash_high,
+            dedupe_hash_low: fixed.dedupe_hash_low,
+            entity_id: event.entity_id,
+            entity_id_hash_high: fixed.entity_id_hash_high,
+            entity_id_hash_low: fixed.entity_id_hash_low,
+            entity_type: event.entity_type,
+            event_id: fixed.event_id,
+            event_type: event.event_type,
+            flags: fixed.flags,
+            ingested_at_physical: fixed.ingested_at_physical,
+            occurred_at_physical: fixed.occurred_at_physical,
+            payload_flags: event.variable.payload_flags,
+            payload_len: event.variable.payload_len,
+            payload_offset: event.variable.payload_offset,
+            provenance: event.provenance.as_ref(),
+            schema_version: fixed.schema_version,
+            source: event.source,
+            stream_id: fixed.stream_id,
+            stream_sequence: fixed.stream_sequence,
+            trace_id_hash_low: fixed.trace_id_hash_low,
+        }
+    }
+
+    fn from_input(event: &'a EventInput, (payload_flags, payload_offset, payload_len): (u32, u32, u32)) -> Self {
+        let envelope = &event.envelope;
+        Self {
+            account_id: envelope.account_id.as_deref(),
+            account_id_hash_low: envelope.account_id_hash_low,
+            actor_id: envelope.actor_id.as_deref(),
+            actor_id_hash_low: envelope.actor_id_hash_low,
+            dedupe_hash_high: envelope.dedupe_hash_high,
+            dedupe_hash_low: envelope.dedupe_hash_low,
+            entity_id: envelope.entity_id.as_deref(),
+            entity_id_hash_high: envelope.entity_id_hash_high,
+            entity_id_hash_low: envelope.entity_id_hash_low,
+            entity_type: &envelope.entity_type,
+            event_id: envelope.event_id.uuid().as_u128(),
+            event_type: &envelope.event_type,
+            flags: envelope.flags.0,
+            ingested_at_physical: envelope.ingested_at.physical_nanos(),
+            occurred_at_physical: envelope.occurred_at.physical_nanos(),
+            payload_flags,
+            payload_len,
+            payload_offset,
+            provenance: event.provenance.as_ref(),
+            schema_version: envelope.schema_version,
+            source: &envelope.source,
+            stream_id: envelope.stream_id.0,
+            stream_sequence: envelope.stream_sequence,
+            trace_id_hash_low: envelope.trace_id_hash_low,
+        }
+    }
+}
+
 pub fn convert_frame(
     header: &OejFrameHeaderV1,
     decoded: &DecodedBatch<'_>,
@@ -127,21 +217,72 @@ pub fn convert_frame(
     chain_blake3: Option<[u8; BLAKE3_LEN]>,
     oe_covers: impl Fn(TenantId, &SequenceRange) -> bool,
 ) -> Result<Option<LiveOverlaySegment>, FormatError> {
-    if header.is_void_record() {
+    if header.is_void_record() || oe_covers(header.tenant_id, &frame_range(header)) {
         return Ok(None);
     }
-    let range = SequenceRange {
+    let rows: Vec<OverlayRow<'_>> = decoded.events.iter().map(OverlayRow::from_decoded).collect();
+    build_segment(
+        header,
+        &rows,
+        decoded.payload_arena,
+        decoded.dictionary_bytes,
+        (segment_id, segment_generation, chain_blake3),
+    )
+    .map(Some)
+}
+
+/// Converts a frame this process just built, taking the rows from the `events` it was built from instead of
+/// re-decoding the batch: only the batch header and each row's payload slot are read from `batch_payload`.
+pub fn convert_built_frame(
+    header: &OejFrameHeaderV1,
+    events: &[EventInput],
+    batch_payload: &[u8],
+    segment_id: u64,
+    segment_generation: u64,
+    chain_blake3: Option<[u8; BLAKE3_LEN]>,
+    oe_covers: impl Fn(TenantId, &SequenceRange) -> bool,
+) -> Result<Option<LiveOverlaySegment>, FormatError> {
+    if header.is_void_record() || oe_covers(header.tenant_id, &frame_range(header)) {
+        return Ok(None);
+    }
+    let sections = built_batch_sections(batch_payload, header.event_count)?;
+    if sections.payload_slots.len() != events.len() {
+        return Err(FormatError::Structural {
+            rule: "batch event_count must equal frame event_count",
+        });
+    }
+    let rows: Vec<OverlayRow<'_>> = events
+        .iter()
+        .zip(sections.payload_slots)
+        .map(|(event, slot)| OverlayRow::from_input(event, slot))
+        .collect();
+    build_segment(
+        header,
+        &rows,
+        sections.payload_arena,
+        sections.dictionary_bytes,
+        (segment_id, segment_generation, chain_blake3),
+    )
+    .map(Some)
+}
+
+fn frame_range(header: &OejFrameHeaderV1) -> SequenceRange {
+    SequenceRange {
         epoch: header.epoch,
         first_sequence: header.first_sequence,
         last_sequence: header.last_sequence,
-    };
-    if oe_covers(header.tenant_id, &range) {
-        return Ok(None);
     }
+}
 
-    let rows = decoded.events.len();
-    let text =
-        |len: fn(&DecodedEvent<'_>) -> usize| StringBuilder::with_capacity(rows, decoded.events.iter().map(len).sum());
+fn build_segment(
+    header: &OejFrameHeaderV1,
+    events: &[OverlayRow<'_>],
+    payload_arena: &[u8],
+    dictionary_bytes: &[u8],
+    (segment_id, segment_generation, chain_blake3): (u64, u64, Option<[u8; BLAKE3_LEN]>),
+) -> Result<LiveOverlaySegment, FormatError> {
+    let rows = events.len();
+    let text = |len: fn(&OverlayRow<'_>) -> usize| StringBuilder::with_capacity(rows, events.iter().map(len).sum());
     let mut tenant_ids = FixedSizeBinaryBuilder::with_capacity(rows, UUID_BYTE_WIDTH);
     let mut epochs = Vec::with_capacity(rows);
     let mut sequences = Vec::with_capacity(rows);
@@ -167,10 +308,10 @@ pub fn convert_frame(
     let mut flags = Vec::with_capacity(rows);
     let mut dedupe_low = Vec::with_capacity(rows);
     let mut dedupe_high = Vec::with_capacity(rows);
-    let signed = decoded.events.iter().filter(|event| event.provenance.is_some()).count();
+    let signed = events.iter().filter(|event| event.provenance.is_some()).count();
     let mut provenance = (signed > 0).then(|| ProvenanceColumns::new(rows, signed));
 
-    for (row_index, event) in decoded.events.iter().enumerate() {
+    for (row_index, event) in events.iter().enumerate() {
         tenant_ids
             .append_value(header.tenant_id.uuid().as_u128().to_le_bytes())
             .map_err(|_| FormatError::Structural {
@@ -179,33 +320,33 @@ pub fn convert_frame(
         epochs.push(header.epoch);
         sequences.push(header.first_sequence + row_index as u64);
         event_ids
-            .append_value(event.fixed.event_id.to_le_bytes())
+            .append_value(event.event_id.to_le_bytes())
             .map_err(|_| FormatError::Structural {
                 rule: "event_id must be 16 bytes",
             })?;
-        stream_ids.push(event.fixed.stream_id);
-        stream_sequences.push(event.fixed.stream_sequence);
-        occurred.push(event.fixed.occurred_at_physical);
-        ingested.push(event.fixed.ingested_at_physical);
+        stream_ids.push(event.stream_id);
+        stream_sequences.push(event.stream_sequence);
+        occurred.push(event.occurred_at_physical);
+        ingested.push(event.ingested_at_physical);
         sources.append_value(event.source);
         event_types.append_value(event.event_type);
         entity_types.append_value(event.entity_type);
-        entity_hash_low.push(event.fixed.entity_id_hash_low);
-        entity_hash_high.push(event.fixed.entity_id_hash_high);
+        entity_hash_low.push(event.entity_id_hash_low);
+        entity_hash_high.push(event.entity_id_hash_high);
         entity_ids.append_option(event.entity_id);
-        actor_hash_low.push(event.fixed.actor_id_hash_low);
+        actor_hash_low.push(event.actor_id_hash_low);
         actor_ids.append_option(event.actor_id);
-        account_hash_low.push(event.fixed.account_id_hash_low);
+        account_hash_low.push(event.account_id_hash_low);
         account_ids.append_option(event.account_id);
-        trace_hash_low.push(event.fixed.trace_id_hash_low);
-        schema_versions.push(event.fixed.schema_version);
-        payload_flags.push(event.variable.payload_flags);
-        payload_refs.push((u64::from(event.variable.payload_len) << 32) | u64::from(event.variable.payload_offset));
-        flags.push(event.fixed.flags);
-        dedupe_low.push(event.fixed.dedupe_hash_low);
-        dedupe_high.push(event.fixed.dedupe_hash_high);
+        trace_hash_low.push(event.trace_id_hash_low);
+        schema_versions.push(event.schema_version);
+        payload_flags.push(event.payload_flags);
+        payload_refs.push((u64::from(event.payload_len) << 32) | u64::from(event.payload_offset));
+        flags.push(event.flags);
+        dedupe_low.push(event.dedupe_hash_low);
+        dedupe_high.push(event.dedupe_hash_high);
         if let Some(provenance) = provenance.as_mut() {
-            provenance.append(event.provenance.as_ref());
+            provenance.append(event.provenance);
         }
     }
 
@@ -259,12 +400,12 @@ pub fn convert_frame(
             source_segment_id: segment_id,
             source_segment_generation: segment_generation,
             tenant_id: header.tenant_id,
-            payload_arena: decoded.payload_arena.to_vec(),
-            variant_dictionary: decoded.dictionary_bytes.to_vec(),
+            payload_arena: payload_arena.to_vec(),
+            variant_dictionary: dictionary_bytes.to_vec(),
         },
     };
     validate_segment(&segment, header)?;
-    Ok(Some(segment))
+    Ok(segment)
 }
 
 struct ProvenanceColumns {

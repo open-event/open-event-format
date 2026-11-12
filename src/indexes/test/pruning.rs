@@ -512,7 +512,7 @@ fn indexed_row(i: u64) -> OeRow {
                 schema_version: 2,
                 flags: EventFlags(0),
             },
-            payload: PayloadInput::Variant(VariantValue::Object(payload)),
+            payload: PayloadInput::Variant(VariantValue::object(payload)),
             source_schema: None,
             source_delivery: None,
             connector_delivery_hash_low: i,

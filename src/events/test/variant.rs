@@ -11,7 +11,7 @@ fn sample_object() -> VariantValue {
     inner.insert("city".to_owned(), VariantValue::String("Oslo".to_owned()));
     inner.insert("zip".to_owned(), VariantValue::Int(1234));
     let mut fields = BTreeMap::new();
-    fields.insert("address".to_owned(), VariantValue::Object(inner));
+    fields.insert("address".to_owned(), VariantValue::object(inner));
     fields.insert(
         "amount".to_owned(),
         VariantValue::Decimal {
@@ -31,7 +31,7 @@ fn sample_object() -> VariantValue {
     );
     fields.insert("long_text".to_owned(), VariantValue::String("x".repeat(100)));
     fields.insert("ratio".to_owned(), VariantValue::Double(0.25));
-    VariantValue::Object(fields)
+    VariantValue::object(fields)
 }
 
 #[test]
@@ -107,7 +107,7 @@ fn one_field_objects_round_trip_every_scalar_width() {
         VariantValue::Uuid(u128::MAX),
     ];
     for scalar in scalars {
-        let value = VariantValue::Object(BTreeMap::from([("value".to_owned(), scalar)]));
+        let value = VariantValue::object(BTreeMap::from([("value".to_owned(), scalar)]));
         let dictionary = dict_for(&value);
         let bytes = encode_value(&value, &dictionary).unwrap();
         VariantRef::new(&bytes).validate(&dictionary).unwrap();
@@ -146,7 +146,7 @@ fn small_multi_field_objects_directly_encode_every_scalar_width() {
     ];
 
     for scalar in scalars {
-        let value = VariantValue::Object(BTreeMap::from([
+        let value = VariantValue::object(BTreeMap::from([
             ("first".to_owned(), VariantValue::Int(7)),
             ("value".to_owned(), scalar),
         ]));
@@ -154,7 +154,7 @@ fn small_multi_field_objects_directly_encode_every_scalar_width() {
         let VariantValue::Object(fields) = &value else {
             unreachable!();
         };
-        let iter = fields.iter().map(|(key, value)| (key.as_str(), value));
+        let iter = fields.iter().map(|(key, value)| (&**key, value));
 
         let mut direct = Writer::new();
         encode_object_into(
@@ -203,16 +203,15 @@ fn direct_object_header_matches_buffered_at_every_id_and_offset_width() {
 
 #[test]
 fn nested_and_wide_objects_fall_back_to_the_buffered_encoding() {
-    let nested = VariantValue::Object(BTreeMap::from([("inner".to_owned(), VariantValue::Int(1))]));
+    let nested = VariantValue::object(BTreeMap::from([("inner".to_owned(), VariantValue::Int(1))]));
     let values = [
-        VariantValue::Object(BTreeMap::from([
+        VariantValue::object(BTreeMap::from([
             ("a".to_owned(), VariantValue::Int(1)),
             ("b".to_owned(), nested),
         ])),
-        VariantValue::Object(
+        VariantValue::object(
             (0..=DIRECT_SCALAR_OBJECT_MAX_FIELDS)
-                .map(|index| (format!("field_{index}"), VariantValue::Int(index as i64)))
-                .collect(),
+                .map(|index| (format!("field_{index}"), VariantValue::Int(index as i64))),
         ),
     ];
     for value in values {
@@ -220,7 +219,7 @@ fn nested_and_wide_objects_fall_back_to_the_buffered_encoding() {
         let VariantValue::Object(fields) = &value else {
             unreachable!();
         };
-        let iter = fields.iter().map(|(key, value)| (key.as_str(), value));
+        let iter = fields.iter().map(|(key, value)| (&**key, value));
         let mut encoded = Writer::new();
         encode_object_into(
             iter.clone(),
@@ -255,7 +254,7 @@ fn direct_object_preflight_leaves_destination_untouched_on_missing_key() {
     let mut out = Writer::new();
     out.put_u8(0xA5);
     let result = encode_object_into(
-        fields.iter().map(|(key, value)| (key.as_str(), value)),
+        fields.iter().map(|(key, value)| (&**key, value)),
         fields.len(),
         &dictionary,
         &mut EncodeScratch::new(),
@@ -276,7 +275,7 @@ fn benchmark_direct_small_objects_against_buffered_encoding() {
             ("label".to_owned(), VariantValue::String("x".repeat(string_len))),
             ("source".to_owned(), VariantValue::String("y".repeat(string_len))),
         ]);
-        let value = VariantValue::Object(fields.clone());
+        let value = VariantValue::object(fields.clone());
         let dictionary = dict_for(&value);
         let mut direct_samples = Vec::new();
         let mut buffered_samples = Vec::new();
@@ -289,7 +288,7 @@ fn benchmark_direct_small_objects_against_buffered_encoding() {
                 for _ in 0..100_000 {
                     out.clear();
                     encode_object_into(
-                        fields.iter().map(|(key, value)| (key.as_str(), value)),
+                        fields.iter().map(|(key, value)| (&**key, value)),
                         fields.len(),
                         &dictionary,
                         &mut scratch,
@@ -308,7 +307,7 @@ fn benchmark_direct_small_objects_against_buffered_encoding() {
                 for _ in 0..100_000 {
                     out.clear();
                     encode_object_buffered(
-                        fields.iter().map(|(key, value)| (key.as_str(), value)),
+                        fields.iter().map(|(key, value)| (&**key, value)),
                         fields.len(),
                         &dictionary,
                         &mut scratch,
@@ -384,8 +383,8 @@ fn out_of_range_field_id_refuses() {
 #[test]
 fn unsorted_field_ids_refuse_on_point_lookup() {
     let mut fields = BTreeMap::new();
-    fields.insert("a".to_owned(), VariantValue::Int(1));
-    fields.insert("b".to_owned(), VariantValue::Int(2));
+    fields.insert("a".to_owned().into(), VariantValue::Int(1));
+    fields.insert("b".to_owned().into(), VariantValue::Int(2));
     let value = VariantValue::Object(fields);
     let dictionary = dict_for(&value);
     let mut bytes = encode_value(&value, &dictionary).unwrap();
@@ -408,7 +407,7 @@ fn unsorted_field_ids_refuse_on_point_lookup() {
 fn every_field_of_a_wide_object_resolves_by_binary_search() {
     let mut fields = BTreeMap::new();
     for index in 0..64u32 {
-        fields.insert(format!("field_{index:03}"), VariantValue::Int(i64::from(index)));
+        fields.insert(format!("field_{index:03}").into(), VariantValue::Int(i64::from(index)));
     }
     let value = VariantValue::Object(fields);
     let dictionary = dict_for(&value);
@@ -451,7 +450,7 @@ fn trailing_bytes_after_short_strings_and_containers_fail_validation() {
     let values = [
         VariantValue::String("hi".to_owned()),
         VariantValue::Array(vec![VariantValue::Int(1)]),
-        VariantValue::Object(fields),
+        VariantValue::object(fields),
     ];
     for value in values {
         let dictionary = dict_for(&value);
@@ -472,7 +471,7 @@ fn decode_rejects_trailing_bytes_after_short_strings_and_containers() {
     let values = [
         VariantValue::String("hi".to_owned()),
         VariantValue::Array(vec![VariantValue::Int(1)]),
-        VariantValue::Object(fields),
+        VariantValue::object(fields),
     ];
     for value in values {
         let dictionary = dict_for(&value);
@@ -507,7 +506,7 @@ fn borrowed_fields_encode_exactly_as_the_owned_object() {
     let VariantValue::Object(fields) = &value else {
         panic!("the sample is an object");
     };
-    let borrowed: Vec<(&str, &VariantValue)> = fields.iter().map(|(key, value)| (key.as_str(), value)).collect();
+    let borrowed: Vec<(&str, &VariantValue)> = fields.iter().map(|(key, value)| (&**key, value)).collect();
     let mut out = Writer::new();
     encode_object_fields_into(&borrowed, &dictionary, &mut out).unwrap();
     assert_eq!(out.into_bytes(), encode_value(&value, &dictionary).unwrap());

@@ -119,13 +119,14 @@ fn manifest_deletes_serves_saved_vectors_and_corrections_to_a_scan() {
             corrects_event_id: original,
         },
     }]);
-    let deletes = ManifestDeletes {
-        corrections: &resolver,
-        manifest: &manifest,
-        objects: None,
-    };
+    let deletes = ManifestDeletes::new(&resolver, &manifest, None);
     let tenant = TenantId::new_test_id(7);
     assert!(deletes.deletion_vector(tenant, FILE_ID).unwrap().unwrap().is_deleted(2));
+    let again = deletes.deletion_vector(tenant, FILE_ID).unwrap().unwrap();
+    assert!(
+        std::sync::Arc::ptr_eq(&again, &deletes.deletion_vector(tenant, FILE_ID).unwrap().unwrap()),
+        "a vector is loaded once per generation and then served from the memo"
+    );
     assert!(
         deletes
             .deletion_vector(TenantId::new_test_id(8), FILE_ID)
@@ -214,24 +215,29 @@ fn a_retried_external_publish_reuses_its_own_object_but_refuses_foreign_bytes() 
 }
 
 #[test]
-fn a_vector_past_the_decodable_row_bound_is_refused_at_publish_and_the_prior_one_still_loads() {
+fn a_range_delete_past_64m_rows_publishes_and_loads_again() {
     let mut current = entry();
     current.deletion_vector = Some(StoredDeletionVector::next_generation(&current, &vector(&[3]), None).unwrap());
 
     let mut purge = DeletionVector::new();
     purge.mark_range(crate::indexes::bitmap::RowRange {
-        start: 0,
-        end: 64 * 1024 * 1024 + 1,
+        start: 10,
+        end: 200 * 1024 * 1024,
     });
-    assert!(StoredDeletionVector::next_generation(&current, &purge, None).is_err());
-    let kept = current.deletion_vector.as_ref().unwrap().load(FILE_ID).unwrap();
-    assert!(kept.is_deleted(3) && kept.deleted_count() == 1);
+    let stored = StoredDeletionVector::next_generation(&current, &purge, None).unwrap();
+    let loaded = stored.load(FILE_ID).unwrap();
+    assert_eq!(loaded.deleted_count(), 200 * 1024 * 1024 - 10 + 1);
+    assert!(loaded.is_deleted(3) && loaded.is_deleted(10) && !loaded.is_deleted(4));
 
-    let mut loadable = DeletionVector::new();
-    loadable.mark_range(crate::indexes::bitmap::RowRange {
-        start: 0,
-        end: 64 * 1024 * 1024,
-    });
-    let stored = StoredDeletionVector::next_generation(&current, &loadable, None).unwrap();
-    assert_eq!(stored.load(FILE_ID).unwrap().deleted_count(), 64 * 1024 * 1024);
+    current.deletion_vector = Some(stored);
+    let next = StoredDeletionVector::next_generation(&current, &vector(&[5]), None).unwrap();
+    assert_eq!(next.load(FILE_ID).unwrap().deleted_count(), 200 * 1024 * 1024 - 10 + 2);
+}
+
+#[test]
+fn a_positional_vector_with_too_many_runs_is_refused_on_decode() {
+    let mut bytes = vec![2u8];
+    bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+    bytes.resize(1 + 4 + (crate::deletes::MAX_DELETION_VECTOR_RUNS + 1) * 16, 0);
+    assert!(crate::deletes::decode_deletion_vector(&bytes).is_err());
 }

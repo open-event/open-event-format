@@ -66,13 +66,13 @@ fn protobuf_message(mut message: DynamicMessage) -> Result<VariantValue, FormatE
             Value::Map(entries) => {
                 let mut object = BTreeMap::new();
                 for (key, item) in entries {
-                    object.insert(protobuf_map_key(key), protobuf_value(enum_kind, item)?);
+                    object.insert(protobuf_map_key(key).into(), protobuf_value(enum_kind, item)?);
                 }
                 VariantValue::Object(object)
             }
             other => protobuf_value(enum_kind, other)?,
         };
-        fields.insert(field.name().to_owned(), value);
+        fields.insert(field.name().into(), value);
     }
     Ok(VariantValue::Object(fields))
 }
@@ -227,7 +227,7 @@ impl<'de> Visitor<'de> for JsonBodyVisitor {
         let mut fields = BTreeMap::new();
         while let Some(key) = access.next_key::<String>()? {
             let JsonBody(value) = access.next_value_seed(JsonBodySeed { depth })?;
-            fields.insert(key, value);
+            fields.insert(key.into(), value);
         }
         Ok(JsonBody(VariantValue::Object(fields)))
     }

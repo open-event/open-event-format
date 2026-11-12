@@ -10,7 +10,7 @@ fn frequently_filtered_field_is_promoted() {
     let mut stats = PathStatistics::new();
     let mut payload = BTreeMap::new();
     payload.insert("score".to_owned(), VariantValue::Int(42));
-    let value = VariantValue::Object(payload);
+    let value = VariantValue::object(payload);
     for _ in 0..200 {
         stats.observe(Some(&value));
     }

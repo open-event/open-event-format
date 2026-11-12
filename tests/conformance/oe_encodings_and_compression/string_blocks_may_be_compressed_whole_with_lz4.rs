@@ -89,7 +89,7 @@ fn free_text_stores_the_smaller_form() {
             let mut event = support::event(i);
             event.envelope.entity_id = Some(room(i));
             if let PayloadInput::Variant(VariantValue::Object(fields)) = &mut event.payload {
-                fields.insert("note".to_owned(), VariantValue::String(sentence(i)));
+                fields.insert("note".to_owned().into(), VariantValue::String(sentence(i)));
             }
             OeRow {
                 epoch: 1,
@@ -115,7 +115,7 @@ fn an_old_reader_refuses_a_string_zstd_file() {
         .map(|i| {
             let mut event = support::event(i);
             if let PayloadInput::Variant(VariantValue::Object(fields)) = &mut event.payload {
-                fields.insert("room".to_owned(), VariantValue::String(room(i)));
+                fields.insert("room".to_owned().into(), VariantValue::String(room(i)));
             }
             OeRow {
                 epoch: 1,

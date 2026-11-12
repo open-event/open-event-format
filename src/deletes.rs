@@ -491,6 +491,21 @@ impl SubjectContentKey {
         Some(sealed)
     }
 
+    /// [`encrypt`](Self::encrypt) of the concatenation of `plaintext_parts`, appended to `out` (see
+    /// [`SealedContentKey::encrypt_into`]). On `None`, `out` is unchanged.
+    pub fn encrypt_into(
+        &mut self,
+        block_id: u64,
+        file_id: u128,
+        plaintext_parts: &[&[u8]],
+        out: &mut Vec<u8>,
+    ) -> Option<()> {
+        let key = self.key.as_mut()?;
+        key.encrypt_into(block_id, file_id, plaintext_parts, out)?;
+        self.key_epoch = key.key_epoch();
+        Some(())
+    }
+
     pub fn destroy(&mut self) {
         self.key = None;
     }
@@ -523,7 +538,12 @@ pub fn rebuild_payload(key: &SubjectContentKey, block_id: u64, file_id: u128, se
 
 pub const DELETION_VECTOR_ORDINAL_ARRAY_MAX: u64 = 4096;
 
+/// Bound on the rows a reader expands into per-ordinal sets (field deletion vectors). Row-level deletion vectors
+/// keep runs and are bounded by [`MAX_DELETION_VECTOR_RUNS`] instead, so a range delete of any size loads.
 const MAX_DELETION_VECTOR_DECODED_ROWS: u64 = 64 * 1024 * 1024;
+
+/// Bound on the runs one positional deletion vector carries; caps the decoded run array (16 bytes per run).
+pub(crate) const MAX_DELETION_VECTOR_RUNS: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeletionVectorWireForm {
@@ -559,6 +579,15 @@ pub fn encode_deletion_vector(vector: &DeletionVector) -> (DeletionVectorWireFor
     }
 }
 
+pub(crate) fn check_decodable_run_count(vector: &DeletionVector) -> Result<(), FormatError> {
+    if vector.deleted_runs.len() > MAX_DELETION_VECTOR_RUNS {
+        return Err(FormatError::Structural {
+            rule: "deletion vector carries more runs than a reader decodes",
+        });
+    }
+    Ok(())
+}
+
 pub(crate) fn check_decodable_row_count(vector: &DeletionVector) -> Result<(), FormatError> {
     if vector.deleted_count() > MAX_DELETION_VECTOR_DECODED_ROWS {
         return Err(FormatError::Structural {
@@ -588,12 +617,13 @@ pub fn decode_deletion_vector(bytes: &[u8]) -> Result<DeletionVector, FormatErro
         return Ok(vector);
     }
     if tag == DeletionVectorWireForm::PositionalRoaring.tag() {
-        let bitmap = RoaringRangeBitmap::decode(reader.take(reader.remaining(), "deletion vector bitmap")?)?;
-        if bitmap.count() > MAX_DELETION_VECTOR_DECODED_ROWS {
+        let body = reader.take(reader.remaining(), "deletion vector bitmap")?;
+        if body.len() > encoded_runs_len(MAX_DELETION_VECTOR_RUNS) {
             return Err(FormatError::Structural {
-                rule: "deletion vector decodes past the row-count bound",
+                rule: "deletion vector carries more runs than a reader decodes",
             });
         }
+        let bitmap = RoaringRangeBitmap::decode(body)?;
         for range in bitmap.ranges() {
             vector.mark_range(*range);
         }

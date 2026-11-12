@@ -278,7 +278,7 @@ fn message_row(i: u64) -> BuildRow {
     let body = format!("message number {i} in a room with a few words of text");
     let mut row = source_form_row(
         i,
-        VariantValue::Object(BTreeMap::from([
+        VariantValue::object(BTreeMap::from([
             ("body".to_owned(), VariantValue::String(body)),
             ("msgtype".to_owned(), VariantValue::String("m.text".to_owned())),
         ])),

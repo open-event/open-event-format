@@ -16,7 +16,7 @@ fn tenant() -> TenantId {
 }
 
 fn payload(sequence: u64) -> VariantValue {
-    VariantValue::Object(BTreeMap::from([
+    VariantValue::object(BTreeMap::from([
         ("n".to_owned(), VariantValue::Int(sequence as i64)),
         ("text".to_owned(), VariantValue::String(format!("message {sequence}"))),
     ]))
@@ -192,4 +192,45 @@ fn string_at_maps_dense_and_presence_mapped_values() {
     let sparse = IdColumn::new((vec![0b1010], sparse), 4);
     let read: Vec<_> = (0..5).map(|row| sparse.at(row)).collect();
     assert_eq!(read, [None, Some("b".to_owned()), None, Some("d".to_owned()), None]);
+}
+
+#[test]
+fn per_row_envelope_and_event_id_reads_decode_each_granule_once() {
+    let rows: Vec<OeRow> = (1..=30)
+        .map(|sequence| OeRow {
+            epoch: 1,
+            event: event(sequence),
+            sequence,
+        })
+        .collect();
+    let built = build_oe_file(rows.clone(), &config()).unwrap();
+    let file = OeFile::open(built.bytes, Some(&built.file_seal)).unwrap();
+    let granule = file.footer().granules[0];
+    let first = granule.first_row_ordinal;
+    let count = u64::from(granule.row_count);
+    assert!(count > 1, "the first granule holds several rows");
+
+    assert_eq!(file.envelope(first).unwrap(), rows[first as usize].event.envelope);
+    let reads = file.column_block_reads();
+    for ordinal in first..first + count {
+        assert_eq!(file.envelope(ordinal).unwrap(), rows[ordinal as usize].event.envelope);
+    }
+    assert_eq!(
+        file.column_block_reads(),
+        reads,
+        "envelope columns decoded once per granule"
+    );
+
+    let expected = rows[first as usize].event.envelope.event_id.uuid().as_u128();
+    assert_eq!(crate::security::row_event_id(&file, first).unwrap(), expected);
+    let reads = file.column_block_reads();
+    for ordinal in first..first + count {
+        let expected = rows[ordinal as usize].event.envelope.event_id.uuid().as_u128();
+        assert_eq!(crate::security::row_event_id(&file, ordinal).unwrap(), expected);
+    }
+    assert_eq!(
+        file.column_block_reads(),
+        reads,
+        "the event id column decoded once per granule"
+    );
 }

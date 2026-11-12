@@ -89,7 +89,7 @@ pub(crate) fn json_row(i: u64, raw: &[u8]) -> BuildRow {
 pub(crate) fn plain_row(i: u64) -> BuildRow {
     source_form_row(
         i,
-        VariantValue::Object(BTreeMap::from([("n".to_owned(), VariantValue::Int(i as i64))])),
+        VariantValue::object(BTreeMap::from([("n".to_owned(), VariantValue::Int(i as i64))])),
     )
 }
 

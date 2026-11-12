@@ -181,11 +181,14 @@ impl OePublisher {
                         })?;
                         crate::artifacts::batch::PayloadInput::ExternalRef(reference.to_owned())
                     }
-                    Some(bytes) => crate::artifacts::batch::PayloadInput::Variant(
-                        crate::events::variant::VariantRef::new(bytes)
-                            .decode(&batch.dictionary)
-                            .map_err(PublishFailure::Format)?,
-                    ),
+                    // Kept encoded: the builder reads it against the batch dictionary,
+                    // which clones as a pointer, so no owned value tree is built here.
+                    Some(bytes) => {
+                        crate::artifacts::batch::PayloadInput::Encoded(crate::artifacts::batch::EncodedPayload {
+                            bytes: bytes.to_vec(),
+                            dictionary: batch.dictionary.clone(),
+                        })
+                    }
                 };
                 rows.push(OeRow {
                     epoch: header.epoch,
@@ -366,7 +369,7 @@ impl OePublisher {
                 return Ok(Published {
                     entry: existing.clone(),
                     generation: head_id,
-                    file_bytes: built.bytes,
+                    file_bytes: std::sync::Arc::unwrap_or_clone(built.bytes),
                 });
             }
             let mut entry = staged_entry.clone();
@@ -487,7 +490,7 @@ impl OePublisher {
         Ok(Published {
             entry,
             generation,
-            file_bytes: built.bytes,
+            file_bytes: std::sync::Arc::unwrap_or_clone(built.bytes),
         })
     }
 }

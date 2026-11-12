@@ -514,7 +514,12 @@ fn forged_deletion_vector_bytes_refuse_instead_of_decoding_wrong() {
     forged.extend_from_slice(&1u32.to_le_bytes());
     forged.extend_from_slice(&0u64.to_le_bytes());
     forged.extend_from_slice(&(1u64 << 33).to_le_bytes());
-    assert!(decode_deletion_vector(&forged).is_err(), "decode bomb refuses");
+    let huge = decode_deletion_vector(&forged).unwrap();
+    assert_eq!(
+        huge.deleted_count(),
+        1u64 << 33,
+        "one run is kept as a run, so a huge range is no decode bomb"
+    );
 }
 
 fn encoding_through_a_built_bitmap(vector: &DeletionVector) -> (DeletionVectorWireForm, Vec<u8>) {

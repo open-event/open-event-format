@@ -6,7 +6,7 @@ use crate::events::relationships::{
 };
 use crate::events::variant::{
     EncodeScratch, KeyDictionary, VariantRef, VariantValue, encode_value_into_with_scratch,
-    transcode_value_into_with_scratch,
+    transcode_value_into_with_previous_remap, transcode_value_into_with_scratch,
 };
 use crate::events::{EventEnvelope, EventFlags, EventId, StreamId, TimestampValue};
 use crate::file::bytes::{Reader, Writer, slice};
@@ -357,6 +357,12 @@ fn decode_string_table(bytes: &[u8]) -> Result<Vec<&str>, FormatError> {
     Ok(strings)
 }
 
+/// Events from one producer usually share a dictionary, often the same
+/// allocation; compare pointers first and keys only when they differ.
+fn same_dictionary(a: &KeyDictionary, b: &KeyDictionary) -> bool {
+    std::ptr::eq(a, b) || a == b
+}
+
 pub fn build_batch(
     events: &[EventInput],
     schema_generation: u64,
@@ -370,9 +376,15 @@ pub fn build_batch(
 
     let mut strings = StringTableBuilder::default();
     let mut keys = BTreeSet::new();
+    let mut previous: Option<&KeyDictionary> = None;
     for event in events {
         match &event.payload {
-            PayloadInput::Encoded(payload) => keys.extend(payload.dictionary.keys()),
+            PayloadInput::Encoded(payload) => {
+                if !previous.is_some_and(|previous| same_dictionary(previous, &payload.dictionary)) {
+                    keys.extend(payload.dictionary.keys());
+                    previous = Some(&payload.dictionary);
+                }
+            }
             PayloadInput::Variant(value) => value.collect_keys(&mut keys),
             PayloadInput::ExternalRef(_) | PayloadInput::None => {}
         }
@@ -382,17 +394,27 @@ pub fn build_batch(
     let mut arena = Writer::new();
     let mut payload_slots: Vec<(u32, u32, u32)> = Vec::with_capacity(events.len());
     let mut scratch = EncodeScratch::new();
+    let mut remapped_from: Option<&KeyDictionary> = None;
     for event in events {
         match &event.payload {
             PayloadInput::Encoded(payload) => {
                 let offset = arena.len() as u32;
-                transcode_value_into_with_scratch(
-                    VariantRef::new(&payload.bytes),
-                    &payload.dictionary,
-                    &dictionary,
-                    &mut scratch,
-                    &mut arena,
-                )?;
+                if remapped_from.is_some_and(|previous| same_dictionary(previous, &payload.dictionary)) {
+                    transcode_value_into_with_previous_remap(
+                        VariantRef::new(&payload.bytes),
+                        &mut scratch,
+                        &mut arena,
+                    )?;
+                } else {
+                    transcode_value_into_with_scratch(
+                        VariantRef::new(&payload.bytes),
+                        &payload.dictionary,
+                        &dictionary,
+                        &mut scratch,
+                        &mut arena,
+                    )?;
+                    remapped_from = Some(&payload.dictionary);
+                }
                 payload_slots.push((0, offset, arena.len() as u32 - offset));
             }
             PayloadInput::None => payload_slots.push((0, 0, 0)),
@@ -728,6 +750,58 @@ fn resolve_optional<'a>(strings: &[&'a str], reference: u32) -> Result<Option<&'
         return Ok(None);
     }
     resolve_required(strings, reference).map(Some)
+}
+
+pub(crate) struct BuiltBatchSections<'a> {
+    pub dictionary_bytes: &'a [u8],
+    pub payload_arena: &'a [u8],
+    pub payload_slots: Vec<(u32, u32, u32)>,
+}
+
+/// The variant dictionary, payload arena and per-row payload slots of a batch this process built with
+/// [`build_batch`], read from its header and variable table without decoding the rest of the batch.
+pub(crate) fn built_batch_sections(
+    payload: &[u8],
+    expected_event_count: u32,
+) -> Result<BuiltBatchSections<'_>, FormatError> {
+    let header = decode_batch_header(payload)?;
+    if header.event_count != expected_event_count {
+        return Err(FormatError::Structural {
+            rule: "batch event_count must equal frame event_count",
+        });
+    }
+    let section = |offset: u32, len: u32, what| slice(payload, offset as usize, len as usize, what);
+    let dictionary_bytes = section(
+        header.variant_dictionary_offset,
+        header.variant_dictionary_len,
+        "variant dictionary",
+    )?;
+    let payload_arena = section(header.payload_arena_offset, header.payload_arena_len, "payload arena")?;
+    let variable = section(
+        header.variable_table_offset,
+        header.variable_table_len,
+        "variable table",
+    )?;
+    let payload_slots = (0..header.event_count as usize)
+        .map(|row| {
+            let mut reader = Reader::new(slice(
+                variable,
+                row * VARIABLE_RECORD_LEN as usize,
+                12,
+                "variable record",
+            )?);
+            Ok((
+                reader.u32("payload flags")?,
+                reader.u32("payload offset")?,
+                reader.u32("payload length")?,
+            ))
+        })
+        .collect::<Result<Vec<_>, FormatError>>()?;
+    Ok(BuiltBatchSections {
+        dictionary_bytes,
+        payload_arena,
+        payload_slots,
+    })
 }
 
 pub fn decode_batch(payload: &[u8], expected_event_count: u32) -> Result<DecodedBatch<'_>, FormatError> {

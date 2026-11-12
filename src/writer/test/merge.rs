@@ -23,8 +23,8 @@ pub(crate) fn tenant() -> TenantId {
 
 pub(crate) fn payload_of(i: u64) -> VariantValue {
     let mut fields = BTreeMap::new();
-    fields.insert("body".to_owned(), VariantValue::String(format!("message {i}")));
-    fields.insert("n".to_owned(), VariantValue::Int(i as i64));
+    fields.insert("body".to_owned().into(), VariantValue::String(format!("message {i}")));
+    fields.insert("n".to_owned().into(), VariantValue::Int(i as i64));
     VariantValue::Object(fields)
 }
 
@@ -523,11 +523,7 @@ fn compaction_applies_field_redactions_and_external_deletion_vectors() {
     published.advance_head(head_id, head_id + 1).unwrap();
 
     let resolver = crate::corrections::CorrectionResolver::new([]);
-    let manifest_deletes = crate::deletion_store::ManifestDeletes {
-        corrections: &resolver,
-        manifest: &head,
-        objects: Some(&objects),
-    };
+    let manifest_deletes = crate::deletion_store::ManifestDeletes::new(&resolver, &head, Some(&objects));
     let first_file = open_built(&first);
     let scan = |low: u64, file: &OeFile, deletes: &dyn crate::layout::entity_scan::DeletesAndCorrections| {
         crate::layout::entity_scan::EntityScan {

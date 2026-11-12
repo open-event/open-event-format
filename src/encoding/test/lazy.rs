@@ -176,10 +176,10 @@ fn dictionary_codes_project_without_materialising_rows() {
         assert!(codes.gather(&[3000]).is_err());
         let counts = codes.code_counts();
         for (entry, count) in codes.dictionary().iter().zip(&counts) {
-            let expected = column.iter().filter(|value| *value == Some(entry.as_str())).count() as u64;
+            let expected = column.iter().filter(|value| *value == Some(entry)).count() as u64;
             assert_eq!(*count, expected);
         }
-        let needle = codes.dictionary().get(1).cloned().unwrap();
+        let needle = codes.dictionary().get(1).unwrap().to_owned();
         let expected: Vec<bool> = column.iter().map(|value| value == Some(needle.as_str())).collect();
         assert_eq!(codes.equals_mask(&needle), expected);
         assert!(codes.equals_mask("absent").iter().all(|matched| !matched));
@@ -239,7 +239,7 @@ fn dictionary_count_from_codes_matches_decoded_filter() {
         let codes = decode_dictionary_codes(block.pipeline, &block.bytes, None)
             .unwrap()
             .unwrap();
-        let present = codes.dictionary().get(2).cloned().unwrap();
+        let present = codes.dictionary().get(2).unwrap().to_owned();
         for predicate in [
             StringPredicate::Equals(present.clone()),
             StringPredicate::Equals("absent".to_owned()),

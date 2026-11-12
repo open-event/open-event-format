@@ -21,6 +21,12 @@ pub trait JournalStorage {
     fn sync(&mut self, shard: ShardId) -> Result<(), StorageError>;
     fn truncate(&mut self, shard: ShardId, len: u64) -> Result<(), StorageError>;
     fn read(&self, shard: ShardId, offset: u64, len: u32) -> Result<Vec<u8>, StorageError>;
+    /// Whether the stored bytes at `offset` equal `expected`. The default reads them whole; a backend can compare
+    /// in bounded chunks instead of materialising a copy of the range.
+    fn read_matches(&self, shard: ShardId, offset: u64, expected: &[u8]) -> Result<bool, StorageError> {
+        let len = u32::try_from(expected.len()).map_err(|_| StorageError::OutOfBounds)?;
+        Ok(self.read(shard, offset, len)? == expected)
+    }
     fn extent(&self, shard: ShardId) -> Result<u64, StorageError>;
     fn atomicity(&self, shard: ShardId) -> Result<ShardAtomicity, StorageError>;
 }

@@ -117,6 +117,8 @@ fn file_with_mark(mark: ColumnMark, bytes: Vec<u8>, usable_optional_features: u6
         column_cache_bytes: AtomicU64::new(0),
         decoded_cache_budget: DECODED_CACHE_BUDGET_BYTES,
         dictionary_decodes: AtomicU64::new(0),
+        envelope_columns: std::sync::Mutex::new(None),
+        event_ids: std::sync::Mutex::new(None),
         footer: Arc::new(footer),
         granule_dictionaries: DashMap::default(),
         granule_dictionaries_bytes: AtomicU64::new(0),
@@ -455,7 +457,7 @@ fn freetext_row(i: u64, note: Option<&str>) -> OeRow {
                 schema_version: 1,
                 flags: EventFlags(0),
             },
-            payload: PayloadInput::Variant(VariantValue::Object(payload)),
+            payload: PayloadInput::Variant(VariantValue::object(payload)),
             source_schema: None,
             source_delivery: None,
             connector_delivery_hash_low: i,
@@ -690,7 +692,10 @@ fn mixed_payload_rows(count: u64) -> Vec<OeRow> {
         if ordinal.is_multiple_of(3)
             && let PayloadInput::Variant(VariantValue::Object(fields)) = &mut row.event.payload
         {
-            fields.insert("extra".to_owned(), VariantValue::String(format!("extra-{ordinal}")));
+            fields.insert(
+                "extra".to_owned().into(),
+                VariantValue::String(format!("extra-{ordinal}")),
+            );
         }
     }
     rows[7].event.payload = PayloadInput::ExternalRef("oej://tenant/3/blob/7".to_owned());
@@ -745,7 +750,7 @@ fn batched_reads_over_long_text_agree_and_fsst_plaintext_size_matches_decode() {
     for (ordinal, row) in rows.iter_mut().enumerate() {
         if let PayloadInput::Variant(VariantValue::Object(fields)) = &mut row.event.payload {
             fields.insert(
-                "label".to_owned(),
+                "label".to_owned().into(),
                 VariantValue::String(format!("label-{ordinal}-{}", "x".repeat(ordinal % 40))),
             );
         }
@@ -1606,7 +1611,7 @@ fn multi_stripe_file_with_gaps() -> (Vec<u8>, [u8; 32], Footer) {
         built.footer.integrity_gaps.iter().any(|gap| gap.byte_len > 0),
         "test needs an alignment gap to corrupt"
     );
-    (built.bytes, built.file_seal, built.footer)
+    (built.bytes.to_vec(), built.file_seal, built.footer)
 }
 
 fn read_shape(file: &OeFile, column_id: u32, granule_id: u32) -> Result<(ColumnData, Vec<u8>), FormatError> {
@@ -1714,7 +1719,7 @@ fn whole_file_open_rejects_an_undeclared_tree_appendix() {
     let expected = built.file_seal;
 
     let tree = vec![0xABu8; 40];
-    let mut object = built.bytes.clone();
+    let mut object = built.bytes.to_vec();
     object.extend_from_slice(&tree);
     object.extend_from_slice(&(tree.len() as u64).to_le_bytes());
     object.extend_from_slice(&TREE_TRAILER_MAGIC);
@@ -1733,7 +1738,7 @@ fn encrypted_whole_file_open_rejects_an_undeclared_tree_appendix() {
     let expected = enc.file_seal;
 
     let tree = vec![0xCDu8; 24];
-    let mut object = enc.bytes.clone();
+    let mut object = enc.bytes.to_vec();
     object.extend_from_slice(&tree);
     object.extend_from_slice(&(tree.len() as u64).to_le_bytes());
     object.extend_from_slice(&TREE_TRAILER_MAGIC);
@@ -1762,7 +1767,7 @@ fn open_refuses_on_a_required_header_feature_beyond_what_this_reader_knows() {
     let unknown_bit = 1u64 << 40;
     header.feature_flags |= unknown_bit;
     let new_header = crate::layout::encode_header(&header);
-    let mut tampered = built.bytes.clone();
+    let mut tampered = built.bytes.to_vec();
     tampered[..HEADER_BLOCK_LEN].copy_from_slice(&new_header);
 
     let err = OeFile::open(tampered, None).expect_err("an unknown required header feature must refuse");
@@ -1886,7 +1891,7 @@ fn shared_string_view_dictionaries_are_prepared_lazily() {
             let PayloadInput::Variant(VariantValue::Object(payload)) = &mut row.event.payload else {
                 unreachable!("the fixture carries an object payload")
             };
-            payload.insert("kind".to_owned(), VariantValue::String(format!("k{}", i % 4)));
+            payload.insert("kind".to_owned().into(), VariantValue::String(format!("k{}", i % 4)));
             row
         })
         .collect();
@@ -2094,7 +2099,7 @@ fn decoded_block_cache_stays_within_its_budget_and_reads_stay_correct() {
             let value = file.payload(ordinal).unwrap();
             assert_eq!(
                 value,
-                PayloadRead::Value(VariantValue::Object(expected)),
+                PayloadRead::Value(VariantValue::object(expected)),
                 "pass {pass} row {ordinal}"
             );
             assert!(
@@ -2283,7 +2288,7 @@ fn verify_stripe_range_in_serves_ranges_out_of_one_fetch_and_names_the_fault() {
         Err(RangeFault::Corrupt)
     );
 
-    let mut damaged = built.bytes.clone();
+    let mut damaged = built.bytes.to_vec();
     let tree_start = damaged.len() - built.tree_len.unwrap() as usize;
     damaged[tree_start] ^= 1;
     let damaged_tail = &damaged[damaged.len() - tail_of(&built).len()..];
@@ -2353,12 +2358,12 @@ fn eager_and_lazy_opens_refuse_a_corrupt_footer_byte_and_tolerate_a_corrupt_tree
     let built = streaming_built();
     let content_len = built.bytes.len() - built.tree_len.unwrap() as usize;
     let footer_start = content_len - built.footer_len as usize;
-    let mut corrupt = built.bytes.clone();
+    let mut corrupt = built.bytes.to_vec();
     corrupt[footer_start + built.footer_len as usize / 2] ^= 0x5A;
     assert!(OeFile::open(corrupt.clone(), Some(&built.file_seal)).is_err());
     assert!(OeFile::open_lazy(corrupt, Some(&built.file_seal), None).is_err());
 
-    let mut damaged = built.bytes.clone();
+    let mut damaged = built.bytes.to_vec();
     damaged[content_len + 3] ^= 0x5A;
     let note = note_column(&built.footer);
     let eager = OeFile::open(damaged.clone(), Some(&built.file_seal)).unwrap();
@@ -2460,7 +2465,7 @@ fn embedding_value_for_row_fallback_maps_rows_through_the_presence_bitmap() {
 fn a_dense_block_keeps_answering_point_reads_once_it_is_cached() {
     let values = [10i64, 20, 30];
     let file = single_block_file(&ColumnData::I64(values.to_vec()), &[], 3);
-    let granule = file.footer.granules[0].clone();
+    let granule = file.footer.granules[0];
     for probe in 0..=POINT_READS_BEFORE_WHOLE_GRANULE_DECODE as usize + 8 {
         let row = probe % values.len();
         assert_eq!(

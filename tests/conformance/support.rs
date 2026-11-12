@@ -54,7 +54,7 @@ pub fn event(i: u64) -> EventInput {
             schema_version: 2,
             flags: EventFlags(0),
         },
-        payload: PayloadInput::Variant(VariantValue::Object(payload)),
+        payload: PayloadInput::Variant(VariantValue::object(payload)),
         source_schema: Some("json".to_owned()),
         source_delivery: Some(format!("delivery-{i}")),
         connector_delivery_hash_low: 5_000 + i,

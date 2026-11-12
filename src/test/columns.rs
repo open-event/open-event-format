@@ -1,12 +1,7 @@
 use super::*;
 
 fn object(fields: &[(&str, VariantValue)]) -> VariantValue {
-    VariantValue::Object(
-        fields
-            .iter()
-            .map(|(key, value)| ((*key).to_owned(), value.clone()))
-            .collect(),
-    )
+    VariantValue::object(fields.iter().map(|(key, value)| ((*key).to_owned(), value.clone())))
 }
 
 #[test]
@@ -99,7 +94,7 @@ fn field_id_statistics_match_string_keyed_selection_for_missing_and_changed_type
             VariantValue::Object(fields) => {
                 let ids: Vec<u32> = fields
                     .keys()
-                    .map(|path| names.iter().position(|name| name == path).unwrap() as u32)
+                    .map(|path| names.iter().position(|name| **name == **path).unwrap() as u32)
                     .collect();
                 let values: Vec<VariantValue> = fields.values().cloned().collect();
                 identified.observe_field_ids(&ids, &values);
