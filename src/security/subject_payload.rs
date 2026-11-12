@@ -6,7 +6,7 @@ use crate::encoding::ColumnData;
 use crate::error::{FormatError, StorageError, SubjectPayloadError};
 use crate::events::EventId;
 use crate::events::variant::{VariantRef, VariantValue};
-use crate::file::bytes::{Reader, Writer};
+use crate::file::bytes::Reader;
 use crate::layout::reader::{OeFile, PayloadRead};
 
 pub trait SubjectKeyStore {
@@ -42,19 +42,22 @@ pub fn seal_subject_payload(
             rule: "a sealed payload's key dictionary fits in u32 bytes",
         })
     })?;
-    let mut plaintext = Writer::with_capacity(4 + dictionary.len() + payload.bytes.len());
-    plaintext.put_u32(dictionary_len);
-    plaintext.put_slice(&dictionary);
-    plaintext.put_slice(&payload.bytes);
+    // One buffer sized for the whole stored form (magic, subject, sealed blob); the plaintext is copied in once and
+    // encrypted where it lies.
+    let plaintext_len = 4 + dictionary.len() + payload.bytes.len();
+    let mut stored =
+        Vec::with_capacity(SEALED_PAYLOAD_MAGIC.len() + 16 + super::sealed_len(key.scheme(), plaintext_len));
+    stored.extend_from_slice(SEALED_PAYLOAD_MAGIC);
+    stored.extend_from_slice(&subject.uuid().as_u128().to_le_bytes());
     let event_id = event_id.uuid().as_u128();
-    let sealed = key
-        .encrypt(seal_block_id(event_id), event_id, plaintext.bytes())
-        .ok_or(SubjectPayloadError::SealRefused)?;
-    let mut stored = Writer::with_capacity(SEALED_PAYLOAD_MAGIC.len() + 16 + sealed.len());
-    stored.put_slice(SEALED_PAYLOAD_MAGIC);
-    stored.put_u128(subject.uuid().as_u128());
-    stored.put_slice(&sealed);
-    Ok(stored.into_bytes())
+    key.encrypt_into(
+        seal_block_id(event_id),
+        event_id,
+        &[&dictionary_len.to_le_bytes(), &dictionary, &payload.bytes],
+        &mut stored,
+    )
+    .ok_or(SubjectPayloadError::SealRefused)?;
+    Ok(stored)
 }
 
 pub fn read_subject_payload(

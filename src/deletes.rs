@@ -491,6 +491,21 @@ impl SubjectContentKey {
         Some(sealed)
     }
 
+    /// [`encrypt`](Self::encrypt) of the concatenation of `plaintext_parts`, appended to `out` (see
+    /// [`SealedContentKey::encrypt_into`]). On `None`, `out` is unchanged.
+    pub fn encrypt_into(
+        &mut self,
+        block_id: u64,
+        file_id: u128,
+        plaintext_parts: &[&[u8]],
+        out: &mut Vec<u8>,
+    ) -> Option<()> {
+        let key = self.key.as_mut()?;
+        key.encrypt_into(block_id, file_id, plaintext_parts, out)?;
+        self.key_epoch = key.key_epoch();
+        Some(())
+    }
+
     pub fn destroy(&mut self) {
         self.key = None;
     }
