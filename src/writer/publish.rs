@@ -366,7 +366,7 @@ impl OePublisher {
                 return Ok(Published {
                     entry: existing.clone(),
                     generation: head_id,
-                    file_bytes: built.bytes,
+                    file_bytes: std::sync::Arc::unwrap_or_clone(built.bytes),
                 });
             }
             let mut entry = staged_entry.clone();
@@ -487,7 +487,7 @@ impl OePublisher {
         Ok(Published {
             entry,
             generation,
-            file_bytes: built.bytes,
+            file_bytes: std::sync::Arc::unwrap_or_clone(built.bytes),
         })
     }
 }

@@ -245,7 +245,7 @@ fn seeding_the_cache_from_the_mirror_opens_its_files_with_no_tail_request() {
     mirror.seed_cache(&cache, generation, std::slice::from_ref(&entry));
 
     let source = Arc::new(CountingSource {
-        bytes: built.bytes.clone(),
+        bytes: built.bytes.to_vec(),
         requests: AtomicUsize::new(0),
     });
     let header = HeaderCommitment::from_header_block(&built.bytes[..HEADER_BLOCK_LEN]).unwrap();

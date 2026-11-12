@@ -1516,28 +1516,30 @@ pub struct OeFile {
 }
 
 impl OeFile {
-    pub fn open(bytes: Vec<u8>, expected_seal: Option<&[u8; SEAL_LEN]>) -> Result<Self, FormatError> {
+    pub fn open(bytes: impl Into<Arc<Vec<u8>>>, expected_seal: Option<&[u8; SEAL_LEN]>) -> Result<Self, FormatError> {
         Self::open_with_keys(bytes, expected_seal, None)
     }
 
     pub fn open_with_keys(
-        bytes: Vec<u8>,
+        bytes: impl Into<Arc<Vec<u8>>>,
         expected_seal: Option<&[u8; SEAL_LEN]>,
         footer_dek: Option<&[u8; FOOTER_DEK_LEN]>,
     ) -> Result<Self, FormatError> {
-        Self::open_inner(bytes, expected_seal, footer_dek, false)
+        Self::open_inner(bytes.into(), expected_seal, footer_dek, false)
     }
 
+    /// Every open takes a `Vec<u8>` or an already-shared `Arc<Vec<u8>>`; shared bytes are kept by reference, so
+    /// opening a file the caller holds in memory (such as a [`BuiltOe`](crate::writer::build::BuiltOe)) copies nothing.
     pub fn open_lazy(
-        bytes: Vec<u8>,
+        bytes: impl Into<Arc<Vec<u8>>>,
         expected_seal: Option<&[u8; SEAL_LEN]>,
         footer_dek: Option<&[u8; FOOTER_DEK_LEN]>,
     ) -> Result<Self, FormatError> {
-        Self::open_inner(bytes, expected_seal, footer_dek, true)
+        Self::open_inner(bytes.into(), expected_seal, footer_dek, true)
     }
 
     fn open_inner(
-        bytes: Vec<u8>,
+        bytes: Arc<Vec<u8>>,
         expected_seal: Option<&[u8; SEAL_LEN]>,
         footer_dek: Option<&[u8; FOOTER_DEK_LEN]>,
         lazy: bool,
@@ -1635,7 +1637,7 @@ impl OeFile {
             None
         };
         Self::assemble(
-            FileBytes::Local(Arc::new(bytes)),
+            FileBytes::Local(bytes),
             header,
             footer,
             usable_optional_features,

@@ -30,7 +30,7 @@ fn unknown_required_feature_fails_file() {
 #[test]
 fn checksum_validated_before_use() {
     let built = support::built_file(8);
-    let mut corrupted = built.bytes.clone();
+    let mut corrupted = built.bytes.to_vec();
     let offset = built.footer.stripes[0].file_offset as usize;
     corrupted[offset] ^= 0x01;
     assert!(OeFile::open(corrupted, None).is_err());

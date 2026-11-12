@@ -457,7 +457,7 @@ fn mutated_entity_hash_elided_file_never_panics() {
     let mut rng = XorShift(47);
     let mut position = 0usize;
     while position < built.bytes.len() {
-        let mut mutated = built.bytes.clone();
+        let mut mutated = built.bytes.to_vec();
         mutated[position] ^= (rng.next() as u8) | 1;
         if let Ok(file) = OeFile::open(mutated, None) {
             for granule in file.footer().granules.iter().take(2) {

@@ -127,7 +127,7 @@ fn local(built: &BuiltOe) -> OeFile {
 
 fn counting_source(built: &BuiltOe) -> Arc<CountingSource> {
     Arc::new(CountingSource {
-        object: built.bytes.clone(),
+        object: built.bytes.to_vec(),
         requests: Mutex::new(Vec::new()),
     })
 }

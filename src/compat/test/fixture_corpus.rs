@@ -268,7 +268,7 @@ fn generated_fixtures_are_swept_and_a_broken_one_is_named() {
     assert_eq!(sweep.opened, vec!["oe-v1.0-minimal.oe".to_owned()]);
     assert!(sweep.failures.is_empty());
 
-    let mut corrupted = built.bytes.clone();
+    let mut corrupted = built.bytes.to_vec();
     let middle = corrupted.len() / 2;
     corrupted[middle] ^= 0xFF;
     std::fs::write(dir.path().join("oe-v1.0-corrupted.oe"), &corrupted).unwrap();

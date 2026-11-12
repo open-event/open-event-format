@@ -23,8 +23,8 @@ use zstd::{bulk::Compressor as ZstdCompressor, zstd_safe::compress_bound};
 
 use chimp::{decode_chimp, decode_chimp_range, encode_chimp};
 pub use lazy::{
-    DictionaryCodes, decode_dictionary_codes, filter_block_by_selection, fsst_uncompressed_len, take_block_rows,
-    take_block_rows_shared,
+    BlockDictionary, DictionaryCodes, decode_dictionary_codes, filter_block_by_selection, fsst_uncompressed_len,
+    take_block_rows, take_block_rows_shared,
 };
 pub(crate) use presence::{PresenceRank, count_present_before, count_set_bits, present_position};
 use scratch::{with_arena_buffer, with_unpack_buffer};

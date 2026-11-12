@@ -51,7 +51,7 @@ pub fn generate_fixture(dir: &Path, label: &str, built: &crate::writer::build::B
     std::fs::create_dir_all(dir)?;
     let (major, minor) = FIXTURE_WRITER_VERSION;
     let path = dir.join(format!("oe-v{major}.{minor}-{label}.oe"));
-    std::fs::write(&path, &built.bytes)?;
+    std::fs::write(&path, built.bytes.as_slice())?;
     Ok(path)
 }
 

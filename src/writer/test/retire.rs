@@ -179,7 +179,7 @@ fn a_compaction_publishes_one_generation_that_adds_the_output_and_outdates_the_i
     let mut notices = NoopPeerNotices::default();
     let clock = FixedClock::at(START_NANOS);
     let built = merged_file();
-    let bytes = built.bytes.clone();
+    let bytes = built.bytes.to_vec();
 
     let published = OePublisher::new()
         .publish_compaction(

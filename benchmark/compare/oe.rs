@@ -183,7 +183,7 @@ impl Format for Oe {
             row.external_id = Some(columns.event_ids[i].as_bytes().to_vec());
             rows.push(row);
         }
-        Ok(build_oe_file(rows, &config())?.bytes)
+        Ok(std::sync::Arc::unwrap_or_clone(build_oe_file(rows, &config())?.bytes))
     }
 
     fn open(&self, _dataset: &Dataset, bytes: Vec<u8>) -> Result<Box<dyn Opened>> {

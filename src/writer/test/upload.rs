@@ -144,7 +144,7 @@ fn a_multipart_upload_cuts_parts_on_stripe_boundaries() {
 
     upload_oe(&store, KEY, &built, 1).unwrap();
 
-    assert_eq!(store.inner.object(KEY).unwrap(), built.bytes);
+    assert_eq!(store.inner.object(KEY).unwrap(), *built.bytes);
     let part_lens = store.part_lens.lock().unwrap().clone();
     assert!(part_lens.len() > 1, "a tiny part minimum must use multipart");
     let mut starts = Vec::new();
