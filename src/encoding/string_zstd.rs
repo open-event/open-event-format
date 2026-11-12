@@ -125,7 +125,9 @@ fn put_unterminated(reader: &mut Reader<'_>, count: usize, out: &mut Writer) -> 
 }
 
 fn unrelay(tag: u8, relaid: &[u8], classic_len: usize, plain: &mut Vec<u8>) -> Result<(), FormatError> {
-    let nulls_end = null_stream_end(relaid)?;
+    let mut null_reader = Reader::new(relaid);
+    let present = NullStream::read(&mut null_reader)?.present_count();
+    let nulls_end = null_reader.position();
     let mut reader = Reader::new(relaid);
     let nulls = reader.take(nulls_end, "null stream")?;
     let mut buffer = std::mem::take(plain);
@@ -144,6 +146,7 @@ fn unrelay(tag: u8, relaid: &[u8], classic_len: usize, plain: &mut Vec<u8>) -> R
             out.put_u32(dict_count as u32);
             put_unterminated(&mut reader, dict_count, &mut out)?;
             let count = reader.u32("dictionary code count")? as usize;
+            check_code_count(count, present)?;
             let width = reader.u8("dictionary code width")?;
             if width > 64 {
                 return Err(FormatError::Structural {
@@ -357,6 +360,15 @@ fn gather_planes(bytes: &[u8], count: usize, planes: usize) -> Vec<u64> {
     codes
 }
 
+fn check_code_count(count: usize, present: usize) -> Result<(), FormatError> {
+    if count > MAX_BLOCK_VALUES || count != present {
+        return Err(FormatError::Structural {
+            rule: "relaid dictionary code count disagrees with the null stream present count",
+        });
+    }
+    Ok(())
+}
+
 fn parse(tag: u8, relaid: &[u8], classic_len: usize) -> Result<Relaid<'_>, FormatError> {
     let mut reader = Reader::new(relaid);
     let nulls = NullStream::read(&mut reader)?;
@@ -390,6 +402,7 @@ fn parse(tag: u8, relaid: &[u8], classic_len: usize) -> Result<Relaid<'_>, Forma
             walk.finish()?;
             let mut reader = Reader::new(rest.get(end..).unwrap_or_default());
             let count = reader.u32("dictionary code count")? as usize;
+            check_code_count(count, nulls.present_count())?;
             let width = reader.u8("dictionary code width")?;
             if width > 64 {
                 return Err(FormatError::Structural {

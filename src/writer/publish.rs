@@ -123,6 +123,9 @@ impl PublishObserver for RecordingObserver {
 #[derive(Debug)]
 pub enum PublishFailure {
     Format(FormatError),
+    /// An input's deletion or redaction state changed after the replacement was built from it;
+    /// the replacement must be rebuilt from the current inputs.
+    InputsChanged,
     Publish(PublishError),
     RangeNotDurable,
     Storage(StorageError),

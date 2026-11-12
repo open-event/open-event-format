@@ -89,16 +89,21 @@ impl DeletionVector {
         }
     }
 
+    /// Returns `ordinals` minus deleted ones, preserving input order (any order accepted).
     pub fn apply(&self, ordinals: &[u64]) -> Vec<u64> {
         let mut kept = Vec::with_capacity(ordinals.len());
-        let mut runs = self.deleted_runs.iter().peekable();
-        for &ordinal in ordinals {
-            while runs.peek().is_some_and(|run| run.end <= ordinal) {
-                runs.next();
+        if ordinals.is_sorted() {
+            let mut runs = self.deleted_runs.iter().peekable();
+            for &ordinal in ordinals {
+                while runs.peek().is_some_and(|run| run.end <= ordinal) {
+                    runs.next();
+                }
+                if runs.peek().is_none_or(|run| run.start > ordinal) {
+                    kept.push(ordinal);
+                }
             }
-            if runs.peek().is_none_or(|run| run.start > ordinal) {
-                kept.push(ordinal);
-            }
+        } else {
+            kept.extend(ordinals.iter().copied().filter(|&ordinal| !self.is_deleted(ordinal)));
         }
         kept
     }

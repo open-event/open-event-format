@@ -385,6 +385,24 @@ pub fn execute_compaction(
     notices: &mut dyn PeerNotices,
     clock: &dyn Clock,
 ) -> Result<Published, PublishFailure> {
+    let mut attempts = 0;
+    loop {
+        match execute_compaction_once(publisher, job, config, published, objects, notices, clock) {
+            Err(PublishFailure::InputsChanged) if attempts < super::publish::MAX_REBASE_ATTEMPTS => attempts += 1,
+            result => return result,
+        }
+    }
+}
+
+fn execute_compaction_once(
+    publisher: &mut OePublisher,
+    job: &CompactionJob,
+    config: &OeBuildConfig,
+    published: &mut dyn PublishedSet,
+    objects: &dyn ObjectStore,
+    notices: &mut dyn PeerNotices,
+    clock: &dyn Clock,
+) -> Result<Published, PublishFailure> {
     let (_, head) = published.head().map_err(PublishFailure::Publish)?;
     let mut entries: Vec<&OeFileEntry> = Vec::with_capacity(job.file_ids.len());
     for file_id in &job.file_ids {

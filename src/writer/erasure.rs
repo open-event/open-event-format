@@ -116,6 +116,7 @@ pub fn rekey_backlog_file(
     for event_id in report.sealed.iter().chain(&report.dropped) {
         backlog.mark_rekeyed(*event_id).map_err(RekeyError::Backlog)?;
     }
+    retarget_backlog_after_compaction(backlog, &[file_id], published.entry.file_id).map_err(RekeyError::Backlog)?;
     report.generation = Some(published.generation);
     report.output_file_id = Some(published.entry.file_id);
     Ok(report)

@@ -902,22 +902,28 @@ impl PublishedSet for RivalSet<'_> {
 }
 
 #[test]
-fn a_compaction_that_rebases_onto_a_newer_deletion_or_redaction_of_an_input_is_refused() {
-    let rivals: [Box<dyn Fn(&mut ManifestGeneration, u128)>; 2] = [
-        Box::new(|next, file_id| {
-            let mut deleted = crate::deletes::DeletionVector::new();
-            deleted.mark_deleted(0);
-            assert!(next.publish_deletions(file_id, &deleted, None).unwrap().is_some());
-        }),
-        Box::new(|next, file_id| {
-            assert!(
-                next.publish_field_deletions(file_id, &body_redaction(&[0]))
-                    .unwrap()
-                    .is_some()
-            );
-        }),
+fn a_compaction_that_rebases_onto_a_newer_deletion_or_redaction_of_an_input_rebuilds_without_resurrecting() {
+    let rivals: [(Box<dyn Fn(&mut ManifestGeneration, u128)>, u64); 2] = [
+        (
+            Box::new(|next, file_id| {
+                let mut deleted = crate::deletes::DeletionVector::new();
+                deleted.mark_deleted(0);
+                assert!(next.publish_deletions(file_id, &deleted, None).unwrap().is_some());
+            }),
+            4,
+        ),
+        (
+            Box::new(|next, file_id| {
+                assert!(
+                    next.publish_field_deletions(file_id, &body_redaction(&[0]))
+                        .unwrap()
+                        .is_some()
+                );
+            }),
+            5,
+        ),
     ];
-    for rival in rivals {
+    for (rival, surviving_rows) in rivals {
         let objects = SimObjectStore::new();
         let mut inner = SimulatedPublishedSet::new();
         let first = build_oe_file(rows_of(1..=3), &build_config()).unwrap();
@@ -943,17 +949,27 @@ fn a_compaction_that_rebases_onto_a_newer_deletion_or_redaction_of_an_input_is_r
             &mut notices,
             &FixedClock::at(START_NANOS),
         );
-        assert!(matches!(result, Err(PublishFailure::Verification(_))));
+        let output = result.expect("the compaction rebuilds from the rival's state");
         let (head_id, head) = published.head().unwrap();
-        assert_eq!(head_id, before + 1, "only the rival's generation was published");
-        assert_eq!(head.files.len(), 2, "the stale output never became a file");
-        assert!(head.files.iter().all(|entry| entry.part_state == PartState::Active));
-        assert!(notices.published.is_empty());
+        assert_eq!(head_id, before + 2, "the rival's generation, then the rebuilt output");
+        let active: Vec<_> = head
+            .files
+            .iter()
+            .filter(|entry| entry.part_state == PartState::Active)
+            .collect();
+        assert_eq!(active, vec![&output.entry]);
+        let file = OeFile::open(output.file_bytes, Some(&output.entry.file_seal)).unwrap();
+        assert_eq!(file.header().row_count, surviving_rows, "deleted rows stay deleted");
+        assert_ne!(
+            file.payload(0).unwrap(),
+            crate::layout::reader::PayloadRead::Value(payload_of(1)),
+            "the first row is deleted or its body stays redacted"
+        );
     }
 }
 
 #[test]
-fn a_graph_rewrite_that_rebases_onto_a_newer_deletion_of_an_input_is_refused() {
+fn a_graph_rewrite_that_rebases_onto_a_newer_deletion_of_an_input_rebuilds() {
     let objects = SimObjectStore::new();
     let mut inner = SimulatedPublishedSet::new();
     let (a, b, c) = (graph_file(0, 4), graph_file(4, 9), graph_file(9, 12));
@@ -983,9 +999,16 @@ fn a_graph_rewrite_that_rebases_onto_a_newer_deletion_of_an_input_is_refused() {
         &mut NoopPeerNotices::default(),
         &FixedClock::at(START_NANOS),
     );
-    assert!(matches!(result, Err(PublishFailure::Verification(_))));
+    result.expect("the graph rewrite rebuilds from the rival's state");
     let (head_id, head) = published.head().unwrap();
-    assert_eq!(head_id, before + 1, "only the rival's generation was published");
-    assert_eq!(head.files.len(), 3);
-    assert!(head.files.iter().all(|entry| entry.part_state == PartState::Active));
+    assert!(
+        head_id >= before + 2,
+        "the rival's generation, then the rebuilt rewrite"
+    );
+    let rival_target = head.files.iter().find(|entry| entry.file_id == later).unwrap();
+    assert_eq!(
+        rival_target.part_state,
+        PartState::Outdated,
+        "the rebuild consumed the rival's deletion"
+    );
 }

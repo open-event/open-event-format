@@ -277,15 +277,40 @@ fn erasing_one_subject_of_a_multi_subject_event_redacts_only_its_fields() {
     assert_eq!(read(1).value, payload(1));
     assert_eq!(read(2).value, payload(2));
 
-    let vector = crate::security::field_deletion_vector_for_subject(&file, alice)
-        .unwrap()
-        .unwrap();
+    let vectors = crate::security::field_deletion_vectors_for_subject(&file, alice).unwrap();
+    assert_eq!(vectors.len(), 1);
+    let vector = &vectors[0];
     assert!(vector.column_redacted("body", 0));
     assert!(!vector.column_redacted("body", 1));
     assert!(!vector.column_redacted("n", 0));
     assert!(
-        crate::security::field_deletion_vector_for_subject(&file, SubjectId::new_test_id(9))
+        crate::security::field_deletion_vectors_for_subject(&file, SubjectId::new_test_id(9))
             .unwrap()
-            .is_none()
+            .is_empty()
     );
+}
+
+#[test]
+fn subject_field_vectors_never_redact_another_subjects_field_in_a_different_row() {
+    let alice = SubjectId::new_test_id(1);
+    let bob = SubjectId::new_test_id(2);
+    let mut rows: Vec<BuildRow> = (0..2).map(|i| row(i, None)).collect();
+    let map = |i: usize, _: &BuildRow| match i {
+        0 => crate::security::FieldSubjects::from([("body".to_owned(), alice), ("n".to_owned(), bob)]),
+        _ => crate::security::FieldSubjects::from([("body".to_owned(), bob), ("n".to_owned(), alice)]),
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let keys =
+        crate::security::FileSubjectKeyStore::open(dir.path(), crate::security::TenantDek::new([3; 32])).unwrap();
+    seal_subject_field_rows(&mut rows, map, &keys).unwrap();
+    let built = build_oe_file(rows, &config()).unwrap();
+    let file = OeFile::open(built.bytes, Some(&built.file_seal)).unwrap();
+
+    let vectors = crate::security::field_deletion_vectors_for_subject(&file, alice).unwrap();
+    assert_eq!(vectors.len(), 2);
+    let redacted = |path: &str, row: u64| vectors.iter().any(|vector| vector.column_redacted(path, row));
+    assert!(redacted("body", 0));
+    assert!(redacted("n", 1));
+    assert!(!redacted("n", 0), "bob owns n in row 0");
+    assert!(!redacted("body", 1), "bob owns body in row 1");
 }

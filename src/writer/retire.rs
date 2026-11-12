@@ -671,9 +671,8 @@ fn deletions_unchanged(
         if entry.deletion_vector != input.deletion_vector
             || entry.field_deletion_vectors != input.field_deletion_vectors
         {
-            return Err(PublishFailure::Verification(
-                "a compaction input's deleted rows or redacted fields changed after the merge read them",
-            ));
+            // The caller rebuilds from the current inputs rather than resurrecting rows or fields.
+            return Err(PublishFailure::InputsChanged);
         }
     }
     Ok(())

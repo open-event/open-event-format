@@ -657,3 +657,11 @@ fn granule_selections_skip_empty_masks_and_full_masks() {
     );
     assert_eq!(RowSelection::from_mask(vec![]), RowSelection::None);
 }
+
+#[test]
+fn apply_filters_deleted_ordinals_in_any_input_order() {
+    let mut vector = DeletionVector::new();
+    vector.mark_deleted(1);
+    assert_eq!(vector.apply(&[2, 1, 0]), vec![2, 0]);
+    assert_eq!(vector.apply(&[0, 1, 2]), vec![0, 2]);
+}

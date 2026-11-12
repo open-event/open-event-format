@@ -972,7 +972,7 @@ fn a_published_compaction_that_rebases_onto_a_newer_deletion_of_an_input_row_is_
         &FixedClock::at(START_NANOS),
     );
 
-    assert!(matches!(result, Err(PublishFailure::Verification(_))));
+    assert!(matches!(result, Err(PublishFailure::InputsChanged)));
     let (head_id, head) = set.head().unwrap();
     assert_eq!(head_id, 2, "only the rival's deletion was published");
     let deleted_input = head.files.iter().find(|entry| entry.file_id == first.file_id).unwrap();

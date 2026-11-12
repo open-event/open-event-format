@@ -166,7 +166,12 @@ fn the_backlog_rekeys_tenant_key_payloads_once_their_subject_is_resolved() {
         SubjectPayloadRead::Plain(crate::layout::reader::PayloadRead::Value(payload_of(3)))
     );
 
-    assert_eq!(backlog.pending().unwrap().len(), 2);
+    let remaining = backlog.pending().unwrap();
+    assert_eq!(remaining.len(), 2);
+    assert!(
+        remaining.iter().all(|entry| entry.file_id == output_id),
+        "unresolved entries follow the replacement file"
+    );
     keys.erase_subject(alice, &clock).unwrap();
     assert_eq!(
         read_subject_payload(&file, 0, &keys).unwrap(),

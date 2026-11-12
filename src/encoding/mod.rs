@@ -64,7 +64,7 @@ impl CascadeStrategy {
     }
 }
 
-const MAX_BLOCK_VALUES: usize = 1 << 24;
+pub(crate) const MAX_BLOCK_VALUES: usize = 1 << 24;
 
 pub const MAX_CASCADE_DEPTH: usize = 3;
 
