@@ -2460,7 +2460,7 @@ fn embedding_value_for_row_fallback_maps_rows_through_the_presence_bitmap() {
 fn a_dense_block_keeps_answering_point_reads_once_it_is_cached() {
     let values = [10i64, 20, 30];
     let file = single_block_file(&ColumnData::I64(values.to_vec()), &[], 3);
-    let granule = file.footer.granules[0].clone();
+    let granule = file.footer.granules[0];
     for probe in 0..=POINT_READS_BEFORE_WHOLE_GRANULE_DECODE as usize + 8 {
         let row = probe % values.len();
         assert_eq!(

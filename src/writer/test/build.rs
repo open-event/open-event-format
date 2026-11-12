@@ -6,6 +6,7 @@ use crate::events::sim::{SimulatedEventAuthor, signed_event_payload};
 use crate::events::variant::VariantValue;
 use crate::events::{EventEnvelope, EventFlags, EventId, StreamId, TimestampValue};
 use crate::invariants::io::ThreadPoolEncodeExecutor;
+use crate::invariants::sim::SerialEncodeExecutor;
 use crate::layout::graph::RowEdges;
 use crate::layout::reader::{OeFile, OeFooter, PayloadRead, SpeculativeTail, tail_range};
 use crate::typed_id::TypedIdTestExt;

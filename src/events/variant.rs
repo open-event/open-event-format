@@ -132,6 +132,25 @@ impl VariantValue {
             _ => {}
         }
     }
+
+    /// Appends every object key under `self` to `keys`, duplicates included,
+    /// so a caller can reuse one buffer across values and sort and dedup it.
+    pub fn collect_keys_into<'a>(&'a self, keys: &mut Vec<&'a str>) {
+        match self {
+            VariantValue::Object(fields) => {
+                for (key, value) in fields {
+                    keys.push(key.as_str());
+                    value.collect_keys_into(keys);
+                }
+            }
+            VariantValue::Array(items) => {
+                for item in items {
+                    item.collect_keys_into(keys);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 fn metadata_byte(basic: u8, header: u8) -> u8 {
@@ -272,6 +291,21 @@ pub fn transcode_value_into_with_scratch(
 ) -> Result<(), FormatError> {
     let mut remap = std::mem::take(&mut scratch.remap);
     fill_id_remap(from, to, &mut remap);
+    let transcoded = transcode_into(value, &remap, scratch, out, 0);
+    scratch.remap = remap;
+    transcoded
+}
+
+/// Transcodes `value` with the id remap left in `scratch` by the previous
+/// [`transcode_value_into_with_scratch`] call. The caller must pass a value
+/// governed by a dictionary equal to that call's `from`, transcoded into a
+/// dictionary equal to that call's `to`.
+pub(crate) fn transcode_value_into_with_previous_remap(
+    value: VariantRef<'_>,
+    scratch: &mut EncodeScratch,
+    out: &mut Writer,
+) -> Result<(), FormatError> {
+    let remap = std::mem::take(&mut scratch.remap);
     let transcoded = transcode_into(value, &remap, scratch, out, 0);
     scratch.remap = remap;
     transcoded
@@ -836,6 +870,43 @@ impl<'a> VariantRef<'a> {
 
     pub fn decode(&self, dictionary: &KeyDictionary) -> Result<VariantValue, FormatError> {
         self.decode_at_depth(dictionary, 0)
+    }
+
+    /// Decodes a top-level object with its keys borrowed from `dictionary`,
+    /// so no key `String` is allocated per row; nested values decode as in
+    /// [`VariantRef::decode`]. Returns `Ok(None)` when the value is not an
+    /// object.
+    pub fn decode_object_fields<'d>(
+        &self,
+        dictionary: &'d KeyDictionary,
+    ) -> Result<Option<Vec<(&'d str, VariantValue)>>, FormatError> {
+        let (basic, header) = self.metadata()?;
+        if basic != BASIC_OBJECT {
+            return Ok(None);
+        }
+        let geometry = self.object_header(header)?;
+        let mut fields = Vec::with_capacity(geometry.count.min(DECODE_ARRAY_PRE_ALLOCATE_CAP));
+        let mut previous_id: Option<u32> = None;
+        for index in 0..geometry.count {
+            let id = self.read_uint_at(
+                geometry.ids_start + index * geometry.id_width,
+                geometry.id_width,
+                "field id",
+            )?;
+            if previous_id.is_some_and(|previous| previous >= id) {
+                return Err(FormatError::Structural {
+                    rule: "object field ids must be strictly ascending",
+                });
+            }
+            previous_id = Some(id);
+            let key = dictionary.key(id).ok_or(FormatError::RefOutOfRange {
+                what: "field id beyond governing dictionary",
+            })?;
+            let value = self.child_slice(&geometry, index)?.decode_at_depth(dictionary, 1)?;
+            fields.push((key, value));
+        }
+        self.check_container_fills_slice(&geometry)?;
+        Ok(Some(fields))
     }
 
     fn decode_at_depth(&self, dictionary: &KeyDictionary, depth: usize) -> Result<VariantValue, FormatError> {
