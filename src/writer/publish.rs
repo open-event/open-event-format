@@ -181,11 +181,14 @@ impl OePublisher {
                         })?;
                         crate::artifacts::batch::PayloadInput::ExternalRef(reference.to_owned())
                     }
-                    Some(bytes) => crate::artifacts::batch::PayloadInput::Variant(
-                        crate::events::variant::VariantRef::new(bytes)
-                            .decode(&batch.dictionary)
-                            .map_err(PublishFailure::Format)?,
-                    ),
+                    // Kept encoded: the builder reads it against the batch dictionary,
+                    // which clones as a pointer, so no owned value tree is built here.
+                    Some(bytes) => {
+                        crate::artifacts::batch::PayloadInput::Encoded(crate::artifacts::batch::EncodedPayload {
+                            bytes: bytes.to_vec(),
+                            dictionary: batch.dictionary.clone(),
+                        })
+                    }
                 };
                 rows.push(OeRow {
                     epoch: header.epoch,

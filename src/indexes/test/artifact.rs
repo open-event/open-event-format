@@ -174,7 +174,7 @@ fn built_file_row(i: u64) -> OeRow {
     if i.is_multiple_of(2) {
         payload.insert(
             "attributes".to_owned(),
-            VariantValue::Object(std::collections::BTreeMap::from([(
+            VariantValue::object(std::collections::BTreeMap::from([(
                 "revenue".to_owned(),
                 VariantValue::Int(i as i64),
             )])),
@@ -207,7 +207,7 @@ fn built_file_row(i: u64) -> OeRow {
                 schema_version: 1,
                 flags: EventFlags(0),
             },
-            payload: PayloadInput::Variant(VariantValue::Object(payload)),
+            payload: PayloadInput::Variant(VariantValue::object(payload)),
             source_schema: None,
             source_delivery: None,
             connector_delivery_hash_low: i,

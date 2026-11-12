@@ -73,8 +73,8 @@ fn config() -> OeBuildConfig {
 
 fn payload(i: u64) -> VariantValue {
     let mut fields = BTreeMap::new();
-    fields.insert("body".to_owned(), VariantValue::String(format!("message {i}")));
-    fields.insert("n".to_owned(), VariantValue::Int(i as i64));
+    fields.insert("body".to_owned().into(), VariantValue::String(format!("message {i}")));
+    fields.insert("n".to_owned().into(), VariantValue::Int(i as i64));
     VariantValue::Object(fields)
 }
 
@@ -197,13 +197,13 @@ fn sealing_for_an_erased_subject_fails_and_leaves_the_row_untouched() {
 
 fn nested_fields() -> Vec<(FieldName, VariantValue)> {
     let mut inner = BTreeMap::new();
-    inner.insert("city".to_owned(), VariantValue::String("Oslo".to_owned()));
-    inner.insert("zip".to_owned(), VariantValue::Int(150));
+    inner.insert("city".to_owned().into(), VariantValue::String("Oslo".to_owned()));
+    inner.insert("zip".to_owned().into(), VariantValue::Int(150));
     vec![
         (FieldName::from("address"), VariantValue::Object(inner)),
         (
             FieldName::from("tags"),
-            VariantValue::Array(vec![VariantValue::Object(BTreeMap::from([(
+            VariantValue::Array(vec![VariantValue::object(BTreeMap::from([(
                 "label".to_owned(),
                 VariantValue::Bool(true),
             )]))]),
@@ -213,11 +213,11 @@ fn nested_fields() -> Vec<(FieldName, VariantValue)> {
 }
 
 fn object_of(fields: &[(FieldName, VariantValue)]) -> VariantValue {
-    VariantValue::Object(
+    VariantValue::object(
         fields
             .iter()
             .map(|(name, value)| (name.to_string(), value.clone()))
-            .collect(),
+            .collect::<Vec<(String, VariantValue)>>(),
     )
 }
 

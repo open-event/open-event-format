@@ -61,7 +61,7 @@ fn event(sequence: u64, payload: BTreeMap<String, VariantValue>) -> EventInput {
             tenant_id: tenant(),
             trace_id_hash_low: 5,
         },
-        payload: PayloadInput::Variant(VariantValue::Object(payload)),
+        payload: PayloadInput::Variant(VariantValue::object(payload)),
         provenance: None,
         relationships: None,
         source_delivery: None,
@@ -228,7 +228,7 @@ fn a_scan_spans_two_files_and_the_overlay() {
         assert_eq!(event.envelope, self::event(sequence, payload(sequence)).envelope);
         assert_eq!(
             event.payload,
-            PayloadRead::Value(VariantValue::Object(payload(sequence)))
+            PayloadRead::Value(VariantValue::object(payload(sequence)))
         );
     }
 }
@@ -254,7 +254,7 @@ fn the_newest_generation_wins_a_repeated_point() {
             BTreeMap::from([("n".to_owned(), VariantValue::Int(1_000 + event.point.sequence as i64))]);
         assert_eq!(
             event.payload,
-            PayloadRead::Value(VariantValue::Object(rewritten_payload))
+            PayloadRead::Value(VariantValue::object(rewritten_payload))
         );
     }
 }
@@ -304,7 +304,7 @@ fn a_replacement_correction_is_returned_instead_of_the_original() {
     assert_eq!(sequences(&events), expected);
     let replaced = events.iter().find(|event| event.point.sequence == 6).unwrap();
     assert_eq!(replaced.envelope.event_id, event_id(30));
-    assert_eq!(replaced.payload, PayloadRead::Value(VariantValue::Object(payload(30))));
+    assert_eq!(replaced.payload, PayloadRead::Value(VariantValue::object(payload(30))));
     assert!(events.iter().all(|event| event.envelope.event_id != event_id(6)));
 }
 
@@ -331,7 +331,7 @@ fn an_amendment_lays_its_fields_over_the_original() {
     assert_eq!(amended.envelope.event_id, event_id(4));
     let mut expected = payload(4);
     expected.insert("text".to_owned(), VariantValue::String("edited".to_owned()));
-    assert_eq!(amended.payload, PayloadRead::Value(VariantValue::Object(expected)));
+    assert_eq!(amended.payload, PayloadRead::Value(VariantValue::object(expected)));
 }
 
 #[test]
@@ -409,7 +409,7 @@ fn a_chain_of_replacements_serves_the_last() {
     assert_eq!(sequences(&events), room_a_without(&[30, 34]));
     let replaced = events.iter().find(|event| event.point.sequence == 6).unwrap();
     assert_eq!(replaced.envelope.event_id, event_id(34));
-    assert_eq!(replaced.payload, PayloadRead::Value(VariantValue::Object(payload(34))));
+    assert_eq!(replaced.payload, PayloadRead::Value(VariantValue::object(payload(34))));
 }
 
 #[test]
@@ -440,7 +440,7 @@ fn a_chain_of_amendments_applies_in_order() {
     let mut expected = payload(4);
     expected.insert("tag".to_owned(), VariantValue::String("first".to_owned()));
     expected.insert("text".to_owned(), VariantValue::String("second".to_owned()));
-    assert_eq!(amended.payload, PayloadRead::Value(VariantValue::Object(expected)));
+    assert_eq!(amended.payload, PayloadRead::Value(VariantValue::object(expected)));
 }
 
 #[test]

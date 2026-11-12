@@ -38,7 +38,7 @@ impl SubjectKeyStore for MemorySubjectKeys {
 
 fn message(text: &str) -> (VariantValue, EncodedPayload) {
     let mut fields = BTreeMap::new();
-    fields.insert("body".to_owned(), VariantValue::String(text.to_owned()));
+    fields.insert("body".to_owned().into(), VariantValue::String(text.to_owned()));
     let value = VariantValue::Object(fields);
     let dictionary = KeyDictionary::build(["body".to_owned()]);
     let bytes = encode_value(&value, &dictionary).unwrap();

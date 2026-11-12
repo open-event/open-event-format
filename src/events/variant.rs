@@ -2,6 +2,11 @@ use super::envelope::TimestampValue;
 use crate::error::FormatError;
 use crate::file::bytes::{Reader, Writer, slice};
 use std::collections::BTreeMap;
+use std::sync::Arc;
+
+/// An object key: shared with the governing [`KeyDictionary`] on decode, so
+/// decoding a row clones a pointer instead of allocating each key.
+pub type VariantKey = Arc<str>;
 
 const BASIC_PRIMITIVE: u8 = 0;
 const BASIC_SHORT_STRING: u8 = 1;
@@ -35,7 +40,7 @@ const DECODE_ARRAY_PRE_ALLOCATE_CAP: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct KeyDictionary {
-    keys: Vec<String>,
+    keys: Arc<[VariantKey]>,
 }
 
 impl KeyDictionary {
@@ -43,7 +48,9 @@ impl KeyDictionary {
         let mut keys: Vec<String> = keys.into_iter().collect();
         keys.sort();
         keys.dedup();
-        Self { keys }
+        Self {
+            keys: keys.into_iter().map(VariantKey::from).collect(),
+        }
     }
 
     pub fn from_sorted_unique(keys: Vec<String>) -> Result<Self, FormatError> {
@@ -56,7 +63,14 @@ impl KeyDictionary {
                 rule: "dictionary keys must be unique and sorted ascending bytewise",
             });
         }
-        Ok(Self { keys })
+        Ok(Self {
+            keys: keys.into_iter().map(VariantKey::from).collect(),
+        })
+    }
+
+    /// The shared key for `field_id`, cloned as a pointer.
+    pub fn shared_key(&self, field_id: u32) -> Option<&VariantKey> {
+        self.keys.get(field_id as usize)
     }
 
     pub fn key_count(&self) -> u32 {
@@ -65,19 +79,19 @@ impl KeyDictionary {
 
     pub fn field_id(&self, key: &str) -> Option<u32> {
         self.keys
-            .binary_search_by(|probe| probe.as_str().cmp(key))
+            .binary_search_by(|probe| (**probe).cmp(key))
             .ok()
             .map(|index| index as u32)
     }
 
     fn field_id_from(&self, key: &str, cursor: &mut usize) -> Option<u32> {
         let start = (*cursor).min(self.keys.len());
-        if self.keys.get(start).is_some_and(|next| next == key) {
+        if self.keys.get(start).is_some_and(|next| &**next == key) {
             *cursor = start + 1;
             return Some(start as u32);
         }
         let suffix = self.keys.get(start..).unwrap_or(&[]);
-        match suffix.binary_search_by(|probe| probe.as_str().cmp(key)) {
+        match suffix.binary_search_by(|probe| (**probe).cmp(key)) {
             Ok(offset) => {
                 let index = start + offset;
                 *cursor = index + 1;
@@ -91,11 +105,11 @@ impl KeyDictionary {
     }
 
     pub fn key(&self, field_id: u32) -> Option<&str> {
-        self.keys.get(field_id as usize).map(String::as_str)
+        self.keys.get(field_id as usize).map(|key| &**key)
     }
 
     pub fn keys(&self) -> impl Iterator<Item = &str> {
-        self.keys.iter().map(String::as_str)
+        self.keys.iter().map(|key| &**key)
     }
 }
 
@@ -109,24 +123,48 @@ pub enum VariantValue {
     Float(f32),
     Int(i64),
     Null,
-    Object(BTreeMap<String, VariantValue>),
+    Object(BTreeMap<VariantKey, VariantValue>),
     String(String),
     Timestamp(TimestampValue),
     Uuid(u128),
 }
 
 impl VariantValue {
+    /// Builds an object from any key type that converts into a [`VariantKey`].
+    pub fn object<K: Into<VariantKey>>(fields: impl IntoIterator<Item = (K, VariantValue)>) -> Self {
+        VariantValue::Object(fields.into_iter().map(|(key, value)| (key.into(), value)).collect())
+    }
+
     pub fn collect_keys<'a>(&'a self, keys: &mut std::collections::BTreeSet<&'a str>) {
         match self {
             VariantValue::Object(fields) => {
                 for (key, value) in fields {
-                    keys.insert(key.as_str());
+                    keys.insert(key);
                     value.collect_keys(keys);
                 }
             }
             VariantValue::Array(items) => {
                 for item in items {
                     item.collect_keys(keys);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Appends every object key under `self` to `keys`, duplicates included,
+    /// so a caller can reuse one buffer across values and sort and dedup it.
+    pub fn collect_keys_into<'a>(&'a self, keys: &mut Vec<&'a str>) {
+        match self {
+            VariantValue::Object(fields) => {
+                for (key, value) in fields {
+                    keys.push(key);
+                    value.collect_keys_into(keys);
+                }
+            }
+            VariantValue::Array(items) => {
+                for item in items {
+                    item.collect_keys_into(keys);
                 }
             }
             _ => {}
@@ -277,22 +315,30 @@ pub fn transcode_value_into_with_scratch(
     transcoded
 }
 
+/// Transcodes `value` with the id remap left in `scratch` by the previous
+/// [`transcode_value_into_with_scratch`] call. The caller must pass a value
+/// governed by a dictionary equal to that call's `from`, transcoded into a
+/// dictionary equal to that call's `to`.
+pub(crate) fn transcode_value_into_with_previous_remap(
+    value: VariantRef<'_>,
+    scratch: &mut EncodeScratch,
+    out: &mut Writer,
+) -> Result<(), FormatError> {
+    let remap = std::mem::take(&mut scratch.remap);
+    let transcoded = transcode_into(value, &remap, scratch, out, 0);
+    scratch.remap = remap;
+    transcoded
+}
+
 fn fill_id_remap(from: &KeyDictionary, to: &KeyDictionary, remap: &mut Vec<Option<u32>>) {
     remap.clear();
     remap.resize(from.keys.len(), None);
     let mut to_index = 0usize;
     for (from_id, from_key) in from.keys.iter().enumerate() {
-        while to
-            .keys
-            .get(to_index)
-            .is_some_and(|key| key.as_str() < from_key.as_str())
-        {
+        while to.keys.get(to_index).is_some_and(|key| **key < **from_key) {
             to_index += 1;
         }
-        if to
-            .keys
-            .get(to_index)
-            .is_some_and(|key| key.as_str() == from_key.as_str())
+        if to.keys.get(to_index).is_some_and(|key| **key == **from_key)
             && let Some(slot) = remap.get_mut(from_id)
         {
             *slot = Some(to_index as u32);
@@ -616,7 +662,7 @@ fn encode_into(
         }
         VariantValue::Object(fields) => {
             encode_object_into(
-                fields.iter().map(|(key, value)| (key.as_str(), value)),
+                fields.iter().map(|(key, value)| (&**key, value)),
                 fields.len(),
                 dictionary,
                 scratch,
@@ -838,6 +884,43 @@ impl<'a> VariantRef<'a> {
         self.decode_at_depth(dictionary, 0)
     }
 
+    /// Decodes a top-level object with its keys borrowed from `dictionary`,
+    /// so no key `String` is allocated per row; nested values decode as in
+    /// [`VariantRef::decode`]. Returns `Ok(None)` when the value is not an
+    /// object.
+    pub fn decode_object_fields<'d>(
+        &self,
+        dictionary: &'d KeyDictionary,
+    ) -> Result<Option<Vec<(&'d str, VariantValue)>>, FormatError> {
+        let (basic, header) = self.metadata()?;
+        if basic != BASIC_OBJECT {
+            return Ok(None);
+        }
+        let geometry = self.object_header(header)?;
+        let mut fields = Vec::with_capacity(geometry.count.min(DECODE_ARRAY_PRE_ALLOCATE_CAP));
+        let mut previous_id: Option<u32> = None;
+        for index in 0..geometry.count {
+            let id = self.read_uint_at(
+                geometry.ids_start + index * geometry.id_width,
+                geometry.id_width,
+                "field id",
+            )?;
+            if previous_id.is_some_and(|previous| previous >= id) {
+                return Err(FormatError::Structural {
+                    rule: "object field ids must be strictly ascending",
+                });
+            }
+            previous_id = Some(id);
+            let key = dictionary.key(id).ok_or(FormatError::RefOutOfRange {
+                what: "field id beyond governing dictionary",
+            })?;
+            let value = self.child_slice(&geometry, index)?.decode_at_depth(dictionary, 1)?;
+            fields.push((key, value));
+        }
+        self.check_container_fills_slice(&geometry)?;
+        Ok(Some(fields))
+    }
+
     fn decode_at_depth(&self, dictionary: &KeyDictionary, depth: usize) -> Result<VariantValue, FormatError> {
         if depth > MAX_DEPTH {
             return Err(FormatError::Structural {
@@ -887,13 +970,13 @@ impl<'a> VariantRef<'a> {
                         });
                     }
                     previous_id = Some(id);
-                    let key = dictionary.key(id).ok_or(FormatError::RefOutOfRange {
+                    let key = dictionary.shared_key(id).ok_or(FormatError::RefOutOfRange {
                         what: "field id beyond governing dictionary",
                     })?;
                     let value = self
                         .child_slice(&geometry, index)?
                         .decode_at_depth(dictionary, depth + 1)?;
-                    fields.push((key.to_owned(), value));
+                    fields.push((key.clone(), value));
                 }
                 self.check_container_fills_slice(&geometry)?;
                 Ok(VariantValue::Object(BTreeMap::from_iter(fields)))

@@ -56,7 +56,7 @@ fn row(sequence: u64) -> OeRow {
                 tenant_id: tenant(),
                 trace_id_hash_low: 5,
             },
-            payload: PayloadInput::Variant(VariantValue::Object(BTreeMap::from([(
+            payload: PayloadInput::Variant(VariantValue::object(BTreeMap::from([(
                 "n".to_owned(),
                 VariantValue::Int(sequence as i64),
             )]))),

@@ -17,7 +17,7 @@ fn rows() -> Vec<OeRow> {
             else {
                 unreachable!("the sample event carries a variant object payload");
             };
-            fields.insert("note".to_owned(), VariantValue::String(body(i)));
+            fields.insert("note".to_owned().into(), VariantValue::String(body(i)));
             OeRow {
                 epoch: 1,
                 sequence: i + 1,

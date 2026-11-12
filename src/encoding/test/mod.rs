@@ -5967,3 +5967,19 @@ fn plain_dictionary_views_validate_entries_like_the_column_decode() {
         assert!(column_of(&body).is_err(), "{offsets:?}");
     }
 }
+
+#[test]
+fn trailing_codecs_never_produce_less_than_the_gate_minimum() {
+    for len in 0..256usize {
+        for pattern in [0u8, 0xAB] {
+            let constant = vec![pattern; len];
+            let varied: Vec<u8> = (0..len).map(|i| (i * 31 % 251) as u8).collect();
+            for input in [&constant, &varied] {
+                assert!(lz4_flex::compress_prepend_size(input).len() >= TRAILING_MIN_OUTPUT_BYTES);
+                let framed = compress_zstd_framed(input, 1);
+                assert!(framed.is_empty() || framed.len() >= TRAILING_MIN_OUTPUT_BYTES);
+            }
+        }
+    }
+    assert!(trailing_candidate(&[0u8; 6], CascadeStrategy::DecodeOptimized).is_none());
+}

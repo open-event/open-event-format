@@ -69,7 +69,7 @@ fn payload(shape: Shape, index: u64) -> VariantValue {
             );
             fields.insert(
                 "details".to_owned(),
-                VariantValue::Object(BTreeMap::from([
+                VariantValue::object(BTreeMap::from([
                     (
                         "actor".to_owned(),
                         VariantValue::String(format!("actor-{}", mix(index ^ 3) % 512)),
@@ -122,7 +122,7 @@ fn payload(shape: Shape, index: u64) -> VariantValue {
             );
         }
     }
-    VariantValue::Object(fields)
+    VariantValue::object(fields)
 }
 
 fn rows(shape: Shape) -> Vec<OeRow> {

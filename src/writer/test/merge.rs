@@ -23,8 +23,8 @@ pub(crate) fn tenant() -> TenantId {
 
 pub(crate) fn payload_of(i: u64) -> VariantValue {
     let mut fields = BTreeMap::new();
-    fields.insert("body".to_owned(), VariantValue::String(format!("message {i}")));
-    fields.insert("n".to_owned(), VariantValue::Int(i as i64));
+    fields.insert("body".to_owned().into(), VariantValue::String(format!("message {i}")));
+    fields.insert("n".to_owned().into(), VariantValue::Int(i as i64));
     VariantValue::Object(fields)
 }
 

@@ -70,7 +70,7 @@ fn row(sequence: u64, key: &str) -> OeRow {
 }
 
 fn value(key: &str) -> VariantValue {
-    VariantValue::Object(BTreeMap::from([
+    VariantValue::object(BTreeMap::from([
         ("key".to_owned(), VariantValue::String(key.to_owned())),
         ("len".to_owned(), VariantValue::Int(key.len() as i64)),
     ]))

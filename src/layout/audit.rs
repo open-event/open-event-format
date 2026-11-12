@@ -9,7 +9,6 @@ use crate::events::EventEnvelope;
 use crate::events::variant::{KeyDictionary, VariantValue, encode_object_fields_into, encode_value_into};
 use crate::file::bytes::Writer;
 use std::cell::RefCell;
-use std::collections::BTreeSet;
 
 pub fn verify_audit_files(chain_start: [u8; 32], files: &[OeFile]) -> Result<[u8; 32], AuditChainError> {
     let mut expected = chain_start;
@@ -148,20 +147,22 @@ pub(crate) fn envelope_row_digest(
         }
         DigestPayload::Object(fields) => {
             out.put_u8(2);
-            let mut keys = BTreeSet::new();
-            for (name, value) in fields {
-                keys.insert(*name);
-                value.collect_keys(&mut keys);
-            }
-            with_dictionary(out, keys, |dictionary, out| {
-                encode_object_fields_into(fields, dictionary, out)
+            with_key_buffer(|keys| {
+                for (name, value) in fields {
+                    keys.push(name);
+                    value.collect_keys_into(keys);
+                }
+                with_dictionary(out, keys, |dictionary, out| {
+                    encode_object_fields_into(fields, dictionary, out)
+                })
             })?;
         }
         DigestPayload::Value(value) => {
             out.put_u8(2);
-            let mut keys = BTreeSet::new();
-            value.collect_keys(&mut keys);
-            with_dictionary(out, keys, |dictionary, out| encode_value_into(value, dictionary, out))?;
+            with_key_buffer(|keys| {
+                value.collect_keys_into(keys);
+                with_dictionary(out, keys, |dictionary, out| encode_value_into(value, dictionary, out))
+            })?;
         }
     }
     Ok(*blake3::hash(out.bytes()).as_bytes())
@@ -169,16 +170,35 @@ pub(crate) fn envelope_row_digest(
 
 thread_local! {
     static ROW_DICTIONARY: RefCell<KeyDictionary> = RefCell::new(KeyDictionary::default());
+    static KEY_BUFFER: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Lends `body` an empty key buffer whose allocation is kept across rows.
+fn with_key_buffer<'a, T>(body: impl FnOnce(&mut Vec<&'a str>) -> T) -> T {
+    let buffer = KEY_BUFFER.try_with(|cell| cell.take()).unwrap_or_default();
+    let mut keys = relabel(buffer);
+    let result = body(&mut keys);
+    let _ = KEY_BUFFER.try_with(|cell| cell.replace(relabel(keys)));
+    result
+}
+
+/// Empties `keys` and reuses its allocation for another key lifetime; the
+/// in-place collect keeps the buffer because both element types share a layout.
+fn relabel<'to>(mut keys: Vec<&str>) -> Vec<&'to str> {
+    keys.clear();
+    keys.into_iter().filter(|_| false).map(|_| "").collect()
 }
 
 fn with_dictionary(
     out: &mut Writer,
-    keys: BTreeSet<&str>,
+    keys: &mut Vec<&str>,
     encode: impl FnOnce(&KeyDictionary, &mut Writer) -> Result<(), FormatError>,
 ) -> Result<(), FormatError> {
+    keys.sort_unstable();
+    keys.dedup();
     ROW_DICTIONARY.with_borrow_mut(|dictionary| {
         if !keys.iter().copied().eq(dictionary.keys()) {
-            *dictionary = KeyDictionary::from_sorted_unique(keys.into_iter().map(str::to_owned).collect())?;
+            *dictionary = KeyDictionary::from_sorted_unique(keys.iter().map(|key| (*key).to_owned()).collect())?;
         }
         encode_variant_dictionary_into(dictionary, out);
         encode(dictionary, out)

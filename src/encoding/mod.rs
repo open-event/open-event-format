@@ -2123,8 +2123,12 @@ fn prepare_dictionary<'a>(present: &[&'a str]) -> PreparedDictionary<'a> {
 }
 
 fn prepare_dictionary_within<'a>(present: &[&'a str], max_distinct: usize) -> Option<PreparedDictionary<'a>> {
-    let mut first_seen: AHashMap<&str, u32> = AHashMap::new();
-    let mut sorted: Vec<(&'a str, u32)> = Vec::new();
+    // Sized for the most entries the trial can hold, so growth never rehashes:
+    // a high-cardinality column fills the map up to `max_distinct` before
+    // the trial gives up.
+    let capacity = present.len().min(max_distinct.saturating_add(1));
+    let mut first_seen: AHashMap<&str, u32> = AHashMap::with_capacity(capacity);
+    let mut sorted: Vec<(&'a str, u32)> = Vec::with_capacity(capacity);
     let mut codes = Vec::with_capacity(present.len());
     for &value in present {
         let next = sorted.len() as u32;
@@ -3713,8 +3717,26 @@ fn trailing_threshold(strategy: CascadeStrategy, len: usize) -> Option<usize> {
     }
 }
 
+/// The smallest output either trailing codec can produce for any input: the
+/// LZ4 block is a 4-byte length prefix plus at least one token byte, and the
+/// framed zstd body is a 4-byte length prefix plus a frame of at least a
+/// 4-byte magic, a 1-byte frame header and a 3-byte block header.
+const TRAILING_MIN_OUTPUT_BYTES: usize = 5;
+
+/// Whether a trailing codec could produce output that passes `fits`. The
+/// gate is exact rather than estimated: it only skips the trial when even
+/// the smallest possible output fails the bar, so the written bytes never
+/// depend on it. A sample-based gate (issue #23) would skip larger blocks
+/// but can reject a block whose full pass meets the bar, changing the file.
+fn trailing_can_fit(fits: impl Fn(usize) -> bool) -> bool {
+    fits(TRAILING_MIN_OUTPUT_BYTES)
+}
+
 fn trailing_candidate(bytes: &[u8], strategy: CascadeStrategy) -> Option<(Compression, Vec<u8>)> {
     let threshold = trailing_threshold(strategy, bytes.len())?;
+    if !trailing_can_fit(|len| len < threshold) {
+        return None;
+    }
     if bytes.len() <= TRAILING_FULL_TRIAL_MAX_BYTES {
         let lz4 = lz4_flex::compress_prepend_size(bytes);
         let zstd_framed = compress_zstd_framed(bytes, 1);
@@ -3748,6 +3770,9 @@ fn captured_trailing_candidate(
     strategy: CascadeStrategy,
 ) -> Option<(Compression, Vec<u8>)> {
     let threshold = trailing_threshold(strategy, body.len())?;
+    if !trailing_can_fit(|len| len < threshold) {
+        return None;
+    }
     match captured {
         Compression::Lz4 => {
             let lz4 = lz4_flex::compress_prepend_size(body);
@@ -4388,16 +4413,14 @@ fn encode_selected_form<'a>(
             Transform::FsstString | Transform::FsstPackedString | Transform::DeltaBitpack | Transform::ForBitpack
         )
     {
+        let halves = |len: usize| len * FSST_TRAILING_MAX_RATIO_DEN <= body.len() * FSST_TRAILING_MAX_RATIO_NUM;
         let candidate = match replay_trailing {
+            _ if !trailing_can_fit(halves) => None,
             Some(captured) => captured_trailing_candidate(&body, captured, strategy),
             None => trailing_candidate(&body, strategy),
         };
         match candidate {
-            Some((compression, bytes))
-                if bytes.len() * FSST_TRAILING_MAX_RATIO_DEN <= body.len() * FSST_TRAILING_MAX_RATIO_NUM =>
-            {
-                (compression, bytes)
-            }
+            Some((compression, bytes)) if halves(bytes.len()) => (compression, bytes),
             _ => (Compression::None, body),
         }
     } else if let Some(captured) = replay_trailing {

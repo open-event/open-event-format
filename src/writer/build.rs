@@ -29,7 +29,7 @@ use crate::indexes::ndv::NdvSketch;
 use crate::indexes::probabilistic::SplitBlockBloomFilter;
 use crate::indexes::text_token::TextTokenIndex;
 use crate::invariants::EncodeExecutor;
-use crate::invariants::sim::SerialEncodeExecutor;
+use crate::invariants::io::ThreadPoolEncodeExecutor;
 use crate::layout::footer::{
     ClusteringEntry, ColumnDescriptor, ColumnKind, ColumnMark, EntityHashFilterEntry, ExactCounts, FileDictionaries,
     Footer, FreetextEntry, FreetextRowOffsets, GranuleEntry, GraphBlockEntry, GraphDirectory, InboxRecipientEntry,
@@ -753,7 +753,7 @@ fn collect_key_names<'a>(value: &'a VariantValue, out: &mut Vec<&'a str>) {
         }
         VariantValue::Object(fields) => {
             for (key, field_value) in fields {
-                out.push(key.as_str());
+                out.push(key);
                 collect_key_names(field_value, out);
             }
         }
@@ -1169,7 +1169,16 @@ impl NormalizedBatch {
         for row in rows {
             let payload = match std::mem::replace(&mut row.payload, BuildPayload::None) {
                 BuildPayload::Encoded(encoded) => {
-                    shared.build_payload(VariantRef::new(&encoded.bytes).decode(&encoded.dictionary)?)
+                    let value = VariantRef::new(&encoded.bytes);
+                    match value.decode_object_fields(&encoded.dictionary)? {
+                        Some(fields) => BuildPayload::Object(
+                            fields
+                                .into_iter()
+                                .map(|(name, value)| (shared.share(name), value))
+                                .collect(),
+                        ),
+                        None => BuildPayload::Whole(value.decode(&encoded.dictionary)?),
+                    }
                 }
                 payload => payload,
             };
@@ -2208,8 +2217,12 @@ fn plan_update_reuse<'a>(
     )
 }
 
+/// Builds a file on the global rayon pool: granules, blocks, footer metadata
+/// and stripe layout run as parallel jobs, and the bytes match
+/// [`build_oe_file_with_executor`] with [`crate::invariants::sim::SerialEncodeExecutor`]. On a
+/// one-thread pool the jobs run inline.
 pub fn build_oe_file<R: BuildInput>(rows: Vec<R>, config: &OeBuildConfig) -> Result<BuiltOe, FormatError> {
-    build_oe_file_with_executor(rows, config, &SerialEncodeExecutor)
+    build_oe_file_with_executor(rows, config, &ThreadPoolEncodeExecutor)
 }
 
 pub fn build_oe_file_with_executor<R: BuildInput>(

@@ -6,7 +6,7 @@ use crate::events::relationships::{
 };
 use crate::events::variant::{
     EncodeScratch, KeyDictionary, VariantRef, VariantValue, encode_value_into_with_scratch,
-    transcode_value_into_with_scratch,
+    transcode_value_into_with_previous_remap, transcode_value_into_with_scratch,
 };
 use crate::events::{EventEnvelope, EventFlags, EventId, StreamId, TimestampValue};
 use crate::file::bytes::{Reader, Writer, slice};
@@ -357,6 +357,12 @@ fn decode_string_table(bytes: &[u8]) -> Result<Vec<&str>, FormatError> {
     Ok(strings)
 }
 
+/// Events from one producer usually share a dictionary, often the same
+/// allocation; compare pointers first and keys only when they differ.
+fn same_dictionary(a: &KeyDictionary, b: &KeyDictionary) -> bool {
+    std::ptr::eq(a, b) || a == b
+}
+
 pub fn build_batch(
     events: &[EventInput],
     schema_generation: u64,
@@ -370,9 +376,15 @@ pub fn build_batch(
 
     let mut strings = StringTableBuilder::default();
     let mut keys = BTreeSet::new();
+    let mut previous: Option<&KeyDictionary> = None;
     for event in events {
         match &event.payload {
-            PayloadInput::Encoded(payload) => keys.extend(payload.dictionary.keys()),
+            PayloadInput::Encoded(payload) => {
+                if !previous.is_some_and(|previous| same_dictionary(previous, &payload.dictionary)) {
+                    keys.extend(payload.dictionary.keys());
+                    previous = Some(&payload.dictionary);
+                }
+            }
             PayloadInput::Variant(value) => value.collect_keys(&mut keys),
             PayloadInput::ExternalRef(_) | PayloadInput::None => {}
         }
@@ -382,17 +394,27 @@ pub fn build_batch(
     let mut arena = Writer::new();
     let mut payload_slots: Vec<(u32, u32, u32)> = Vec::with_capacity(events.len());
     let mut scratch = EncodeScratch::new();
+    let mut remapped_from: Option<&KeyDictionary> = None;
     for event in events {
         match &event.payload {
             PayloadInput::Encoded(payload) => {
                 let offset = arena.len() as u32;
-                transcode_value_into_with_scratch(
-                    VariantRef::new(&payload.bytes),
-                    &payload.dictionary,
-                    &dictionary,
-                    &mut scratch,
-                    &mut arena,
-                )?;
+                if remapped_from.is_some_and(|previous| same_dictionary(previous, &payload.dictionary)) {
+                    transcode_value_into_with_previous_remap(
+                        VariantRef::new(&payload.bytes),
+                        &mut scratch,
+                        &mut arena,
+                    )?;
+                } else {
+                    transcode_value_into_with_scratch(
+                        VariantRef::new(&payload.bytes),
+                        &payload.dictionary,
+                        &dictionary,
+                        &mut scratch,
+                        &mut arena,
+                    )?;
+                    remapped_from = Some(&payload.dictionary);
+                }
                 payload_slots.push((0, offset, arena.len() as u32 - offset));
             }
             PayloadInput::None => payload_slots.push((0, 0, 0)),

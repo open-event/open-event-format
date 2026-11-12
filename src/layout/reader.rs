@@ -3398,12 +3398,12 @@ impl OeFile {
         if let VariantValue::Object(fields) = &mut value {
             for entry in &self.footer.shredded {
                 if let Some(shredded) = self.shredded_value_for_row(entry.column_id, granule, row_in_granule)? {
-                    fields.insert(entry.path.clone(), shredded);
+                    fields.insert(entry.path.as_str().into(), shredded);
                 }
             }
             for entry in &self.footer.freetext {
                 if let Some(text) = self.freetext_value_for_row(entry.column_id, granule, row_in_granule)? {
-                    fields.insert(entry.declared_field.clone(), text);
+                    fields.insert(entry.declared_field.as_str().into(), text);
                 }
             }
         }
@@ -3447,12 +3447,12 @@ impl OeFile {
         if let VariantValue::Object(fields) = &mut value {
             for entry in &self.footer.shredded {
                 if let Some(shredded) = self.field_value_in_group(group, entry.column_id, row_in_granule)? {
-                    fields.insert(entry.path.clone(), shredded);
+                    fields.insert(entry.path.as_str().into(), shredded);
                 }
             }
             for entry in &self.footer.freetext {
                 if let Some(text) = self.freetext_value_in_group(group, entry.column_id, row_in_granule)? {
-                    fields.insert(entry.declared_field.clone(), text);
+                    fields.insert(entry.declared_field.as_str().into(), text);
                 }
             }
         }
