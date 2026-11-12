@@ -1085,7 +1085,7 @@ fn a_retry_after_a_failed_sync_is_not_appended_a_second_time() {
         .iter()
         .map(|frame| {
             let (header, payload) = decode_frame(&frame.frame_bytes).unwrap();
-            decode_batch(payload, header.event_count)
+            crate::artifacts::batch::decode_batch(payload, header.event_count)
                 .unwrap()
                 .events
                 .iter()

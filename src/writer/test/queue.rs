@@ -323,3 +323,39 @@ fn a_steal_refuses_a_record_too_short_to_carry_its_tenant_and_epoch() {
     queue.push_encoded(&[0; 8]).unwrap();
     assert!(peek_steal_raw(&queue, TenantId::new_test_id(9), 1, true).is_none());
 }
+
+#[test]
+fn admitting_encoded_records_refuses_a_malformed_payload() {
+    let dictionary = KeyDictionary::build(["k".to_owned()]);
+    let mut bad = record(1, 1);
+    bad.event.payload = PayloadInput::Encoded(EncodedPayload {
+        bytes: vec![0xFF; 6],
+        dictionary: dictionary.clone(),
+    });
+    assert!(
+        encode_pending(&bad).is_err(),
+        "a caller's payload is validated when encoded"
+    );
+
+    let value = crate::events::variant::encode_value(&VariantValue::String("abcdef".to_owned()), &dictionary).unwrap();
+    let mut good = record(1, 1);
+    good.event.payload = PayloadInput::Encoded(EncodedPayload {
+        bytes: value.clone(),
+        dictionary,
+    });
+    let good = encode_pending(&good).unwrap();
+    let at = good
+        .windows(value.len())
+        .position(|window| window == value.as_slice())
+        .unwrap();
+    let mut damaged = good.clone();
+    damaged[at..at + value.len()].fill(0xFF);
+    assert!(decode_pending(&damaged).is_err());
+
+    let destination = CommitQueue::new(1 << 16);
+    assert!(destination.admit_encoded(&[good.as_slice()]).unwrap().is_some());
+    assert!(matches!(
+        destination.admit_encoded(&[good.as_slice(), damaged.as_slice()]),
+        Err(QueueError::Codec)
+    ));
+}

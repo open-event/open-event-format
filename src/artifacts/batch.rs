@@ -730,6 +730,58 @@ fn resolve_optional<'a>(strings: &[&'a str], reference: u32) -> Result<Option<&'
     resolve_required(strings, reference).map(Some)
 }
 
+pub(crate) struct BuiltBatchSections<'a> {
+    pub dictionary_bytes: &'a [u8],
+    pub payload_arena: &'a [u8],
+    pub payload_slots: Vec<(u32, u32, u32)>,
+}
+
+/// The variant dictionary, payload arena and per-row payload slots of a batch this process built with
+/// [`build_batch`], read from its header and variable table without decoding the rest of the batch.
+pub(crate) fn built_batch_sections(
+    payload: &[u8],
+    expected_event_count: u32,
+) -> Result<BuiltBatchSections<'_>, FormatError> {
+    let header = decode_batch_header(payload)?;
+    if header.event_count != expected_event_count {
+        return Err(FormatError::Structural {
+            rule: "batch event_count must equal frame event_count",
+        });
+    }
+    let section = |offset: u32, len: u32, what| slice(payload, offset as usize, len as usize, what);
+    let dictionary_bytes = section(
+        header.variant_dictionary_offset,
+        header.variant_dictionary_len,
+        "variant dictionary",
+    )?;
+    let payload_arena = section(header.payload_arena_offset, header.payload_arena_len, "payload arena")?;
+    let variable = section(
+        header.variable_table_offset,
+        header.variable_table_len,
+        "variable table",
+    )?;
+    let payload_slots = (0..header.event_count as usize)
+        .map(|row| {
+            let mut reader = Reader::new(slice(
+                variable,
+                row * VARIABLE_RECORD_LEN as usize,
+                12,
+                "variable record",
+            )?);
+            Ok((
+                reader.u32("payload flags")?,
+                reader.u32("payload offset")?,
+                reader.u32("payload length")?,
+            ))
+        })
+        .collect::<Result<Vec<_>, FormatError>>()?;
+    Ok(BuiltBatchSections {
+        dictionary_bytes,
+        payload_arena,
+        payload_slots,
+    })
+}
+
 pub fn decode_batch(payload: &[u8], expected_event_count: u32) -> Result<DecodedBatch<'_>, FormatError> {
     let header = decode_batch_header(payload)?;
     if header.event_count != expected_event_count {

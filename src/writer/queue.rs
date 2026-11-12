@@ -581,7 +581,9 @@ impl CommitQueue {
             return Ok(None);
         };
         self.admit_placed(records.len(), total_len, |index, out| {
-            out.put_slice(records.get(index).ok_or(QueueError::Codec)?);
+            let record = records.get(index).ok_or(QueueError::Codec)?;
+            decode_pending(record).map_err(|_| QueueError::Codec)?;
+            out.put_slice(record);
             Ok(())
         })
     }
