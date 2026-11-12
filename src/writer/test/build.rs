@@ -2065,11 +2065,11 @@ fn profiled_build_preserves_bytes_and_reports_each_phase_once() {
 fn corrupted_file_refuses() {
     let rows: Vec<OeRow> = (0..8).map(row).collect();
     let built = build_oe_file(rows.clone(), &config()).unwrap();
-    let mut corrupted = built.bytes.clone();
+    let mut corrupted = built.bytes.to_vec();
     let stripe_offset = built.footer.stripes[0].file_offset as usize;
     corrupted[stripe_offset] ^= 0xFF;
     assert!(OeFile::open(corrupted, None).is_err());
-    let mut tampered = built.bytes.clone();
+    let mut tampered = built.bytes.to_vec();
     let last = tampered.len() - 20;
     tampered[last] ^= 0x01;
     assert!(OeFile::open(tampered, Some(&built.file_seal)).is_err());
@@ -3455,7 +3455,7 @@ fn a_streamed_build_is_byte_identical_to_the_materialized_one() {
         expected_start = offset + len as u64;
     }
     assert_eq!(expected_start, streamed.total_len);
-    assert_eq!(streamed_bytes, materialized.bytes);
+    assert_eq!(streamed_bytes, *materialized.bytes);
     assert_eq!(streamed.file_id, materialized.file_id);
     assert_eq!(streamed.file_seal, materialized.file_seal);
     assert_eq!(streamed.file_crc64_nvme, materialized.file_crc64_nvme);
