@@ -6,13 +6,12 @@ use crate::artifacts::overlay::LiveOverlaySegment;
 use crate::columns::column_ids;
 use crate::encoding::{ColumnData, StringColumn};
 use crate::error::FormatError;
-use crate::events::variant::VariantRef;
+use crate::events::variant::{KeyDictionary, VariantRef};
 use crate::events::{
     EventEnvelope, EventFlags, EventId, SequencePoint, StreamId, TimestampValue, derived_entity_id_hash,
 };
 use crate::file::bytes::slice;
 use arrow_array::*;
-use hashbrown::HashMap;
 use uuid::Uuid;
 
 impl OeFile {
@@ -38,21 +37,17 @@ impl OeFile {
         from: SequencePoint,
         to: SequencePoint,
     ) -> Vec<&GranuleEntry> {
-        let bounds: HashMap<(u32, u32), (i128, i128)> = self
-            .footer()
-            .page_stats
-            .iter()
-            .filter(|stats| {
-                stats.column_id == column_ids::ENTITY_ID_HASH_LOW || stats.column_id == column_ids::ENTITY_ID_HASH_HIGH
-            })
-            .filter_map(|stats| Some(((stats.column_id, stats.granule_id), (stats.min_i128?, stats.max_i128?))))
-            .collect();
-        let admits = |column_id: u32, granule_id: u32, value: u64| match bounds.get(&(column_id, granule_id)) {
-            Some(&(min, max)) => {
-                let value = i128::from(value);
-                (min <= value && value <= max, min == value && max == value)
+        let admits = |column_id: u32, granule_id: u32, value: u64| {
+            let bounds = self
+                .block_page_stats(column_id, granule_id)
+                .and_then(|stats| stats.min_i128.zip(stats.max_i128));
+            match bounds {
+                Some((min, max)) => {
+                    let value = i128::from(value);
+                    (min <= value && value <= max, min == value && max == value)
+                }
+                None => (true, false),
             }
-            None => (true, false),
         };
         let mut candidates: Vec<(&GranuleEntry, bool, SequencePoint)> = self
             .granules_for_entity_hash(entity_id_hash_low)
@@ -102,6 +97,14 @@ impl OeFile {
 
 impl LiveOverlaySegment {
     pub fn event(&self, row: usize) -> Result<(EventEnvelope, PayloadRead), FormatError> {
+        self.event_with_dictionary(row, &mut None)
+    }
+
+    pub(crate) fn event_with_dictionary(
+        &self,
+        row: usize,
+        dictionary: &mut Option<KeyDictionary>,
+    ) -> Result<(EventEnvelope, PayloadRead), FormatError> {
         if row >= self.batch.num_rows() {
             return Err(FormatError::RefOutOfRange { what: "overlay row" });
         }
@@ -165,8 +168,11 @@ impl LiveOverlaySegment {
                     what: "overlay external payload reference",
                 })?)
             } else {
-                let dictionary = decode_variant_dictionary(&self.meta.variant_dictionary)?;
-                PayloadRead::Value(VariantRef::new(bytes).decode(&dictionary)?)
+                let dictionary = match dictionary {
+                    Some(dictionary) => dictionary,
+                    None => dictionary.insert(decode_variant_dictionary(&self.meta.variant_dictionary)?),
+                };
+                PayloadRead::Value(VariantRef::new(bytes).decode(dictionary)?)
             }
         };
         Ok((envelope, payload))
@@ -237,16 +243,37 @@ fn read_strings(file: &OeFile, column_id: u32, granule_id: u32) -> Result<(Vec<u
     Ok((presence, values))
 }
 
-fn string_at((presence, values): &(Vec<u8>, StringColumn), rows: usize, row: usize) -> Option<String> {
-    let present = |row: usize| presence.get(row / 8).is_some_and(|byte| byte & (1 << (row % 8)) != 0);
-    let index = if values.len() == rows {
-        row
-    } else if present(row) {
-        (0..row).filter(|&row| present(row)).count()
-    } else {
-        return None;
-    };
-    values.get(index).flatten().map(str::to_owned)
+struct IdColumn {
+    dense_index: Option<Vec<Option<u32>>>,
+    values: StringColumn,
+}
+
+impl IdColumn {
+    fn new((presence, values): (Vec<u8>, StringColumn), rows: usize) -> Self {
+        let dense_index = (values.len() != rows).then(|| {
+            let mut next = 0u32;
+            (0..rows)
+                .map(|row| {
+                    presence
+                        .get(row / 8)
+                        .is_some_and(|byte| byte & (1 << (row % 8)) != 0)
+                        .then(|| {
+                            next += 1;
+                            next - 1
+                        })
+                })
+                .collect()
+        });
+        Self { dense_index, values }
+    }
+
+    fn at(&self, row: usize) -> Option<String> {
+        let index = match &self.dense_index {
+            Some(dense_index) => dense_index.get(row).copied().flatten()? as usize,
+            None => row,
+        };
+        self.values.get(index).flatten().map(str::to_owned)
+    }
 }
 
 pub(crate) fn entity_hash_columns_elided(file: &OeFile) -> bool {
@@ -301,14 +328,14 @@ fn dictionary_entry<'a>(values: &'a [String], ids: &[u64], row: usize) -> Result
         })
 }
 
-struct EnvelopeColumns {
-    account_id: (Vec<u8>, StringColumn),
+pub(crate) struct EnvelopeColumns {
+    account_id: IdColumn,
     account_id_hash_low: Vec<u64>,
-    actor_id: (Vec<u8>, StringColumn),
+    actor_id: IdColumn,
     actor_id_hash_low: Vec<u64>,
     dedupe_hash_high: Vec<u64>,
     dedupe_hash_low: Vec<u64>,
-    entity_id: (Vec<u8>, StringColumn),
+    entity_id: IdColumn,
     entity_id_hash_high: Vec<u64>,
     entity_id_hash_low: Vec<u64>,
     entity_type_id: Vec<u64>,
@@ -326,12 +353,9 @@ struct EnvelopeColumns {
 }
 
 impl EnvelopeColumns {
-    fn read(file: &OeFile, granule_id: u32) -> Result<Self, FormatError> {
+    pub(crate) fn read(file: &OeFile, granule_id: u32) -> Result<Self, FormatError> {
         let rows = file
-            .footer()
-            .granules
-            .iter()
-            .find(|granule| granule.granule_id == granule_id)
+            .granule_entry(granule_id)
             .ok_or(FormatError::RefOutOfRange { what: "granule id" })?
             .row_count as usize;
         let u64s = |column_id| read_u64s(file, column_id, granule_id, rows);
@@ -354,8 +378,9 @@ impl EnvelopeColumns {
                 u64s(column_ids::ENTITY_ID_HASH_HIGH)?,
             )
         };
-        let actor_id = read_strings(file, column_ids::ACTOR_ID, granule_id)?;
-        let account_id = read_strings(file, column_ids::ACCOUNT_ID, granule_id)?;
+        let entity_id = IdColumn::new(entity_id, rows);
+        let actor_id = IdColumn::new(read_strings(file, column_ids::ACTOR_ID, granule_id)?, rows);
+        let account_id = IdColumn::new(read_strings(file, column_ids::ACCOUNT_ID, granule_id)?, rows);
         let actor_id_hash_low = u64s(column_ids::ACTOR_ID_HASH_LOW)?;
         let account_id_hash_low = u64s(column_ids::ACCOUNT_ID_HASH_LOW)?;
         let trace_id_hash_low = u64s(column_ids::TRACE_ID_HASH_LOW)?;
@@ -392,20 +417,20 @@ impl EnvelopeColumns {
         })
     }
 
-    fn envelope(&self, file: &OeFile, row: usize) -> Result<EventEnvelope, FormatError> {
+    pub(crate) fn envelope(&self, file: &OeFile, row: usize) -> Result<EventEnvelope, FormatError> {
         if row >= self.rows {
             return Err(FormatError::RefOutOfRange { what: "row ordinal" });
         }
         let at = |values: &[u64]| values.get(row).copied().unwrap_or_default();
         let dictionary = &file.footer().dictionaries;
         Ok(EventEnvelope {
-            account_id: string_at(&self.account_id, self.rows, row),
+            account_id: self.account_id.at(row),
             account_id_hash_low: at(&self.account_id_hash_low),
-            actor_id: string_at(&self.actor_id, self.rows, row),
+            actor_id: self.actor_id.at(row),
             actor_id_hash_low: at(&self.actor_id_hash_low),
             dedupe_hash_high: at(&self.dedupe_hash_high),
             dedupe_hash_low: at(&self.dedupe_hash_low),
-            entity_id: string_at(&self.entity_id, self.rows, row),
+            entity_id: self.entity_id.at(row),
             entity_id_hash_high: at(&self.entity_id_hash_high),
             entity_id_hash_low: at(&self.entity_id_hash_low),
             entity_type: dictionary_entry(&dictionary.entity_type, &self.entity_type_id, row)?.to_owned(),

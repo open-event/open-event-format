@@ -105,6 +105,16 @@ pub fn journal_logical_end(file: &File, physical: u64) -> std::io::Result<u64> {
     Ok(offset)
 }
 
+fn zero_tail_untouched(file: &File, logical_end: u64, physical: u64) -> std::io::Result<bool> {
+    if logical_end >= physical {
+        return Ok(true);
+    }
+    let len = (physical - logical_end).min(u64::from(FRAME_ALIGN));
+    let mut block = vec![0; usize::try_from(len).unwrap_or(0)];
+    read_exact_at(file, &mut block, logical_end)?;
+    Ok(block.iter().all(|byte| *byte == 0))
+}
+
 #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
 #[allow(unsafe_code)]
 fn preallocate(file: &File, len: u64) -> std::io::Result<bool> {
@@ -175,11 +185,16 @@ impl FileJournalStorage {
             let mut entry = readers.entries.remove(index);
             let physical = entry.file.metadata().map_err(io_error("journal stat"))?.len();
             let extent = match entry.extent {
-                Some(extent) if physical == entry.physical => extent,
+                Some(extent)
+                    if physical == entry.physical
+                        && zero_tail_untouched(&entry.file, extent, physical).map_err(io_error("journal scan"))? =>
+                {
+                    extent
+                }
                 _ => journal_logical_end(&entry.file, physical).map_err(io_error("journal scan"))?,
             };
             entry.physical = physical;
-            entry.extent = (extent == physical).then_some(extent);
+            entry.extent = Some(extent);
             let file = Arc::clone(&entry.file);
             readers.entries.push(entry);
             (file, extent)
@@ -201,7 +216,7 @@ impl FileJournalStorage {
                 file: Arc::clone(&file),
                 physical,
                 shard,
-                extent: (extent == physical).then_some(extent),
+                extent: Some(extent),
             });
             (file, extent)
         };

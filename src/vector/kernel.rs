@@ -1,6 +1,7 @@
 use super::model::{ScoredRow, VectorColumnMeta, VectorElement, VectorMetric};
-use super::quantize::{binarize, decode_row, trailer_pair};
+use super::quantize::{binarize, trailer_pair};
 use crate::indexes::bitmap::RoaringRangeBitmap;
+use half::f16;
 use multiversion::multiversion;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -40,23 +41,32 @@ impl PreparedQuery {
                 .zip(&self.values)
                 .map(|(bytes, value)| f32::from_le_bytes(bytes.try_into().unwrap_or([0; 4])) * value)
                 .sum(),
-            _ => {
-                let decoded = decode_row(element, dimension as u32, row);
-                match self.metric {
-                    VectorMetric::L2 => -decoded
-                        .iter()
-                        .zip(&self.values)
-                        .map(|(stored, value)| (stored - value) * (stored - value))
-                        .sum::<f32>(),
-                    VectorMetric::Cosine | VectorMetric::Dot => decoded
-                        .iter()
-                        .zip(&self.values)
-                        .map(|(stored, value)| stored * value)
-                        .sum(),
-                }
+            VectorElement::F32 => self.combine(row.chunks_exact(4).map(|bytes| f32::from_le_bytes(array(bytes)))),
+            VectorElement::F16 => self.combine(
+                row.chunks_exact(2)
+                    .map(|bytes| f16::from_le_bytes(array(bytes)).to_f32()),
+            ),
+            VectorElement::I8 => {
+                let (values, trailer) = row.split_at(dimension.min(row.len()));
+                let (scale, offset) = trailer_pair(trailer);
+                self.combine(values.iter().map(|q| f32::from(*q as i8) * scale + offset))
             }
         }
     }
+
+    fn combine(&self, stored: impl Iterator<Item = f32>) -> f32 {
+        let pairs = stored.zip(&self.values);
+        match self.metric {
+            VectorMetric::L2 => -pairs
+                .map(|(stored, value)| (stored - value) * (stored - value))
+                .sum::<f32>(),
+            VectorMetric::Cosine | VectorMetric::Dot => pairs.map(|(stored, value)| stored * value).sum(),
+        }
+    }
+}
+
+fn array<const N: usize>(bytes: &[u8]) -> [u8; N] {
+    bytes.try_into().unwrap_or([0; N])
 }
 
 pub fn top_k(
@@ -87,9 +97,15 @@ pub fn top_k(
     match filter {
         None => score_range(0, block_rows),
         Some(filter) => {
-            for range in filter.ranges() {
+            let ranges = filter.ranges();
+            let last_row = first_row + block_rows;
+            let overlapping = ranges
+                .iter()
+                .skip(ranges.partition_point(|range| range.end <= first_row))
+                .take_while(|range| range.start < last_row);
+            for range in overlapping {
                 let start = range.start.max(first_row);
-                let end = range.end.min(first_row + block_rows);
+                let end = range.end.min(last_row);
                 if start < end {
                     score_range(start - first_row, end - first_row);
                 }

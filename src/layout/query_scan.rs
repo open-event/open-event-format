@@ -220,14 +220,9 @@ impl OeFile {
         }
         let mut entries = Vec::with_capacity(granule_ids.len());
         for &granule_id in granule_ids {
-            let entry = self
-                .footer
-                .granules
-                .iter()
-                .find(|granule| granule.granule_id == granule_id)
-                .ok_or(FormatError::RefOutOfRange {
-                    what: "scanned granule missing from the granule directory",
-                })?;
+            let entry = self.granule_entry(granule_id).ok_or(FormatError::RefOutOfRange {
+                what: "scanned granule missing from the granule directory",
+            })?;
             entries.push(*entry);
         }
         match request.order {
@@ -254,6 +249,7 @@ impl OeFile {
         let mut stats = SelectiveScanStats::default();
         let mut held: Vec<Option<SelectedBatch>> = Vec::new();
         let mut best: Vec<(i64, u64, usize, u32)> = Vec::new();
+        let mut live: Vec<usize> = Vec::new();
         let chunk_len = if bound.is_some() { 1 } else { PARALLEL_CHUNK };
         let stored_limit_hit = |returned: usize| request.limit.is_some_and(|limit| !timed && returned >= limit);
         let mut cursor = 0;
@@ -333,33 +329,57 @@ impl OeFile {
                         ScanColumn::Materialized(ColumnRead {
                             data: ColumnData::I64(values),
                             ..
-                        }) => Some(values.clone()),
+                        }) => Some(values.as_slice()),
                         _ => None,
                     })
                     .ok_or(FormatError::Structural {
                         rule: "occurred_at holds one i64 per row",
                     })?;
                 let index = held.len();
+                let before = best.len();
                 for &row in &keep {
                     let at = *occurred.get(row as usize).ok_or(FormatError::Structural {
                         rule: "occurred_at holds one i64 per row",
                     })?;
                     best.push((at, first + u64::from(row), index, row));
                 }
-                if let Some(limit) = request.limit {
-                    sort_best(&mut best, request.order);
-                    best.truncate(limit);
-                    if best.len() == limit
-                        && let (Some(bound), Some(&(nth, ..))) = (bound, best.last())
-                    {
-                        bound.tighten(nth);
+                let Some(limit) = request.limit else {
+                    best.truncate(before);
+                    let rows = RowSelection::from_sorted_rows(keep);
+                    if rows.is_empty() {
+                        continue;
                     }
-                }
-                held.push(Some(SelectedBatch {
+                    stats.rows_returned += rows.len();
+                    sink(SelectedBatch {
+                        batch,
+                        first_row_ordinal: first,
+                        rows,
+                    })?;
+                    continue;
+                };
+                live.push(keep.len());
+                held.push((!keep.is_empty()).then_some(SelectedBatch {
                     batch,
                     first_row_ordinal: first,
                     rows: RowSelection::Range(0..0),
                 }));
+                sort_best(&mut best, request.order);
+                for &(_, _, dropped, _) in best.get(limit..).unwrap_or_default() {
+                    if let Some(count) = live.get_mut(dropped) {
+                        *count = count.saturating_sub(1);
+                        if *count == 0
+                            && let Some(slot) = held.get_mut(dropped)
+                        {
+                            *slot = None;
+                        }
+                    }
+                }
+                best.truncate(limit);
+                if best.len() == limit
+                    && let (Some(bound), Some(&(nth, ..))) = (bound, best.last())
+                {
+                    bound.tighten(nth);
+                }
             }
         }
         if timed {
@@ -399,10 +419,7 @@ impl OeFile {
             return Ok(if rows.is_empty() { Vec::new() } else { vec![0] });
         }
         let granule_first = self
-            .footer
-            .granules
-            .iter()
-            .find(|granule| granule.granule_id == granule_id)
+            .granule_entry(granule_id)
             .map(|granule| granule.first_row_ordinal)
             .ok_or(FormatError::RefOutOfRange { what: "granule id" })?;
         let starts: Vec<u64> = pages
@@ -432,41 +449,13 @@ pub struct QueryInputs<'a> {
 
 impl OeFile {
     pub fn granule_statistics(&self, entry: &GranuleEntry) -> GranuleStatistics {
-        let mut statistics = vec![Statistic::TimeBounds {
-            column_id: column_ids::OCCURRED_AT,
-            max_time: i128::from(entry.max_occurred_at_physical),
-            min_time: i128::from(entry.min_occurred_at_physical),
-        }];
-        let mut columns: std::collections::BTreeMap<u32, FoldedPageStats> = Default::default();
-        for stats in self
-            .footer
-            .page_stats
-            .iter()
-            .filter(|s| s.granule_id == entry.granule_id)
-        {
-            let page_span = stats.min_i128.zip(stats.max_i128);
-            let folded = columns.entry(stats.column_id).or_insert((page_span, 0, 0));
-            folded.0 = match (folded.0, page_span) {
-                (Some((lo, hi)), Some((min, max))) => Some((lo.min(min), hi.max(max))),
-                _ => None,
-            };
-            folded.1 += u64::from(stats.null_count);
-            folded.2 += u64::from(stats.row_count);
-        }
-        for (column_id, (span, null_count, row_count)) in columns {
-            if row_count != u64::from(entry.row_count) {
-                continue;
-            }
-            if let Some((min, max)) = span {
-                statistics.push(Statistic::MinMaxBound { column_id, max, min });
-            }
-            statistics.push(Statistic::NullCount {
-                column_id,
-                null_count,
-                row_count,
-            });
-        }
-        GranuleStatistics { statistics }
+        fold_page_stats(
+            entry,
+            self.footer
+                .page_stats
+                .iter()
+                .filter(|stats| stats.granule_id == entry.granule_id),
+        )
     }
 
     pub fn execute_query(
@@ -486,18 +475,21 @@ impl OeFile {
                 rule: "an aggregate-shortcut plan is answered by the aggregate tier",
             });
         };
+        let mut page_stats: HashMap<u32, Vec<&PageStats>> =
+            granule_ids.iter().map(|&granule_id| (granule_id, Vec::new())).collect();
+        for stats in &self.footer.page_stats {
+            if let Some(pages) = page_stats.get_mut(&stats.granule_id) {
+                pages.push(stats);
+            }
+        }
         let mut residuals: HashMap<u32, FilterExpr> = HashMap::with_capacity(granule_ids.len());
         let mut kept = Vec::with_capacity(granule_ids.len());
         for &granule_id in granule_ids {
-            let entry =
-                self.footer
-                    .granules
-                    .iter()
-                    .find(|g| g.granule_id == granule_id)
-                    .ok_or(FormatError::RefOutOfRange {
-                        what: "scanned granule missing from the granule directory",
-                    })?;
-            if let Some(rest) = residual(filter, &self.granule_statistics(entry)) {
+            let entry = self.granule_entry(granule_id).ok_or(FormatError::RefOutOfRange {
+                what: "scanned granule missing from the granule directory",
+            })?;
+            let pages = page_stats.get(&granule_id).map(Vec::as_slice).unwrap_or_default();
+            if let Some(rest) = residual(filter, &fold_page_stats(entry, pages.iter().copied())) {
                 residuals.insert(granule_id, rest);
                 kept.push(granule_id);
             }
@@ -549,6 +541,39 @@ impl OeFile {
     ) -> Result<RoaringRangeBitmap, FormatError> {
         Ok(RoaringRangeBitmap::from_rows(self.thread_rows(space, root_target)?))
     }
+}
+
+fn fold_page_stats<'a>(entry: &GranuleEntry, pages: impl Iterator<Item = &'a PageStats>) -> GranuleStatistics {
+    let mut statistics = vec![Statistic::TimeBounds {
+        column_id: column_ids::OCCURRED_AT,
+        max_time: i128::from(entry.max_occurred_at_physical),
+        min_time: i128::from(entry.min_occurred_at_physical),
+    }];
+    let mut columns: std::collections::BTreeMap<u32, FoldedPageStats> = Default::default();
+    for stats in pages {
+        let page_span = stats.min_i128.zip(stats.max_i128);
+        let folded = columns.entry(stats.column_id).or_insert((page_span, 0, 0));
+        folded.0 = match (folded.0, page_span) {
+            (Some((lo, hi)), Some((min, max))) => Some((lo.min(min), hi.max(max))),
+            _ => None,
+        };
+        folded.1 += u64::from(stats.null_count);
+        folded.2 += u64::from(stats.row_count);
+    }
+    for (column_id, (span, null_count, row_count)) in columns {
+        if row_count != u64::from(entry.row_count) {
+            continue;
+        }
+        if let Some((min, max)) = span {
+            statistics.push(Statistic::MinMaxBound { column_id, max, min });
+        }
+        statistics.push(Statistic::NullCount {
+            column_id,
+            null_count,
+            row_count,
+        });
+    }
+    GranuleStatistics { statistics }
 }
 
 type FoldedPageStats = (Option<(i128, i128)>, u64, u64);

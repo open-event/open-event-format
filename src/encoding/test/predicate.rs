@@ -2054,3 +2054,198 @@ fn mid_cardinality_strings_win_the_dictionary_trial_and_filter_on_codes() {
     assert_eq!(transform_of(&values, true), Transform::DictionaryString);
     assert!(check(&values, &equals(&present), true));
 }
+
+fn dictionary_body(entries: &[&str], codes: &[u64]) -> Vec<u8> {
+    let mut out = Writer::new();
+    out.put_u32(codes.len() as u32);
+    out.put_u8(0);
+    out.put_u32(entries.len() as u32);
+    let mut offset = 0u32;
+    out.put_u32(offset);
+    for entry in entries {
+        offset += entry.len() as u32;
+        out.put_u32(offset);
+    }
+    for entry in entries {
+        out.put_slice(entry.as_bytes());
+    }
+    bitpack(codes, 2, &mut out);
+    out.into_bytes()
+}
+
+#[test]
+fn an_unsorted_or_repeating_dictionary_is_filtered_like_its_decoded_rows() {
+    let pipeline = PipelineId::new(Transform::DictionaryString, Compression::None, ValueKind::String);
+    let predicates = [
+        equals("a"),
+        equals("b"),
+        equals("d"),
+        StringPredicate::NotEquals("a".to_owned()),
+        StringPredicate::NotEquals("c".to_owned()),
+        StringPredicate::InSet(vec!["a".to_owned()]),
+        StringPredicate::InSet(vec!["c".to_owned(), "a".to_owned(), "zz".to_owned()]),
+        StringPredicate::Range {
+            lower: Some(bound("a", true)),
+            upper: None,
+        },
+        StringPredicate::Range {
+            lower: Some(bound("a", false)),
+            upper: Some(bound("c", false)),
+        },
+        StringPredicate::Range {
+            lower: None,
+            upper: Some(bound("b", true)),
+        },
+        contains("a"),
+    ];
+    for entries in [
+        ["b", "a", "c"],
+        ["c", "b", "a"],
+        ["a", "b", "a"],
+        ["a", "a", "a"],
+        ["a", "b", "c"],
+    ] {
+        let body = dictionary_body(&entries, &[0, 1, 2, 2, 1, 0, 1]);
+        let rows = decoded(pipeline, &body);
+        for predicate in &predicates {
+            let reference = predicate.filter_decoded(&rows);
+            assert_eq!(
+                filter_string_block(pipeline, &body, predicate).unwrap(),
+                Some(reference.clone()),
+                "{entries:?} {predicate:?}"
+            );
+            assert_eq!(
+                count_string_block_shared(pipeline, &body, predicate, None).unwrap(),
+                Some(reference.iter().filter(|matched| **matched).count()),
+                "{entries:?} {predicate:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_dictionary_count_refuses_a_code_stream_its_block_cannot_hold() {
+    let pipeline = PipelineId::new(Transform::DictionaryString, Compression::None, ValueKind::String);
+    let past_the_dictionary = dictionary_body(&["a", "b"], &[0, 1, 2]);
+    assert!(matches!(
+        count_string_block_shared(pipeline, &past_the_dictionary, &equals("a"), None),
+        Err(FormatError::RefOutOfRange { .. })
+    ));
+    let mut short = dictionary_body(&["a", "b"], &[0, 1, 1]);
+    short[..4].copy_from_slice(&4u32.to_le_bytes());
+    assert!(matches!(
+        count_string_block_shared(pipeline, &short, &equals("a"), None),
+        Err(FormatError::Structural { .. })
+    ));
+}
+
+#[test]
+fn a_forged_run_form_row_count_refuses_the_row_mask() {
+    let mut out = Writer::new();
+    out.put_u32(u32::MAX);
+    out.put_u8(2);
+    out.put_u32(1);
+    out.put_u32(0);
+    out.put_u32(1);
+    out.put_u32(1);
+    out.put_u32(0);
+    out.put_u32(1);
+    out.put_slice(b"a");
+    out.put_u32(1);
+    out.put_u8(0);
+    let pipeline = PipelineId::new(Transform::DictionaryString, Compression::None, ValueKind::String);
+    assert!(matches!(
+        filter_string_block(pipeline, &out.into_bytes(), &equals("a")),
+        Err(FormatError::Structural { .. })
+    ));
+}
+
+#[test]
+fn substring_kernels_agree_with_a_per_value_search_for_every_needle_shape() {
+    let mut values: Vec<Option<String>> = vec![
+        Some("a".to_owned()),
+        Some("AAA".to_owned()),
+        Some(String::new()),
+        Some(String::new()),
+        None,
+        Some("Alpha Beta".to_owned()),
+        Some("beta".to_owned()),
+        Some("alp".to_owned()),
+        Some("ha betalpha".to_owned()),
+        Some(String::new()),
+        Some("ALPHABETA alpha".to_owned()),
+        Some("b".to_owned()),
+        Some("eta".to_owned()),
+    ];
+    values.extend((0..400).map(|row| match row % 9 {
+        0 => None,
+        1 => Some(String::new()),
+        2 => Some(format!("row {row} Alpha")),
+        3 => Some(format!("beta row {row} alpha beta")),
+        4 => Some("al".to_owned()),
+        5 => Some("pha".to_owned()),
+        _ => Some(format!("filler value number {row} with nothing of note")),
+    }));
+    let column: StringColumn = values.clone().into();
+    let needle_sets: [(&[&str], bool); 14] = [
+        (&["alpha"], true),
+        (&["ALPHA"], true),
+        (&["aaa"], true),
+        (&["a"], true),
+        (&["alpha", "beta"], false),
+        (&["alpha", "beta"], true),
+        (&["beta", "eta"], false),
+        (&["beta", "eta", "a"], true),
+        (&["alpha", "alpha"], true),
+        (&["", "alpha"], false),
+        (&["", "a"], true),
+        (&["row", "alpha", "beta", "1"], true),
+        (&["absent", "alpha"], false),
+        (&["alphabeta", "habet", "a a"], true),
+    ];
+    for transform in [Transform::RawString, Transform::FsstString, Transform::DictionaryString] {
+        let block = encode_block_forced_for_conformance(
+            &ColumnData::Strings(column.clone()),
+            false,
+            CascadeStrategy::NoTrailing,
+            transform,
+        )
+        .unwrap();
+        assert_eq!(block.pipeline.transform().unwrap(), transform);
+        for (needles, case_insensitive) in needle_sets {
+            let predicate = contains_all(needles, case_insensitive);
+            let StringPredicate::Contains(matcher) = &predicate else {
+                panic!("a substring predicate");
+            };
+            let reference: Vec<bool> = values
+                .iter()
+                .map(|value| {
+                    value.as_deref().is_some_and(|value| {
+                        needles.iter().all(|needle| {
+                            if case_insensitive {
+                                value.to_ascii_lowercase().contains(&needle.to_ascii_lowercase())
+                            } else {
+                                value.contains(needle)
+                            }
+                        })
+                    })
+                })
+                .collect();
+            for (value, expected) in values.iter().zip(&reference) {
+                if let Some(value) = value {
+                    assert_eq!(matcher.matches(value), *expected, "{needles:?} in {value:?}");
+                }
+            }
+            assert_eq!(
+                filter_string_block(block.pipeline, &block.bytes, &predicate).unwrap(),
+                Some(reference.clone()),
+                "{transform:?} {needles:?} case-insensitive {case_insensitive}"
+            );
+            assert_eq!(
+                count_string_block_shared(block.pipeline, &block.bytes, &predicate, None).unwrap(),
+                Some(reference.iter().filter(|matched| **matched).count()),
+                "{transform:?} {needles:?} case-insensitive {case_insensitive}"
+            );
+        }
+    }
+}

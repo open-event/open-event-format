@@ -11,6 +11,7 @@ use crate::indexes::stable_hash;
 use crate::layout::footer::{ExternalIdEntry, Footer, ReferenceFilterEntry};
 use crate::layout::required_features;
 use crate::layout::source_form::external_id_sentinel;
+use rayon::prelude::*;
 
 pub(crate) type SourceFormBlock = (u32, Vec<u8>, ColumnData);
 
@@ -60,7 +61,7 @@ pub(crate) fn build(
     carried: &[&ColumnSpec],
 ) -> Result<(Vec<Vec<SourceFormBlock>>, SourceFormIndexes), FormatError> {
     let blocks = granule_row_ranges
-        .iter()
+        .par_iter()
         .map(|&(start, end)| {
             let granule = rows.get(start..end).unwrap_or_default();
             carried
@@ -68,12 +69,14 @@ pub(crate) fn build(
                 .map(|spec| column_block(granule, spec.column_id))
                 .collect::<Result<Vec<_>, _>>()
         })
+        .collect::<Vec<_>>()
+        .into_iter()
         .collect::<Result<Vec<_>, _>>()?;
     let indexes = SourceFormIndexes {
         external_ids: external_id_index(rows),
         reference_filters: reference_filters(rows, granule_row_ranges),
         elides_event_ids: carried.iter().any(|spec| spec.column_id == column_ids::EXTERNAL_ID)
-            && rows.iter().any(|row| {
+            && rows.par_iter().any(|row| {
                 row.external_id
                     .as_deref()
                     .and_then(|id| external_id_sentinel(id, row.envelope.event_id.uuid().as_u128()))
@@ -148,6 +151,7 @@ fn column_block(rows: &[BuildRow], column_id: u32) -> Result<SourceFormBlock, Fo
         return Ok((column_id, presence, ColumnData::Strings(values)));
     }
     if column_id == column_ids::CONNECTOR_DELIVERY_HASH {
+        let mut scratch = String::new();
         for (index, row) in rows.iter().enumerate() {
             let Some(lineage) = row.delivery.as_ref().filter(|_| carries(row, column_id)) else {
                 continue;
@@ -155,11 +159,10 @@ fn column_block(rows: &[BuildRow], column_id: u32) -> Result<SourceFormBlock, Fo
             if let Some(byte) = presence.get_mut(index / 8) {
                 *byte |= 1 << (index % 8);
             }
-            let hex = format!(
-                "{:016x}{:016x}",
-                lineage.connector_delivery_hash_high, lineage.connector_delivery_hash_low
-            );
-            values.push(Some(&hex));
+            scratch.clear();
+            hex_lower_into(&lineage.connector_delivery_hash_high.to_be_bytes(), &mut scratch);
+            hex_lower_into(&lineage.connector_delivery_hash_low.to_be_bytes(), &mut scratch);
+            values.push(Some(&scratch));
         }
         return Ok((column_id, presence, ColumnData::Strings(values)));
     }
@@ -184,7 +187,7 @@ fn truncate_external_ids(mut entries: Vec<ExternalIdEntry>) -> Vec<ExternalIdEnt
 
 fn external_id_index(rows: &[BuildRow]) -> Vec<ExternalIdEntry> {
     let mut entries: Vec<ExternalIdEntry> = rows
-        .iter()
+        .par_iter()
         .enumerate()
         .filter_map(|(ordinal, row)| {
             row.external_id.as_ref().map(|id| ExternalIdEntry {
@@ -193,7 +196,7 @@ fn external_id_index(rows: &[BuildRow]) -> Vec<ExternalIdEntry> {
             })
         })
         .collect();
-    entries.sort_unstable_by_key(|entry| (entry.id_hash, entry.row_ordinal));
+    entries.par_sort_unstable_by_key(|entry| (entry.id_hash, entry.row_ordinal));
     entries
 }
 

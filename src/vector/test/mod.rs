@@ -838,3 +838,292 @@ fn a_catalogued_search_reads_each_segments_deletes_from_the_manifest() {
     assert!(after.iter().all(|hit| hit.row != target));
     assert!(search_catalogued_segments(&store, &manifest, &readers, &[], &search).is_err());
 }
+
+#[test]
+fn every_block_and_the_footer_is_sealed_on_its_own_nonce() {
+    let keys = super::seal::FileKeys::random().unwrap();
+    let indexes = [
+        0,
+        1,
+        2,
+        255,
+        256,
+        1 << 32,
+        u64::MAX - 1,
+        super::constant::FOOTER_BLOCK_INDEX,
+    ];
+    let nonces: std::collections::HashSet<[u8; 12]> = indexes.iter().map(|index| keys.nonce(*index)).collect();
+    assert_eq!(nonces.len(), indexes.len());
+    assert_eq!(keys.nonce(7)[..4], keys.nonce_prefix[..4]);
+    assert_eq!(keys.nonce(7)[4..], 7u64.to_le_bytes());
+}
+
+#[test]
+fn blocks_of_identical_plaintext_seal_differently_and_cannot_stand_in_for_each_other() {
+    let dimension = 8;
+    let model = model(dimension, VectorMetric::Dot);
+    let mut rows = input(GRANULE_ROWS * 2, dimension);
+    rows.vectors = vec![vec![0.25; dimension as usize]; GRANULE_ROWS * 2];
+    let bytes = write_segment(&spec(model.clone(), vec![VectorElement::F32]), &rows, &key(1)).unwrap();
+    let reader = SegmentReader::open(bytes.clone(), &key(1)).unwrap();
+    let column = representation_column_id(VectorElement::F32);
+    assert_eq!(
+        reader.vector_row(column, 0, &model).unwrap(),
+        reader.vector_row(column, GRANULE_ROWS as u64, &model).unwrap()
+    );
+
+    let offsets = reader.footer_block_offsets();
+    let vector_blocks = offsets.last().unwrap();
+    let plain_len = GRANULE_ROWS * dimension as usize * 4;
+    let sealed_len = plain_len + 16;
+    let first = vector_blocks[0] as usize;
+    let second = vector_blocks[1] as usize;
+    let first_block = bytes[first..first + sealed_len].to_vec();
+    let second_block = bytes[second..second + sealed_len].to_vec();
+    assert_ne!(first_block[..plain_len], second_block[..plain_len]);
+    assert!(
+        first_block
+            .chunks(16)
+            .zip(second_block.chunks(16))
+            .all(|(left, right)| left != right)
+    );
+
+    let mut swapped = bytes.clone();
+    swapped[first..first + sealed_len].copy_from_slice(&second_block);
+    swapped[second..second + sealed_len].copy_from_slice(&first_block);
+    let reader = SegmentReader::open(swapped, &key(1)).unwrap();
+    for row in [0, GRANULE_ROWS as u64] {
+        assert!(matches!(
+            reader.vector_row(column, row, &model),
+            Err(VectorError::Authentication { .. })
+        ));
+    }
+
+    let other = write_segment(&spec(model.clone(), vec![VectorElement::F32]), &rows, &key(1)).unwrap();
+    let mut transplanted = bytes.clone();
+    transplanted[first..first + sealed_len].copy_from_slice(&other[first..first + sealed_len]);
+    let reader = SegmentReader::open(transplanted, &key(1)).unwrap();
+    assert!(matches!(
+        reader.vector_row(column, 0, &model),
+        Err(VectorError::Authentication { .. })
+    ));
+}
+
+#[test]
+fn a_first_version_segment_still_reads_and_is_never_written_again() {
+    let model = model(8, VectorMetric::Cosine);
+    let spec = spec(model.clone(), vec![VectorElement::U1, VectorElement::F32]);
+    let rows = input(GRANULE_ROWS + 5, 8);
+    let version = |bytes: &[u8]| u16::from_le_bytes([bytes[4], bytes[5]]);
+    let current = write_segment(&spec, &rows, &key(1)).unwrap();
+    assert_eq!(version(&current), 2);
+
+    let legacy_keys = super::seal::FileKeys::random_shared_nonce().unwrap();
+    assert_eq!(legacy_keys.nonce(0), legacy_keys.nonce(1));
+    assert_eq!(legacy_keys.nonce(0)[..], legacy_keys.nonce_prefix[..12]);
+    let legacy = super::segment::write_segment_sealed_by(&spec, &rows, &key(1), &legacy_keys).unwrap();
+    assert_eq!(version(&legacy), 1);
+    let reader = SegmentReader::open(legacy.clone(), &key(1)).unwrap();
+    reader.verify_content().unwrap();
+    let read = reader.read_all().unwrap();
+    assert_eq!(read.event_ids, rows.event_ids);
+    assert_eq!(read.string_columns, rows.string_columns);
+    assert_eq!(read.integer_columns, rows.integer_columns);
+
+    for (bytes, relabelled) in [(&legacy, 2u8), (&current, 1u8)] {
+        let mut bytes = bytes.clone();
+        bytes[4] = relabelled;
+        assert!(matches!(
+            SegmentReader::open(bytes, &key(1)),
+            Err(VectorError::Authentication { .. })
+        ));
+    }
+    let mut unknown = legacy.clone();
+    unknown[4] = 3;
+    assert!(matches!(
+        SegmentReader::open(unknown, &key(1)),
+        Err(VectorError::Format(_))
+    ));
+
+    let rewrapped = rewrap_segment(&legacy, &key(1), &key(2)).unwrap();
+    assert_eq!(version(&rewrapped), 1);
+    let rewrapped = SegmentReader::open(rewrapped, &key(2)).unwrap();
+    assert_eq!(rewrapped.read_all().unwrap().event_ids, rows.event_ids);
+    let merged = merge_segments(std::slice::from_ref(&reader), &spec, &key(1)).unwrap();
+    assert_eq!(version(&merged), 2);
+    let merged = SegmentReader::open(merged, &key(1)).unwrap();
+    assert_eq!(merged.read_all().unwrap().event_ids, rows.event_ids);
+}
+
+#[test]
+fn a_row_scores_exactly_as_its_decoded_floats_do() {
+    for dimension in [1u32, 7, 32, 100] {
+        let query = unit(4_242, dimension);
+        for metric in [VectorMetric::Cosine, VectorMetric::Dot, VectorMetric::L2] {
+            let prepared = PreparedQuery::new(&query, metric);
+            for element in [VectorElement::I8, VectorElement::F16, VectorElement::F32] {
+                if element == VectorElement::I8 && metric != VectorMetric::L2 {
+                    continue;
+                }
+                for seed in 0..20 {
+                    let mut row = Vec::new();
+                    encode_row(element, &unit(seed, dimension), &mut row);
+                    let decoded = decode_row(element, dimension, &row);
+                    let pairs = decoded.iter().zip(&query);
+                    let expected: f32 = match metric {
+                        VectorMetric::L2 => -pairs
+                            .map(|(stored, value)| (stored - value) * (stored - value))
+                            .sum::<f32>(),
+                        VectorMetric::Cosine | VectorMetric::Dot => pairs.map(|(stored, value)| stored * value).sum(),
+                    };
+                    assert_eq!(
+                        prepared.score(element, &row).to_bits(),
+                        expected.to_bits(),
+                        "{element:?} {metric:?} dimension {dimension} seed {seed}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_filter_of_many_scattered_runs_scans_exactly_its_rows_in_every_granule() {
+    use crate::indexes::bitmap::RowRange;
+    let dimension = 8;
+    let model = model(dimension, VectorMetric::Dot);
+    let rows = input(GRANULE_ROWS * 3 + 17, dimension);
+    let total = rows.event_ids.len() as u64;
+    let bytes = write_segment(&spec(model.clone(), vec![VectorElement::F32]), &rows, &key(1)).unwrap();
+    let reader = SegmentReader::open(bytes.clone(), &key(1)).unwrap();
+    let meta = reader.vector_columns()[0].clone();
+    let query = unit(77, dimension);
+    let granule = GRANULE_ROWS as u64;
+    let filters = [
+        RoaringRangeBitmap::from_rows((0..total).filter(|row| row % 2 == 0)),
+        RoaringRangeBitmap::from_ranges([
+            RowRange { start: 3, end: 9 },
+            RowRange {
+                start: granule - 2,
+                end: granule + 2,
+            },
+            RowRange {
+                start: granule * 3,
+                end: granule * 3 + 1,
+            },
+            RowRange {
+                start: total - 1,
+                end: total + 50,
+            },
+        ]),
+        RoaringRangeBitmap::from_rows([granule * 2 - 1]),
+        RoaringRangeBitmap::from_rows([granule * 2]),
+        RoaringRangeBitmap::from_rows([total + 5]),
+    ];
+    for filter in &filters {
+        let k = total as usize;
+        let found = reader.top_k(meta.column_id, &query, &model, Some(filter), k).unwrap();
+        assert_eq!(found.len(), (0..total).filter(|row| filter.contains(*row)).count());
+        assert_eq!(
+            found,
+            brute_force(&meta, &rows.vectors, &query, |row| filter.contains(row), k)
+        );
+    }
+    for (filter, opened) in [(&filters[2], 1), (&filters[3], 1), (&filters[4], 0)] {
+        let reader = SegmentReader::open(bytes.clone(), &key(1)).unwrap();
+        reader.top_k(meta.column_id, &query, &model, Some(filter), 5).unwrap();
+        assert_eq!(reader.blocks_opened(), opened);
+    }
+}
+
+#[test]
+fn search_hits_carry_their_own_event_ids_and_decrypt_each_id_granule_once() {
+    let dimension = 16;
+    let model = model(dimension, VectorMetric::Dot);
+    let mut first = input(GRANULE_ROWS * 2 + 30, dimension);
+    let mut second = input(GRANULE_ROWS + 30, dimension);
+    first.event_ids = (0..first.event_ids.len()).map(|row| format!("$a{row}")).collect();
+    second.event_ids = (0..second.event_ids.len()).map(|row| format!("$b{row}")).collect();
+    second.vectors = (0..second.event_ids.len())
+        .map(|row| unit(1_000_000 + row as u64, dimension))
+        .collect();
+    let segment_spec = spec(model.clone(), vec![VectorElement::F32]);
+    let readers = vec![
+        SegmentReader::open(write_segment(&segment_spec, &first, &key(1)).unwrap(), &key(1)).unwrap(),
+        SegmentReader::open(write_segment(&segment_spec, &second, &key(1)).unwrap(), &key(1)).unwrap(),
+    ];
+    let query = unit(31_337, dimension);
+    let search = VectorSearch {
+        filter: SearchFilter::default(),
+        k: 400,
+        model: &model,
+        oversample: DEFAULT_OVERSAMPLE,
+        query: &query,
+    };
+    let hits = search_segments(&readers, &search).unwrap();
+    let opened: u64 = readers.iter().map(|reader| reader.blocks_opened()).sum();
+    assert_eq!(hits.len(), 400);
+    assert!(hits.iter().any(|hit| hit.segment == 0) && hits.iter().any(|hit| hit.segment == 1));
+    for pair in hits.windows(2) {
+        assert!(
+            pair[0].score > pair[1].score
+                || (pair[0].score == pair[1].score && (pair[0].segment, pair[0].row) < (pair[1].segment, pair[1].row))
+        );
+    }
+    for hit in &hits {
+        let prefix = if hit.segment == 0 { "$a" } else { "$b" };
+        assert_eq!(hit.event_id, format!("{prefix}{}", hit.row));
+    }
+    assert!(opened <= 10, "{opened} blocks opened");
+}
+
+#[test]
+fn rows_for_event_ids_finds_every_holder_once_in_row_order() {
+    let model = model(8, VectorMetric::Cosine);
+    let mut rows = input(GRANULE_ROWS + 20, 8);
+    rows.event_ids[GRANULE_ROWS + 3] = rows.event_ids[5].clone();
+    let bytes = write_segment(&spec(model, vec![VectorElement::I8]), &rows, &key(1)).unwrap();
+    let reader = SegmentReader::open(bytes, &key(1)).unwrap();
+    let last = format!("$event{}", GRANULE_ROWS + 19);
+    let found = reader
+        .rows_for_event_ids(&[last.as_str(), "$event5", "$missing", "$event5", "$event0"])
+        .unwrap();
+    assert_eq!(found, vec![0, 5, GRANULE_ROWS as u64 + 3, GRANULE_ROWS as u64 + 19]);
+    assert!(reader.rows_for_event_ids(&[]).unwrap().is_empty());
+}
+
+struct RangedOnly(Vec<u8>);
+
+impl SegmentSource for RangedOnly {
+    fn byte_len(&self) -> Result<u64, VectorError> {
+        Ok(self.0.len() as u64)
+    }
+
+    fn read_range(&self, offset: u64, len: usize) -> Result<Vec<u8>, VectorError> {
+        self.0.read_range(offset, len)
+    }
+}
+
+#[test]
+fn borrowed_and_ranged_sources_read_the_same_rows() {
+    let model = model(8, VectorMetric::Cosine);
+    let rows = input(GRANULE_ROWS + 9, 8);
+    let bytes = write_segment(&spec(model.clone(), ALL.to_vec()), &rows, &key(1)).unwrap();
+    assert_eq!(bytes.borrow_range(10, 4), Some(&bytes[10..14]));
+    assert_eq!(bytes.borrow_range(bytes.len() as u64 - 1, 2), None);
+    assert_eq!(bytes.borrow_range(u64::MAX, 2), None);
+    let borrowed = SegmentReader::open(bytes.clone(), &key(1)).unwrap();
+    let ranged = SegmentReader::open(RangedOnly(bytes), &key(1)).unwrap();
+    let query = unit(3, 8);
+    for meta in borrowed.vector_columns() {
+        assert_eq!(
+            borrowed.top_k(meta.column_id, &query, &model, None, 25).unwrap(),
+            ranged.top_k(meta.column_id, &query, &model, None, 25).unwrap()
+        );
+    }
+    assert_eq!(
+        borrowed.read_all().unwrap().event_ids,
+        ranged.read_all().unwrap().event_ids
+    );
+    assert_eq!(borrowed.blocks_opened(), ranged.blocks_opened());
+}

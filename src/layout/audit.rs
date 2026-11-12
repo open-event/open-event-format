@@ -8,6 +8,7 @@ use crate::error::{AuditChainError, FormatError};
 use crate::events::EventEnvelope;
 use crate::events::variant::{KeyDictionary, VariantValue, encode_object_fields_into, encode_value_into};
 use crate::file::bytes::Writer;
+use std::cell::RefCell;
 use std::collections::BTreeSet;
 
 pub fn verify_audit_files(chain_start: [u8; 32], files: &[OeFile]) -> Result<[u8; 32], AuditChainError> {
@@ -152,24 +153,36 @@ pub(crate) fn envelope_row_digest(
                 keys.insert(*name);
                 value.collect_keys(&mut keys);
             }
-            let dictionary = put_dictionary(out, keys)?;
-            encode_object_fields_into(fields, &dictionary, out)?;
+            with_dictionary(out, keys, |dictionary, out| {
+                encode_object_fields_into(fields, dictionary, out)
+            })?;
         }
         DigestPayload::Value(value) => {
             out.put_u8(2);
             let mut keys = BTreeSet::new();
             value.collect_keys(&mut keys);
-            let dictionary = put_dictionary(out, keys)?;
-            encode_value_into(value, &dictionary, out)?;
+            with_dictionary(out, keys, |dictionary, out| encode_value_into(value, dictionary, out))?;
         }
     }
     Ok(*blake3::hash(out.bytes()).as_bytes())
 }
 
-fn put_dictionary(out: &mut Writer, keys: BTreeSet<&str>) -> Result<KeyDictionary, FormatError> {
-    let dictionary = KeyDictionary::from_sorted_unique(keys.into_iter().map(str::to_owned).collect())?;
-    encode_variant_dictionary_into(&dictionary, out);
-    Ok(dictionary)
+thread_local! {
+    static ROW_DICTIONARY: RefCell<KeyDictionary> = RefCell::new(KeyDictionary::default());
+}
+
+fn with_dictionary(
+    out: &mut Writer,
+    keys: BTreeSet<&str>,
+    encode: impl FnOnce(&KeyDictionary, &mut Writer) -> Result<(), FormatError>,
+) -> Result<(), FormatError> {
+    ROW_DICTIONARY.with_borrow_mut(|dictionary| {
+        if !keys.iter().copied().eq(dictionary.keys()) {
+            *dictionary = KeyDictionary::from_sorted_unique(keys.into_iter().map(str::to_owned).collect())?;
+        }
+        encode_variant_dictionary_into(dictionary, out);
+        encode(dictionary, out)
+    })
 }
 
 pub(crate) fn row_hash(prev_row_hash: &[u8; 32], row_digest: &[u8; 32]) -> [u8; 32] {

@@ -81,7 +81,10 @@ impl RangeSet {
             if *start > cursor {
                 holes.push((cursor, start - 1));
             }
-            cursor = end.saturating_add(1);
+            let Some(next) = end.checked_add(1) else {
+                return holes;
+            };
+            cursor = next;
             if cursor > to {
                 break;
             }

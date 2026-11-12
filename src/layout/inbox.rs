@@ -1,5 +1,5 @@
 use super::entity_scan::{DeletesAndCorrections, EntityEvent};
-use super::event::{entity_hash_columns_elided, read_entity_hashes};
+use super::event::{EnvelopeColumns, entity_hash_columns_elided, read_entity_hashes};
 use super::footer::{GranuleEntry, InboxRecipientEntry};
 use super::optional_features;
 use super::reader::scan::ScanColumn;
@@ -10,7 +10,6 @@ use crate::encoding::ColumnData;
 use crate::error::{FormatError, InboxError};
 use crate::events::{EventEnvelope, SequencePoint, TenantId};
 use crate::field_deletion_store::FieldRedactions;
-use std::vec::IntoIter;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Recipient {
@@ -129,10 +128,7 @@ fn read_rows(
         |batch, selection| {
             let rows = batch.row_count as usize;
             let first_row_ordinal = file
-                .footer()
-                .granules
-                .iter()
-                .find(|granule| granule.granule_id == batch.granule_id)
+                .granule_entry(batch.granule_id)
                 .map(|granule| granule.first_row_ordinal)
                 .ok_or(FormatError::RefOutOfRange {
                     what: "scanned granule missing from the granule directory",
@@ -199,20 +195,16 @@ fn scanned_u64s(column: ScanColumn, rows: usize) -> Result<Vec<u64>, FormatError
 fn take_envelope(
     file: &OeFile,
     granule_id: u32,
-    envelopes: &mut Option<(IntoIter<EventEnvelope>, usize)>,
+    envelopes: &mut Option<EnvelopeColumns>,
     row_in_granule: usize,
 ) -> Result<EventEnvelope, FormatError> {
-    if envelopes.is_none() {
-        *envelopes = Some((file.granule_envelopes(granule_id)?.into_iter(), 0));
-    }
-    envelopes
-        .as_mut()
-        .and_then(|(envelopes, next)| {
-            let envelope = envelopes.nth(row_in_granule - *next);
-            *next = row_in_granule + 1;
-            envelope
-        })
-        .ok_or(FormatError::RefOutOfRange { what: "row in granule" })
+    let columns = match envelopes {
+        Some(columns) => columns,
+        None => envelopes.insert(EnvelopeColumns::read(file, granule_id)?),
+    };
+    columns
+        .envelope(file, row_in_granule)
+        .map_err(|_| FormatError::RefOutOfRange { what: "row in granule" })
 }
 
 fn recipient_of(entry: &InboxRecipientEntry) -> Recipient {

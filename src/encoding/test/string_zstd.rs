@@ -239,3 +239,57 @@ fn malformed_stages_are_refused_not_panicked_on() {
         assert!(decompress_into(stored.get(..cut).unwrap_or_default(), &mut plain, &SoftwareDecompressor).is_err());
     }
 }
+
+#[test]
+fn a_zero_width_relaid_dictionary_refuses_an_amplified_code_count() {
+    let relaid_with = |count: u32| {
+        let mut relaid = Writer::new();
+        relaid.put_u32(0);
+        relaid.put_u8(0);
+        relaid.put_u32(0);
+        relaid.put_u32(count);
+        relaid.put_u8(0);
+        relaid.into_bytes()
+    };
+    let classic_len = 18;
+    let pipeline = PipelineId::new(Transform::DictionaryString, Compression::StringZstd, ValueKind::String);
+    for count in [u32::MAX, MAX_BLOCK_VALUES as u32 + 1] {
+        let relaid = relaid_with(count);
+        let stored = store_relaid(TAG_DICTIONARY, &relaid, classic_len);
+        let mut plain = Vec::new();
+        assert!(unrelay(TAG_DICTIONARY, &relaid, classic_len as usize, &mut plain).is_err());
+        assert!(parse(TAG_DICTIONARY, &relaid, classic_len as usize).is_err());
+        assert!(decompress_into(&stored, &mut plain, &SoftwareDecompressor).is_err());
+        assert!(decode_block(pipeline, &stored).is_err());
+        assert!(crate::encoding::decode_string_block_views(pipeline, &stored).is_err());
+    }
+    let empty = relaid_with(0);
+    let mut plain = Vec::new();
+    unrelay(TAG_DICTIONARY, &empty, classic_len as usize, &mut plain).unwrap();
+    assert_eq!(plain.len(), classic_len as usize);
+    assert!(parse(TAG_DICTIONARY, &empty, classic_len as usize).is_ok());
+}
+
+#[test]
+fn a_refused_relayout_is_not_built_and_a_kept_one_matches_the_stage() {
+    let data = column(&rooms(2000));
+    for transform in [Transform::RawString, Transform::DictionaryString] {
+        let (classic_bytes, side) = classic(transform, &data);
+        let stored = compress(transform, side, &classic_bytes).unwrap();
+        let mut offered = 0;
+        let refused = compress_if(transform, side, &classic_bytes, |len| {
+            offered = len;
+            false
+        });
+        assert!(matches!(refused, Relayout::Refused));
+        assert_eq!(offered, stored.len());
+        let Relayout::Kept(kept) = compress_if(transform, side, &classic_bytes, |len| len == stored.len()) else {
+            unreachable!("the relayout is kept at its own length")
+        };
+        assert_eq!(kept, stored);
+    }
+    assert!(matches!(
+        compress_if(Transform::FsstString, SideStream::None, &[], |_| true),
+        Relayout::Unavailable
+    ));
+}

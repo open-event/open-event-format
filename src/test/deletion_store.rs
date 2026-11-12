@@ -212,3 +212,26 @@ fn a_retried_external_publish_reuses_its_own_object_but_refuses_foreign_bytes() 
         StoredDeletionVector::next_generation_with_limit(&entry(), &vector(&[6]), None, Some(&objects), 0).is_err()
     );
 }
+
+#[test]
+fn a_vector_past_the_decodable_row_bound_is_refused_at_publish_and_the_prior_one_still_loads() {
+    let mut current = entry();
+    current.deletion_vector = Some(StoredDeletionVector::next_generation(&current, &vector(&[3]), None).unwrap());
+
+    let mut purge = DeletionVector::new();
+    purge.mark_range(crate::indexes::bitmap::RowRange {
+        start: 0,
+        end: 64 * 1024 * 1024 + 1,
+    });
+    assert!(StoredDeletionVector::next_generation(&current, &purge, None).is_err());
+    let kept = current.deletion_vector.as_ref().unwrap().load(FILE_ID).unwrap();
+    assert!(kept.is_deleted(3) && kept.deleted_count() == 1);
+
+    let mut loadable = DeletionVector::new();
+    loadable.mark_range(crate::indexes::bitmap::RowRange {
+        start: 0,
+        end: 64 * 1024 * 1024,
+    });
+    let stored = StoredDeletionVector::next_generation(&current, &loadable, None).unwrap();
+    assert_eq!(stored.load(FILE_ID).unwrap().deleted_count(), 64 * 1024 * 1024);
+}

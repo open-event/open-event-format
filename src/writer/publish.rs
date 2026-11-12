@@ -370,10 +370,9 @@ impl OePublisher {
             debug_assert!(entry.part_state.can_transition_to(PartState::Active));
             entry.part_state = PartState::Active;
             let mut next = ManifestGeneration {
+                footer_mirror: None,
                 generation: head_id + 1,
-                files: head.files.clone(),
-                retirements: head.retirements.clone(),
-                ..Default::default()
+                ..head.clone()
             };
             next.files.push(entry.clone());
             let next_id = next.generation;

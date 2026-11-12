@@ -1,7 +1,7 @@
 use crate::corrections::CorrectionResolver;
 use crate::deletes::{
     CorrectionMetadata, DeletionAggregateDelta, DeletionVector, DeletionVectorEncoding, DeletionVectorRef,
-    RowPositionDomain, decode_deletion_vector, encode_deletion_vector,
+    RowPositionDomain, check_decodable_row_count, decode_deletion_vector, encode_deletion_vector,
 };
 use crate::error::{EntityScanError, FormatError};
 use crate::events::{EventId, SequencePoint, SequenceRange, TenantId};
@@ -87,6 +87,7 @@ impl StoredDeletionVector {
             None => (DeletionVector::new(), 1),
         };
         merged.union_with(additions);
+        check_decodable_row_count(&merged)?;
         let (_, encoded) = encode_deletion_vector(&merged);
         let mut stored = Self {
             blake3: [0; 32],
@@ -151,7 +152,7 @@ impl StoredDeletionVector {
                 detail: format!("deletion vector object {} is missing", object.key),
             });
         };
-        let bytes = stored.bytes;
+        let mut bytes = stored.bytes;
         if bytes.len() as u64 != object.len {
             return Err(FormatError::Structural {
                 rule: "deletion vector object length disagrees with its ref",
@@ -163,7 +164,7 @@ impl StoredDeletionVector {
             });
         }
         let header = 8 + 16 + 8 + 8 + 32;
-        let (head, encoded) = bytes.split_at_checked(header).ok_or(FormatError::Truncated {
+        let head = bytes.get(..header).ok_or(FormatError::Truncated {
             what: "deletion vector object header",
         })?;
         let mut expected = Vec::with_capacity(header);
@@ -177,7 +178,7 @@ impl StoredDeletionVector {
                 rule: "deletion vector object identity disagrees with its ref",
             });
         }
-        Ok(encoded.to_vec())
+        Ok(bytes.split_off(header))
     }
 
     pub fn load_with(

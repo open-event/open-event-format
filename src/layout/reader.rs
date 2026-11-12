@@ -152,11 +152,15 @@ pub struct RawColumnBlock<'a> {
 #[derive(Debug)]
 struct CachedColumn {
     data: ColumnData,
+    dense: bool,
     rank: RankSelect,
 }
 
 impl CachedColumn {
     fn value_at(&self, row_in_granule: u64) -> Option<VariantValue> {
+        if self.dense {
+            return OeFile::typed_variant_at(&self.data, usize::try_from(row_in_granule).ok()?);
+        }
         let (before, present) = self.rank.rank_and_contains(row_in_granule);
         if !present {
             return None;
@@ -757,6 +761,16 @@ impl OeFooter {
         proof_trees: &[u8],
         authenticated: bool,
     ) -> Result<Self, FormatError> {
+        let (footer, usable_optional_features) = Self::decode_content_tail(content, blob_len, proof_trees)?;
+        Ok(Self {
+            authenticated,
+            footer,
+            proof_trees: proof_trees.to_vec(),
+            usable_optional_features,
+        })
+    }
+
+    fn decode_content_tail(content: &[u8], blob_len: usize, proof_trees: &[u8]) -> Result<(Footer, u64), FormatError> {
         let blob_start = content
             .len()
             .checked_sub(FOOTER_TAIL_TRAILER_LEN)
@@ -768,12 +782,7 @@ impl OeFooter {
         let usable_optional_features =
             compat::check_features(footer.required_feature_flags, footer.optional_feature_flags)?;
         validate_stripe_proofs(&footer, proof_trees)?;
-        Ok(Self {
-            authenticated,
-            footer,
-            proof_trees: proof_trees.to_vec(),
-            usable_optional_features,
-        })
+        Ok((footer, usable_optional_features))
     }
 
     pub fn plan_verified_stripe_read(
@@ -1080,37 +1089,41 @@ impl OeFooter {
     }
 }
 
+const BLOCK_ROWS_BEYOND_BOUND: &str = "column block row count beyond the block bound";
+
+fn block_rows_beyond_bound(row_count: u32) -> bool {
+    row_count as usize > super::MAX_ELIDED_BLOCK_ROWS
+}
+
+#[derive(Debug)]
+struct ColumnarMarksLayout {
+    granule_stripe_id: HashMap<u32, u32>,
+    pages_in_data_area: bool,
+    stripe_bases: HashMap<u32, u64>,
+    stripe_pages: HashMap<u32, Vec<MarksPageEntry>>,
+}
+
 #[derive(Debug)]
 struct ColumnarMarks {
     decoded: HashMap<(u32, u32, u32), ColumnMark>,
     decoded_page_directories: HashSet<(u32, u32, u32)>,
     decoded_pages: HashSet<(u32, u32, u32)>,
-    granule_stripe_id: HashMap<u32, u32>,
+    footer: Arc<Footer>,
+    layout: Arc<ColumnarMarksLayout>,
     page_marks: BTreeMap<(u32, u32, u32, u32), PageDirectoryEntry>,
-    pages: Vec<u8>,
-    pages_in_data_area: bool,
     shared_extents_found: HashSet<u32>,
-    stripe_bases: HashMap<u32, u64>,
-    stripe_pages: HashMap<u32, Vec<MarksPageEntry>>,
     pending_aliased: Vec<(u32, u64, u64)>,
 }
 
 impl ColumnarMarks {
-    fn new(footer: &Footer, pages_in_data_area: bool) -> Self {
-        Self {
-            decoded: HashMap::new(),
-            decoded_page_directories: HashSet::new(),
-            decoded_pages: HashSet::new(),
+    fn new(footer: &Arc<Footer>, pages_in_data_area: bool) -> Self {
+        let layout = ColumnarMarksLayout {
             granule_stripe_id: footer
                 .granules
                 .iter()
                 .map(|granule| (granule.granule_id, granule.stripe_id))
                 .collect(),
-            page_marks: BTreeMap::new(),
-            pages: footer.marks_pages.clone(),
             pages_in_data_area,
-            pending_aliased: Vec::new(),
-            shared_extents_found: HashSet::new(),
             stripe_bases: footer
                 .stripes
                 .iter()
@@ -1128,19 +1141,38 @@ impl ColumnarMarks {
                 }
                 by_stripe
             },
+        };
+        Self::over(Arc::clone(footer), Arc::new(layout))
+    }
+
+    fn over(footer: Arc<Footer>, layout: Arc<ColumnarMarksLayout>) -> Self {
+        Self {
+            decoded: HashMap::new(),
+            decoded_page_directories: HashSet::new(),
+            decoded_pages: HashSet::new(),
+            footer,
+            layout,
+            page_marks: BTreeMap::new(),
+            pending_aliased: Vec::new(),
+            shared_extents_found: HashSet::new(),
         }
     }
 
+    fn fresh(&self) -> Self {
+        Self::over(Arc::clone(&self.footer), Arc::clone(&self.layout))
+    }
+
     fn page_bytes<'a>(&'a self, file: &'a OeFile, entry: &MarksPageEntry) -> Result<&'a [u8], FormatError> {
-        if !self.pages_in_data_area {
+        if !self.layout.pages_in_data_area {
             return Ok(slice(
-                &self.pages,
+                &self.footer.marks_pages,
                 entry.page_offset as usize,
                 entry.page_len as usize,
                 "columnar marks page",
             )?);
         }
         let position = self
+            .layout
             .stripe_bases
             .get(&entry.stripe_id)
             .copied()
@@ -1156,7 +1188,7 @@ impl ColumnarMarks {
         if self.shared_extents_found.contains(&stripe_id) {
             return Ok(());
         }
-        let entries = self.stripe_pages.get(&stripe_id).cloned().unwrap_or_default();
+        let entries = self.layout.stripe_pages.get(&stripe_id).cloned().unwrap_or_default();
         let mut extent_counts: HashMap<(u64, u64), (u32, u32)> = HashMap::new();
         for entry in &entries {
             let extents = {
@@ -1185,6 +1217,7 @@ impl ColumnarMarks {
         granule_id: u32,
     ) -> Result<(), FormatError> {
         let stripe_id = *self
+            .layout
             .granule_stripe_id
             .get(&granule_id)
             .ok_or(FormatError::RefOutOfRange {
@@ -1195,6 +1228,7 @@ impl ColumnarMarks {
             return Ok(());
         }
         let entries: Vec<MarksPageEntry> = self
+            .layout
             .stripe_pages
             .get(&stripe_id)
             .map(|pages| {
@@ -1211,6 +1245,11 @@ impl ColumnarMarks {
                 decode_marks_page(entry.column_id, entry.projection_id, page_bytes)?
             };
             for mark in marks {
+                if block_rows_beyond_bound(mark.row_count) {
+                    return Err(FormatError::Structural {
+                        rule: BLOCK_ROWS_BEYOND_BOUND,
+                    });
+                }
                 self.decoded
                     .insert((mark.column_id, mark.projection_id, mark.granule_id), mark);
             }
@@ -1227,6 +1266,7 @@ impl ColumnarMarks {
         granule_id: u32,
     ) -> Result<(), FormatError> {
         let stripe_id = *self
+            .layout
             .granule_stripe_id
             .get(&granule_id)
             .ok_or(FormatError::RefOutOfRange {
@@ -1239,6 +1279,7 @@ impl ColumnarMarks {
             return Ok(());
         }
         let entries: Vec<MarksPageEntry> = self
+            .layout
             .stripe_pages
             .get(&stripe_id)
             .map(|pages| {
@@ -1258,6 +1299,11 @@ impl ColumnarMarks {
                 if page.compressed_len > super::MAX_PAGE_BYTES {
                     return Err(FormatError::Structural {
                         rule: "page/chunk exceeds the maximum size",
+                    });
+                }
+                if block_rows_beyond_bound(page.row_count) {
+                    return Err(FormatError::Structural {
+                        rule: BLOCK_ROWS_BEYOND_BOUND,
                     });
                 }
                 self.page_marks.insert(
@@ -1304,6 +1350,7 @@ impl ColumnarMarks {
         granule_id: u32,
     ) -> Result<Option<Option<ColumnMark>>, FormatError> {
         let stripe_id = *self
+            .layout
             .granule_stripe_id
             .get(&granule_id)
             .ok_or(FormatError::RefOutOfRange {
@@ -1323,6 +1370,7 @@ impl ColumnarMarks {
         page_index: u32,
     ) -> Result<Option<Option<PageDirectoryEntry>>, FormatError> {
         let stripe_id = *self
+            .layout
             .granule_stripe_id
             .get(&granule_id)
             .ok_or(FormatError::RefOutOfRange {
@@ -1348,6 +1396,7 @@ impl ColumnarMarks {
         granule_id: u32,
     ) -> Result<Option<Vec<PageDirectoryEntry>>, FormatError> {
         let stripe_id = *self
+            .layout
             .granule_stripe_id
             .get(&granule_id)
             .ok_or(FormatError::RefOutOfRange {
@@ -1371,7 +1420,25 @@ impl ColumnarMarks {
 )]
 enum Marks {
     Columnar(RwLock<ColumnarMarks>),
-    Eager(HashMap<(u32, u32, u32), ColumnMark>),
+    Eager(Arc<HashMap<(u32, u32, u32), ColumnMark>>),
+}
+
+#[derive(Debug, Clone, Default)]
+pub(super) struct FileIndex {
+    embedding_row_offsets: HashMap<(u32, u32), EmbeddingRowOffsets>,
+    entity_hash_filters_by_granule: HashMap<u32, usize>,
+    freetext_row_offsets: HashMap<(u32, u32), FreetextRowOffsets>,
+    granule_stripe_base: HashMap<u32, u64>,
+    initial_aliased_extents: Vec<(u64, u64)>,
+    page_marks: BTreeMap<(u32, u32, u32, u32), PageDirectoryEntry>,
+    pub(super) page_stats_index: HashMap<(u32, u32), PageStats>,
+    payload_granule_index: HashMap<u32, PayloadGranule>,
+    shared_alphabets: HashMap<u32, Arc<Vec<String>>>,
+    snapshot_first_keys_in_order: bool,
+    stripe_position_by_id: HashMap<u32, usize>,
+    text_token_indexes_by_key: HashMap<(u32, u32, u32), usize>,
+    text_token_offsets: HashMap<(u32, u32, u32), TextTokenOffsetsEntry>,
+    usable_optional_features: u64,
 }
 
 #[derive(Debug)]
@@ -1423,34 +1490,24 @@ pub struct OeFile {
     column_cache_bytes: AtomicU64,
     decoded_cache_budget: u64,
     dictionary_decodes: AtomicU64,
-    embedding_row_offsets: HashMap<(u32, u32), EmbeddingRowOffsets>,
-    entity_hash_filters_by_granule: HashMap<u32, usize>,
-    footer: Footer,
-    freetext_row_offsets: HashMap<(u32, u32), FreetextRowOffsets>,
+    footer: Arc<Footer>,
     granule_dictionaries: DashMap<u32, DictionarySlot, ahash::RandomState>,
     granule_dictionaries_bytes: AtomicU64,
-    granule_stripe_base: HashMap<u32, u64>,
     graph_edges: DashMap<u32, GraphEdgesSlot, ahash::RandomState>,
     graph_edges_bytes: AtomicU64,
     header: OeHeader,
+    pub(super) index: Arc<FileIndex>,
     inflated_residuals: DashMap<(u32, u32), InflatedResidualSlot, ahash::RandomState>,
     inflated_residuals_bytes: AtomicU64,
     lazy_stripes: Option<Arc<StripeVerification>>,
     marks: Marks,
-    page_marks: BTreeMap<(u32, u32, u32, u32), PageDirectoryEntry>,
-    page_stats_index: HashMap<(u32, u32), PageStats>,
-    payload_granule_index: HashMap<u32, PayloadGranule>,
-    shared_alphabets: HashMap<u32, Arc<Vec<String>>>,
     packed_shared_alphabets: HashMap<u32, PackedAlphabetSlot>,
     shared_string_views: DashMap<u32, SharedStringViewDictionary>,
     point_probe_counts: DashMap<(u32, u32), u32, ahash::RandomState>,
     residual_seek_tables: DashMap<u32, Arc<SeekTable>, ahash::RandomState>,
     pub(super) snapshot_first_keys_in_order: bool,
-    stripe_position_by_id: HashMap<u32, usize>,
     stripe_relative: bool,
     text_token_cache: DashMap<(u32, u32, u32), Arc<TextTokenIndex>, ahash::RandomState>,
-    text_token_indexes_by_key: HashMap<(u32, u32, u32), usize>,
-    text_token_offsets: HashMap<(u32, u32, u32), TextTokenOffsetsEntry>,
     usable_optional_features: u64,
 }
 
@@ -1501,7 +1558,10 @@ impl OeFile {
 
         compat::check_features(header.feature_flags, 0)?;
 
-        let body_tail = slice(&bytes, HEADER_BLOCK_LEN, content_len - HEADER_BLOCK_LEN, "oe body tail")?;
+        let body_tail_len = content_len
+            .checked_sub(HEADER_BLOCK_LEN)
+            .ok_or(FormatError::Truncated { what: "oe body tail" })?;
+        let body_tail = slice(&bytes, HEADER_BLOCK_LEN, body_tail_len, "oe body tail")?;
         let opened_footer = if header.feature_flags & required_features::FOOTER_ENCRYPTED != 0 {
             let dek = footer_dek.ok_or(FormatError::Structural {
                 rule: "encrypted footer requires a file DEK to open",
@@ -1509,16 +1569,12 @@ impl OeFile {
             let stripped_tail = strip_outboard_tree(body_tail)?;
             let plaintext = decrypt_footer_tail(stripped_tail, dek, header.file_id)?;
             let plaintext_len = footer_blob_len(&plaintext)?;
-            OeFooter::from_content_tail(&plaintext, plaintext_len, proof_trees, false)?
+            OeFooter::decode_content_tail(&plaintext, plaintext_len, proof_trees)?
         } else {
             let plaintext_len = footer_blob_len(body_tail)?;
-            OeFooter::from_content_tail(body_tail, plaintext_len, proof_trees, false)?
+            OeFooter::decode_content_tail(body_tail, plaintext_len, proof_trees)?
         };
-        let OeFooter {
-            footer,
-            usable_optional_features,
-            ..
-        } = opened_footer;
+        let (footer, usable_optional_features) = opened_footer;
         if header.profile != footer.profile {
             return Err(FormatError::Structural {
                 rule: "header profile must match footer profile",
@@ -1585,14 +1641,21 @@ impl OeFile {
     }
 
     pub fn fresh_reader(&self) -> Result<Self, FormatError> {
-        Self::assemble(
+        let marks = match &self.marks {
+            Marks::Eager(map) => Marks::Eager(Arc::clone(map)),
+            Marks::Columnar(state) => Marks::Columnar(RwLock::new(
+                state.read().unwrap_or_else(PoisonError::into_inner).fresh(),
+            )),
+        };
+        Ok(Self::over_index(
             self.bytes.fresh(),
             self.header.clone(),
-            self.footer.clone(),
-            self.usable_optional_features,
+            Arc::clone(&self.footer),
+            Arc::clone(&self.index),
+            marks,
             self.lazy_stripes.clone(),
             self.decoded_cache_budget,
-        )
+        ))
     }
 
     pub(super) fn assemble(
@@ -1622,20 +1685,31 @@ impl OeFile {
                 rule: "page/chunk exceeds the maximum size",
             });
         }
+        if footer.marks.iter().any(|mark| block_rows_beyond_bound(mark.row_count))
+            || footer
+                .page_directory
+                .iter()
+                .any(|entry| block_rows_beyond_bound(entry.row_count))
+        {
+            return Err(FormatError::Structural {
+                rule: BLOCK_ROWS_BEYOND_BOUND,
+            });
+        }
 
+        let footer = Arc::new(footer);
         let marks = if footer.required_feature_flags & required_features::COLUMNAR_MARKS != 0 {
             Marks::Columnar(RwLock::new(ColumnarMarks::new(
                 &footer,
                 footer.required_feature_flags & required_features::STRIPE_MARKS_PAGES != 0,
             )))
         } else {
-            Marks::Eager(
+            Marks::Eager(Arc::new(
                 footer
                     .marks
                     .iter()
                     .map(|mark| ((mark.column_id, mark.projection_id, mark.granule_id), *mark))
                     .collect(),
-            )
+            ))
         };
         let page_marks = footer
             .page_directory
@@ -1692,6 +1766,15 @@ impl OeFile {
                 rule: "granule directory must be strictly ascending by first_row_ordinal with no overlap",
             });
         }
+        if footer
+            .granules
+            .last()
+            .is_some_and(|last| last.first_row_ordinal.checked_add(u64::from(last.row_count)).is_none())
+        {
+            return Err(FormatError::Structural {
+                rule: "granule row range overflows",
+            });
+        }
         let stripe_base_by_id: HashMap<u32, u64> = footer
             .stripes
             .iter()
@@ -1738,7 +1821,7 @@ impl OeFile {
                 }
             }
         }
-        let aliased_extents: DashSet<(u64, u64), ahash::RandomState> = extent_marks
+        let initial_aliased_extents: Vec<(u64, u64)> = extent_marks
             .into_iter()
             .filter_map(|(extent, count)| (count > 1).then_some(extent))
             .collect();
@@ -1747,15 +1830,51 @@ impl OeFile {
             .iter()
             .map(|entry| (entry.column_id, Arc::new(entry.values.clone())))
             .collect();
+        let index = FileIndex {
+            embedding_row_offsets,
+            entity_hash_filters_by_granule,
+            freetext_row_offsets,
+            granule_stripe_base,
+            initial_aliased_extents,
+            page_marks,
+            page_stats_index,
+            payload_granule_index,
+            shared_alphabets,
+            snapshot_first_keys_in_order,
+            stripe_position_by_id,
+            text_token_indexes_by_key,
+            text_token_offsets,
+            usable_optional_features,
+        };
+        Ok(Self::over_index(
+            bytes,
+            header,
+            footer,
+            Arc::new(index),
+            marks,
+            lazy_stripes,
+            decoded_cache_budget,
+        ))
+    }
+
+    fn over_index(
+        bytes: FileBytes,
+        header: OeHeader,
+        footer: Arc<Footer>,
+        index: Arc<FileIndex>,
+        marks: Marks,
+        lazy_stripes: Option<Arc<StripeVerification>>,
+        decoded_cache_budget: u64,
+    ) -> Self {
         let packed_shared_alphabets: HashMap<u32, PackedAlphabetSlot> = footer
             .packed_shared_dictionaries
             .iter()
             .map(|entry| (entry.column_id, PackedAlphabetSlot::default()))
             .collect();
-        Ok(Self {
+        Self {
             aliased_extent_cache: DashMap::default(),
             aliased_extent_cache_bytes: AtomicU64::new(0),
-            aliased_extents,
+            aliased_extents: index.initial_aliased_extents.iter().copied().collect(),
             block_reads: AtomicU64::new(0),
             bytes,
             cache_access_counter: AtomicU64::new(0),
@@ -1763,13 +1882,8 @@ impl OeFile {
             column_cache_bytes: AtomicU64::new(0),
             decoded_cache_budget,
             dictionary_decodes: AtomicU64::new(0),
-            embedding_row_offsets,
-            entity_hash_filters_by_granule,
-            footer,
-            freetext_row_offsets,
             granule_dictionaries: DashMap::default(),
             granule_dictionaries_bytes: AtomicU64::new(0),
-            granule_stripe_base,
             graph_edges: DashMap::default(),
             graph_edges_bytes: AtomicU64::new(0),
             header,
@@ -1777,22 +1891,17 @@ impl OeFile {
             inflated_residuals_bytes: AtomicU64::new(0),
             lazy_stripes,
             marks,
-            page_marks,
-            page_stats_index,
-            payload_granule_index,
             point_probe_counts: DashMap::default(),
             residual_seek_tables: DashMap::default(),
-            shared_alphabets,
             packed_shared_alphabets,
             shared_string_views: DashMap::default(),
-            snapshot_first_keys_in_order,
-            stripe_position_by_id,
-            stripe_relative,
+            snapshot_first_keys_in_order: index.snapshot_first_keys_in_order,
+            stripe_relative: footer.required_feature_flags & required_features::STRIPE_RELATIVE_MARKS != 0,
             text_token_cache: DashMap::default(),
-            text_token_indexes_by_key,
-            text_token_offsets,
-            usable_optional_features,
-        })
+            usable_optional_features: index.usable_optional_features,
+            footer,
+            index,
+        }
     }
 
     pub fn granule_dictionary_decodes(&self) -> u64 {
@@ -1861,7 +1970,7 @@ impl OeFile {
 
     fn stripe_base_for(&self, granule_id: u32) -> u64 {
         if self.stripe_relative {
-            self.granule_stripe_base.get(&granule_id).copied().unwrap_or(0)
+            self.index.granule_stripe_base.get(&granule_id).copied().unwrap_or(0)
         } else {
             0
         }
@@ -1916,7 +2025,7 @@ impl OeFile {
     ) -> Result<Vec<PageDirectoryEntry>, FormatError> {
         let span = (column_id, projection_id, granule_id, 0)..=(column_id, projection_id, granule_id, u32::MAX);
         match &self.marks {
-            Marks::Eager(_) => Ok(self.page_marks.range(span).map(|(_, entry)| *entry).collect()),
+            Marks::Eager(_) => Ok(self.index.page_marks.range(span).map(|(_, entry)| *entry).collect()),
             Marks::Columnar(state) => {
                 if let Some(entries) = state
                     .read()
@@ -1945,6 +2054,7 @@ impl OeFile {
     ) -> Result<Option<PageDirectoryEntry>, FormatError> {
         match &self.marks {
             Marks::Eager(_) => Ok(self
+                .index
                 .page_marks
                 .get(&(column_id, projection_id, granule_id, page_index))
                 .copied()),
@@ -2023,7 +2133,8 @@ impl OeFile {
             .granules
             .iter()
             .filter(|granule| {
-                self.entity_hash_filters_by_granule
+                self.index
+                    .entity_hash_filters_by_granule
                     .get(&granule.granule_id)
                     .and_then(|&index| self.footer.entity_hash_filters.get(index))
                     .and_then(|entry| {
@@ -2177,7 +2288,7 @@ impl OeFile {
     }
 
     pub fn shared_alphabet(&self, column_id: u32) -> Option<&[String]> {
-        if let Some(values) = self.shared_alphabets.get(&column_id) {
+        if let Some(values) = self.index.shared_alphabets.get(&column_id) {
             return Some(values.as_slice());
         }
         let slot = self.packed_shared_alphabets.get(&column_id)?;
@@ -2205,7 +2316,7 @@ impl OeFile {
         column_id: u32,
         predicate: &StringPredicate,
     ) -> Option<SharedDictionaryPredicate> {
-        if let Some(values) = self.shared_alphabets.get(&column_id) {
+        if let Some(values) = self.index.shared_alphabets.get(&column_id) {
             return Some(translate_for_shared_dictionary(predicate, values.as_slice()));
         }
         let slot = self.packed_shared_alphabets.get(&column_id)?;
@@ -2252,6 +2363,7 @@ impl OeFile {
         mark: &ColumnMark,
     ) -> Result<ColumnRead, FormatError> {
         let stats = self
+            .index
             .page_stats_index
             .get(&(column_id, granule_id))
             .ok_or(FormatError::Structural {
@@ -2382,6 +2494,11 @@ impl OeFile {
                 append_presence_bits(&mut combined_presence, row_offset, &page.presence, page_rows);
             }
             row_offset += page_rows;
+            if row_offset > mark.row_count as usize {
+                return Err(FormatError::Structural {
+                    rule: "sum of page row counts must equal the mark row count",
+                });
+            }
             combined_data = Some(match combined_data {
                 None => page.data,
                 Some(existing) => concat_column_data(existing, page.data)?,
@@ -2412,7 +2529,7 @@ impl OeFile {
         })?;
         if mark.page_count > 1 {
             let mut combined_presence = Vec::new();
-            let mut builder = StringViewBuilder::with_capacity(mark.row_count as usize);
+            let mut pages = Vec::new();
             let mut row_offset = 0usize;
             for page_index in 0..mark.page_count {
                 let raw = self.read_page_raw_with_mark(column_id, granule_id, page_index, &mark)?;
@@ -2432,12 +2549,21 @@ impl OeFile {
                     append_presence_bits(&mut combined_presence, row_offset, &raw.presence, page_rows);
                 }
                 row_offset += page_rows;
-                builder.append_array(&views);
+                if row_offset > mark.row_count as usize {
+                    return Err(FormatError::Structural {
+                        rule: "sum of page row counts must equal the mark row count",
+                    });
+                }
+                pages.push(views);
             }
             if row_offset != mark.row_count as usize {
                 return Err(FormatError::Structural {
                     rule: "sum of page row counts must equal the mark row count",
                 });
+            }
+            let mut builder = StringViewBuilder::with_capacity(pages.iter().map(Array::len).sum());
+            for views in &pages {
+                builder.append_array(views);
             }
             let views = builder.finish();
             validate_block_counts(&combined_presence, views.len(), mark.row_count as usize)?;
@@ -2476,7 +2602,7 @@ impl OeFile {
         page_index: u32,
     ) -> Result<Option<TextTokenIndex>, FormatError> {
         if self.usable_optional_features & optional_features::TEXT_TOKEN_FILTER_OFFSETS != 0
-            && let Some(entry) = self.text_token_offsets.get(&(column_id, granule_id, page_index))
+            && let Some(entry) = self.index.text_token_offsets.get(&(column_id, granule_id, page_index))
         {
             let bytes = self.data(
                 self.file_position(granule_id, entry.index_offset)?,
@@ -2485,7 +2611,8 @@ impl OeFile {
             )?;
             return TextTokenIndex::decode(bytes).map(Some);
         }
-        self.text_token_indexes_by_key
+        self.index
+            .text_token_indexes_by_key
             .get(&(column_id, granule_id, page_index))
             .and_then(|&index| self.footer.text_token_indexes.get(index))
             .map(|entry| TextTokenIndex::decode(&entry.index_bytes))
@@ -2563,7 +2690,8 @@ impl OeFile {
     }
 
     fn payload_granule(&self, granule_id: u32) -> Result<&PayloadGranule, FormatError> {
-        self.payload_granule_index
+        self.index
+            .payload_granule_index
             .get(&granule_id)
             .ok_or(FormatError::RefOutOfRange {
                 what: "granule missing from payload index",
@@ -2790,7 +2918,7 @@ impl OeFile {
         granule_id: u32,
         row_in_granule: u64,
     ) -> Result<Option<(u64, u64)>, FormatError> {
-        let Some(entry) = self.embedding_row_offsets.get(&(column_id, granule_id)) else {
+        let Some(entry) = self.index.embedding_row_offsets.get(&(column_id, granule_id)) else {
             return Ok(None);
         };
         let offsets = self.data(
@@ -2820,12 +2948,13 @@ impl OeFile {
         offset: u64,
         len: u64,
     ) -> Result<Vec<u8>, FormatError> {
-        let entry = self
-            .embedding_row_offsets
-            .get(&(column_id, granule_id))
-            .ok_or(FormatError::RefOutOfRange {
-                what: "embedding row offsets missing for column/granule",
-            })?;
+        let entry =
+            self.index
+                .embedding_row_offsets
+                .get(&(column_id, granule_id))
+                .ok_or(FormatError::RefOutOfRange {
+                    what: "embedding row offsets missing for column/granule",
+                })?;
         let bytes = self.data(
             self.file_position(entry.granule_id, entry.bytes_offset)?,
             entry.bytes_len as usize,
@@ -2841,7 +2970,7 @@ impl OeFile {
         row_in_granule: u64,
     ) -> Result<Option<VariantValue>, FormatError> {
         if self.usable_optional_features & optional_features::TYPED_COLUMN_ROW_OFFSETS != 0
-            && let Some(entry) = self.freetext_row_offsets.get(&(column_id, granule.granule_id))
+            && let Some(entry) = self.index.freetext_row_offsets.get(&(column_id, granule.granule_id))
         {
             let Some((offset, len)) = self.freetext_row_slot(entry, row_in_granule)? else {
                 return Ok(None);
@@ -2860,6 +2989,7 @@ impl OeFile {
         let row_in_granule = row_ordinal - granule.first_row_ordinal;
         if self.usable_optional_features & optional_features::TYPED_COLUMN_ROW_OFFSETS != 0
             && self
+                .index
                 .embedding_row_offsets
                 .contains_key(&(column_id, granule.granule_id))
         {
@@ -2877,9 +3007,14 @@ impl OeFile {
         let ColumnData::Strings(values) = &read.data else {
             return Ok(None);
         };
-        Ok(values
-            .get(row_in_granule as usize)
-            .flatten()
+        let row = row_in_granule as usize;
+        let position = if read.presence.is_empty() {
+            Some(row)
+        } else {
+            present_position(&read.presence, row)
+        };
+        Ok(position
+            .and_then(|position| values.get(position).flatten())
             .map(|value| value.as_bytes().to_vec()))
     }
 
@@ -3063,7 +3198,11 @@ impl OeFile {
         let read = self.read_column(column_id, granule_id)?;
         let bytes = column_data_bytes(&read.data);
         let rank = RankSelect::from_packed_bits(&read.presence);
-        let decoded = Arc::new(CachedColumn { data: read.data, rank });
+        let decoded = Arc::new(CachedColumn {
+            data: read.data,
+            dense: read.presence.is_empty(),
+            rank,
+        });
         let column = {
             let slot = self.column_cache.entry(key).or_insert(CachedColumnSlot {
                 bytes,
@@ -3186,7 +3325,8 @@ impl OeFile {
     }
 
     pub(crate) fn stripe_by_id(&self, stripe_id: u32) -> Option<&StripeEntry> {
-        self.stripe_position_by_id
+        self.index
+            .stripe_position_by_id
             .get(&stripe_id)
             .and_then(|&position| self.footer().stripes.get(position))
     }
@@ -3333,7 +3473,10 @@ impl OeFile {
         row_in_granule: u64,
     ) -> Result<Option<VariantValue>, FormatError> {
         if self.usable_optional_features & optional_features::TYPED_COLUMN_ROW_OFFSETS != 0
-            && let Some(entry) = self.freetext_row_offsets.get(&(column_id, group.granule.granule_id))
+            && let Some(entry) = self
+                .index
+                .freetext_row_offsets
+                .get(&(column_id, group.granule.granule_id))
         {
             let Some((offset, len)) = self.freetext_row_slot(entry, row_in_granule)? else {
                 return Ok(None);

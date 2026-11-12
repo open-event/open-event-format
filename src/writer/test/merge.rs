@@ -869,3 +869,123 @@ fn elided_entity_hashes_round_trip_through_read_build_rows() {
     );
     assert_eq!(read_build_rows(&open_built(&rebuilt)).unwrap(), rows);
 }
+
+pub(crate) struct RivalSet<'a> {
+    pub(crate) inner: SimulatedPublishedSet,
+    pub(crate) rival: Option<Box<dyn FnOnce(&mut ManifestGeneration) + 'a>>,
+}
+
+impl PublishedSet for RivalSet<'_> {
+    fn head(&self) -> Result<(u64, ManifestGeneration), crate::error::PublishError> {
+        self.inner.head()
+    }
+    fn put_generation(&mut self, generation: ManifestGeneration) -> Result<(), crate::error::PublishError> {
+        if let Some(rival) = self.rival.take() {
+            let (head_id, head) = self.inner.head()?;
+            let mut next = ManifestGeneration {
+                footer_mirror: None,
+                generation: head_id + 1,
+                ..head
+            };
+            rival(&mut next);
+            self.inner.put_generation(next)?;
+            self.inner.advance_head(head_id, head_id + 1)?;
+        }
+        self.inner.put_generation(generation)
+    }
+    fn advance_head(&mut self, expected: u64, next: u64) -> Result<(), crate::error::PublishError> {
+        self.inner.advance_head(expected, next)
+    }
+    fn generation(&self, id: u64) -> Result<ManifestGeneration, crate::error::PublishError> {
+        self.inner.generation(id)
+    }
+}
+
+#[test]
+fn a_compaction_that_rebases_onto_a_newer_deletion_or_redaction_of_an_input_is_refused() {
+    let rivals: [Box<dyn Fn(&mut ManifestGeneration, u128)>; 2] = [
+        Box::new(|next, file_id| {
+            let mut deleted = crate::deletes::DeletionVector::new();
+            deleted.mark_deleted(0);
+            assert!(next.publish_deletions(file_id, &deleted, None).unwrap().is_some());
+        }),
+        Box::new(|next, file_id| {
+            assert!(
+                next.publish_field_deletions(file_id, &body_redaction(&[0]))
+                    .unwrap()
+                    .is_some()
+            );
+        }),
+    ];
+    for rival in rivals {
+        let objects = SimObjectStore::new();
+        let mut inner = SimulatedPublishedSet::new();
+        let first = build_oe_file(rows_of(1..=3), &build_config()).unwrap();
+        let second = build_oe_file(rows_of(4..=5), &build_config()).unwrap();
+        publish_built(&first, 1, 3, &mut inner, &objects);
+        publish_built(&second, 4, 5, &mut inner, &objects);
+        let (before, _) = inner.head().unwrap();
+        let target = first.file_id;
+        let mut published = RivalSet {
+            inner,
+            rival: Some(Box::new(move |next| rival(next, target))),
+        };
+        let mut notices = NoopPeerNotices::default();
+        let result = execute_compaction(
+            &mut OePublisher::default(),
+            &CompactionJob {
+                expected_output_bytes: 0,
+                file_ids: vec![first.file_id, second.file_id],
+            },
+            &build_config(),
+            &mut published,
+            &objects,
+            &mut notices,
+            &FixedClock::at(START_NANOS),
+        );
+        assert!(matches!(result, Err(PublishFailure::Verification(_))));
+        let (head_id, head) = published.head().unwrap();
+        assert_eq!(head_id, before + 1, "only the rival's generation was published");
+        assert_eq!(head.files.len(), 2, "the stale output never became a file");
+        assert!(head.files.iter().all(|entry| entry.part_state == PartState::Active));
+        assert!(notices.published.is_empty());
+    }
+}
+
+#[test]
+fn a_graph_rewrite_that_rebases_onto_a_newer_deletion_of_an_input_is_refused() {
+    let objects = SimObjectStore::new();
+    let mut inner = SimulatedPublishedSet::new();
+    let (a, b, c) = (graph_file(0, 4), graph_file(4, 9), graph_file(9, 12));
+    publish_built(&a, 1, 4, &mut inner, &objects);
+    publish_built(&b, 5, 9, &mut inner, &objects);
+    publish_built(&c, 10, 12, &mut inner, &objects);
+    delete_rows(&mut inner, b.file_id, &[1]);
+    let (before, _) = inner.head().unwrap();
+    let later = c.file_id;
+    let mut published = RivalSet {
+        inner,
+        rival: Some(Box::new(move |next| {
+            let mut deleted = crate::deletes::DeletionVector::new();
+            deleted.mark_deleted(1);
+            assert!(next.publish_deletions(later, &deleted, None).unwrap().is_some());
+        })),
+    };
+    let result = execute_compaction(
+        &mut OePublisher::default(),
+        &CompactionJob {
+            expected_output_bytes: 0,
+            file_ids: vec![a.file_id, b.file_id],
+        },
+        &build_config(),
+        &mut published,
+        &objects,
+        &mut NoopPeerNotices::default(),
+        &FixedClock::at(START_NANOS),
+    );
+    assert!(matches!(result, Err(PublishFailure::Verification(_))));
+    let (head_id, head) = published.head().unwrap();
+    assert_eq!(head_id, before + 1, "only the rival's generation was published");
+    assert_eq!(head.files.len(), 3);
+    assert!(head.files.iter().all(|entry| entry.part_state == PartState::Active));
+}

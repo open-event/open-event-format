@@ -976,7 +976,7 @@ fn alp_try(value: f64, power: f64) -> Option<i64> {
     }
     let rounded = scaled.round();
     let as_int = rounded as i64;
-    if (as_int as f64) / power == value {
+    if ((as_int as f64) / power).to_bits() == value.to_bits() {
         Some(as_int)
     } else {
         None
@@ -996,7 +996,7 @@ fn alp_probe_chunk(values: &[f64], power: f64, zigzags: &mut [u64], encodable: &
             0.0
         };
         let rounded = truncated + adjust;
-        let ok = in_range && (rounded / power) == *value;
+        let ok = in_range && (rounded / power).to_bits() == value.to_bits();
         let as_int = rounded as i64;
         *zigzag_slot = if ok { zigzag(as_int) } else { 0 };
         *encodable_slot = ok;
@@ -1804,7 +1804,7 @@ impl<'a> NullStream<'a> {
     fn read(reader: &mut Reader<'a>) -> Result<Self, FormatError> {
         let row_count = reader.u32("string row count")? as usize;
         let form = match reader.u8("null stream form")? {
-            0 | 1 if row_count > MAX_BLOCK_VALUES => {
+            0..=2 if row_count > MAX_BLOCK_VALUES => {
                 return Err(FormatError::Structural {
                     rule: "null stream row count beyond the block bound",
                 });
@@ -2089,6 +2089,7 @@ fn write_fsst_dictionary_values(
     Ok(true)
 }
 
+#[cfg(test)]
 fn encode_dictionary_string(
     values: &StringColumn,
     present: &[&str],
@@ -2099,6 +2100,7 @@ fn encode_dictionary_string(
     encode_dictionary_string_with(values, present, strategy, shared, true, out)
 }
 
+#[cfg(test)]
 fn encode_dictionary_string_with(
     values: &StringColumn,
     present: &[&str],
@@ -2107,20 +2109,61 @@ fn encode_dictionary_string_with(
     fsst_values: bool,
     out: &mut Writer,
 ) -> Result<SideStream, FormatError> {
+    encode_prepared_dictionary(values, &prepare_dictionary(present), strategy, shared, fsst_values, out)
+}
+
+#[derive(Default)]
+struct PreparedDictionary<'a> {
+    codes: Vec<u32>,
+    dictionary: Vec<&'a str>,
+}
+
+fn prepare_dictionary<'a>(present: &[&'a str]) -> PreparedDictionary<'a> {
+    prepare_dictionary_within(present, present.len()).unwrap_or_default()
+}
+
+fn prepare_dictionary_within<'a>(present: &[&'a str], max_distinct: usize) -> Option<PreparedDictionary<'a>> {
+    let mut first_seen: AHashMap<&str, u32> = AHashMap::new();
+    let mut sorted: Vec<(&'a str, u32)> = Vec::new();
+    let mut codes = Vec::with_capacity(present.len());
+    for &value in present {
+        let next = sorted.len() as u32;
+        let id = *first_seen.entry(value).or_insert(next);
+        if id == next {
+            sorted.push((value, id));
+            if sorted.len() > max_distinct {
+                return None;
+            }
+        }
+        codes.push(id);
+    }
+    sorted.sort_unstable();
+    let mut rank = vec![0u32; sorted.len()];
+    for (position, (_, id)) in sorted.iter().enumerate() {
+        if let Some(slot) = rank.get_mut(*id as usize) {
+            *slot = position as u32;
+        }
+    }
+    for code in &mut codes {
+        *code = rank.get(*code as usize).copied().unwrap_or(0);
+    }
+    Some(PreparedDictionary {
+        codes,
+        dictionary: sorted.into_iter().map(|(value, _)| value).collect(),
+    })
+}
+
+fn encode_prepared_dictionary(
+    values: &StringColumn,
+    prepared: &PreparedDictionary<'_>,
+    strategy: CascadeStrategy,
+    shared: Option<&[String]>,
+    fsst_values: bool,
+    out: &mut Writer,
+) -> Result<SideStream, FormatError> {
     NullStream::from_values(values).write(out);
-    let mut dictionary: Vec<&str> = AHashSet::from_iter(present.iter().copied()).into_iter().collect();
-    dictionary.sort_unstable();
-    let code_of: AHashMap<&str, u64> = dictionary
-        .iter()
-        .enumerate()
-        .map(|(index, value)| (*value, index as u64))
-        .collect();
-    let local_code = |row: usize| {
-        present
-            .get(row)
-            .and_then(|value| code_of.get(value).copied())
-            .unwrap_or(0)
-    };
+    let PreparedDictionary { codes, dictionary } = prepared;
+    let local_code = |row: usize| codes.get(row).map_or(0, |&code| u64::from(code));
     if let Some(alphabet) = shared
         && dictionary
             .iter()
@@ -2137,14 +2180,14 @@ fn encode_dictionary_string_with(
             .collect();
         let max = alphabet_index_of.iter().copied().max().unwrap_or(0);
         let mut shared_out = Writer::new();
-        bitpack_with(present.len(), bits_needed(max), &mut shared_out, |row| {
+        bitpack_with(codes.len(), bits_needed(max), &mut shared_out, |row| {
             alphabet_index_of.get(local_code(row) as usize).copied().unwrap_or(0)
         });
         let shared_bytes = shared_out.into_bytes();
         let mut local_out = Writer::new();
         let local_side = encode_local_dictionary_with(
-            &dictionary,
-            present.len(),
+            dictionary,
+            codes.len(),
             local_code,
             strategy,
             fsst_values,
@@ -2158,7 +2201,7 @@ fn encode_dictionary_string_with(
         out.put_slice(&local_bytes);
         return Ok(local_side);
     }
-    encode_local_dictionary_with(&dictionary, present.len(), local_code, strategy, fsst_values, out)
+    encode_local_dictionary_with(dictionary, codes.len(), local_code, strategy, fsst_values, out)
 }
 
 #[cfg(test)]
@@ -2289,12 +2332,9 @@ fn encode_raw_string(values: &StringColumn, present: &[&str], out: &mut Writer) 
 fn merge_nulls<'a>(
     nulls: &NullStream<'_>,
     count: usize,
+    text_bytes: usize,
     value: impl Fn(usize) -> Result<&'a str, FormatError>,
 ) -> Result<StringColumn, FormatError> {
-    let mut text_bytes = 0usize;
-    for index in 0..count {
-        text_bytes += value(index)?.len();
-    }
     let mut values = StringColumn::with_capacity(nulls.row_count(), text_bytes);
     let mut next = 0usize;
     nulls.each_row(|set| {
@@ -2375,6 +2415,50 @@ impl<'a> DictionaryValues<'a> {
                     })
                 })
                 .collect(),
+        }
+    }
+
+    fn into_view_arena(self) -> Result<(Vec<u8>, Vec<usize>), FormatError> {
+        match self {
+            Self::Fsst(arena) => {
+                for (&start, &end) in arena.bounds.iter().zip(arena.bounds.iter().skip(1)) {
+                    let entry = arena.text.get(start..end).ok_or(FormatError::InvalidUtf8 {
+                        what: "dictionary entry",
+                    })?;
+                    if entry.len() > DICTIONARY_FSST_MAX_VALUE_LEN {
+                        return Err(FormatError::Structural {
+                            rule: "dictionary entry exceeds the FSST value cap",
+                        });
+                    }
+                }
+                Ok((arena.text.into_bytes(), arena.bounds))
+            }
+            Self::Plain { data, offsets } => {
+                if offsets
+                    .windows(2)
+                    .any(|pair| matches!(pair, [start, end] if end < start))
+                {
+                    return Err(FormatError::Structural {
+                        rule: "dictionary offsets must be non-decreasing",
+                    });
+                }
+                let first = offsets.first().copied().unwrap_or(0);
+                let last = offsets.last().copied().unwrap_or(first);
+                let bytes = slice(data, first, last - first, "dictionary entry")?;
+                let text = simdutf8::basic::from_utf8(bytes).map_err(|_| FormatError::InvalidUtf8 {
+                    what: "dictionary entry",
+                })?;
+                let mut bounds = offsets;
+                for bound in &mut bounds {
+                    *bound -= first;
+                    if !text.is_char_boundary(*bound) {
+                        return Err(FormatError::InvalidUtf8 {
+                            what: "dictionary entry",
+                        });
+                    }
+                }
+                Ok((bytes.to_vec(), bounds))
+            }
         }
     }
 }
@@ -2539,7 +2623,8 @@ fn fsst_decompress_values_with_table(
     let base = buffer.len();
     let mut bounds = Vec::with_capacity(offsets.len());
     bounds.push(base);
-    buffer.reserve((data.len() - arena_start) * constant::FSST_MAX_SYMBOL_BYTES);
+    let codes_end = ends.iter().copied().max().unwrap_or(arena_start).min(data.len());
+    buffer.reserve(codes_end.saturating_sub(arena_start) * constant::FSST_MAX_SYMBOL_BYTES);
     let out = buffer.spare_capacity_mut().as_mut_ptr().cast::<u8>();
     let mut written = 0usize;
     let mut value_start = arena_start;
@@ -2550,7 +2635,8 @@ fn fsst_decompress_values_with_table(
         let codes = data
             .get(value_start..value_end)
             .ok_or(FormatError::Truncated { what })?;
-        // SAFETY: `written` is at most eight times the code bytes decoded so far, all of them before `codes` in
+        // SAFETY: `written` is at most eight times the code bytes decoded so far, and those with `codes` all lie in
+        // `data[arena_start..codes_end]`, so `slot` has at least eight bytes per byte of `codes` still spare.
         let slot = unsafe { out.add(written) };
         // SAFETY: `slot` has the room `decode_fsst_codes` asks for, as just shown.
         written += unsafe { table.decode_fsst_codes(codes, slot) }?;
@@ -2970,6 +3056,21 @@ fn decode_fsst_string(reader: &mut Reader<'_>) -> Result<StringColumn, FormatErr
     merge_nulls_arena(&nulls, arena)
 }
 
+fn decode_fsst_packed_string(body: &[u8]) -> Result<StringColumn, FormatError> {
+    let packed = fsst_packed_values(body)?;
+    let mut reader = Reader::new(body);
+    let nulls = NullStream::read(&mut reader)?;
+    let table = FsstDecodeTable::read(&mut reader)?;
+    let arena = fsst_decompress_arena(
+        &table,
+        packed.arena,
+        &packed.offsets,
+        "fsst value",
+        "fsst offsets must be non-decreasing",
+    )?;
+    merge_nulls_arena(&nulls, arena)
+}
+
 fn merge_nulls_arena(nulls: &NullStream<'_>, arena: FsstArena) -> Result<StringColumn, FormatError> {
     let FsstArena { bounds, text } = arena;
     let count = bounds.len().saturating_sub(1);
@@ -3016,9 +3117,13 @@ fn decode_raw_string(reader: &mut Reader<'_>) -> Result<StringColumn, FormatErro
     let offsets = read_offsets(reader, present_count)?;
     let data_len = offsets.last().copied().unwrap_or(0);
     let data = reader.take(data_len, "raw string data")?;
-    merge_nulls(&nulls, offsets.len().saturating_sub(1), |index| {
-        raw_string_value(data, &offsets, index)
-    })
+    let raw = RawValues::validated(data, &offsets)?;
+    merge_nulls(
+        &nulls,
+        offsets.len().saturating_sub(1),
+        offsets_text_len(&offsets, data),
+        |index| raw.value(&offsets, index),
+    )
 }
 
 fn relaid_string_column(relaid: string_zstd::Relaid<'_>) -> Result<StringColumn, FormatError> {
@@ -3164,9 +3269,6 @@ pub(crate) fn decode_string_block_views_shared_prepared(
         return Ok(Some(array));
     }
     with_trailing_removed(pipeline.compression()?, bytes, |body| {
-        if let Some((classic, body)) = classic_fsst_view(pipeline, body)? {
-            return decode_string_block_views_with_body(classic, Transform::FsstString, &body, shared, prepared);
-        }
         decode_string_block_views_with_body(pipeline, transform, body, shared, prepared)
     })
 }
@@ -3178,6 +3280,10 @@ fn decode_string_block_views_with_body(
     shared: Option<&[String]>,
     prepared: Option<&SharedStringViewDictionary>,
 ) -> Result<Option<StringViewArray>, FormatError> {
+    let packed = match transform {
+        Transform::FsstPackedString => Some(fsst_packed_values(body)?),
+        _ => None,
+    };
     let mut reader = Reader::new(body);
     let nulls = NullStream::read(&mut reader)?;
 
@@ -3202,34 +3308,8 @@ fn decode_string_block_views_with_body(
                     dictionary_views_by_row(&nulls, &dictionary.entry_views, &codes)?,
                 )
             } else {
-                let mut entries: Vec<&str> = Vec::new();
-                let owned: Vec<String>;
-                if side == SideStream::FsstDictionaryValues {
-                    let dict_count = reader.u32("dictionary count")? as usize;
-                    owned = read_dictionary_values(&mut reader, dict_count, side)?;
-                    entries.extend(owned.iter().map(String::as_str));
-                } else {
-                    let dict_count = reader.u32("dictionary count")? as usize;
-                    let offsets = read_offsets(&mut reader, dict_count)?;
-                    let data_len = offsets.last().copied().unwrap_or(0);
-                    let data = reader.take(data_len, "dictionary data")?;
-                    for pair in offsets.windows(2) {
-                        let (start, end) = match pair {
-                            [start, end] => (*start, *end),
-                            _ => continue,
-                        };
-                        if end < start {
-                            return Err(FormatError::Structural {
-                                rule: "dictionary offsets must be non-decreasing",
-                            });
-                        }
-                        let bytes = slice(data, start, end - start, "dictionary entry")?;
-                        entries.push(simdutf8::basic::from_utf8(bytes).map_err(|_| FormatError::InvalidUtf8 {
-                            what: "dictionary entry",
-                        })?);
-                    }
-                }
-                let (arena, bounds) = concatenate(&entries);
+                let dict_count = reader.u32("dictionary count")? as usize;
+                let (arena, bounds) = DictionaryValues::read(&mut reader, dict_count, side)?.into_view_arena()?;
                 let entry_views = views_over(&arena, &bounds)?;
                 let codes = bitunpack(&mut reader)?;
                 (
@@ -3238,12 +3318,17 @@ fn decode_string_block_views_with_body(
                 )
             }
         }
-        Transform::FsstString => {
+        Transform::FsstString | Transform::FsstPackedString => {
             let table = FsstDecodeTable::read(&mut reader)?;
-            let present_count = reader.u32("fsst present count")? as usize;
-            let offsets = read_offsets(&mut reader, present_count)?;
-            let data_len = offsets.last().copied().unwrap_or(0);
-            let data = reader.take(data_len, "fsst data")?;
+            let (offsets, data) = match packed {
+                Some(packed) => (packed.offsets, packed.arena),
+                None => {
+                    let present_count = reader.u32("fsst present count")? as usize;
+                    let offsets = read_offsets(&mut reader, present_count)?;
+                    let data_len = offsets.last().copied().unwrap_or(0);
+                    (offsets, reader.take(data_len, "fsst data")?)
+                }
+            };
             let mut arena = Vec::new();
             let bounds = fsst_decompress_values_with_table(
                 &table,
@@ -3435,15 +3520,14 @@ fn shared_alphabet_covers(shared: Option<&[String]>, present: &[&str]) -> bool {
         .all(|value| !seen.insert(value) || alphabet.binary_search_by(|entry| entry.as_str().cmp(value)).is_ok())
 }
 
-fn dictionary_trial_worthwhile(present: &[&str]) -> bool {
-    let limit = present.len() * DICTIONARY_TRIAL_MAX_DISTINCT_NUM / DICTIONARY_TRIAL_MAX_DISTINCT_DEN;
-    let mut distinct = AHashSet::with_capacity(limit + 1);
-    for value in present {
-        if distinct.insert(*value) && distinct.len() > limit {
-            return false;
-        }
-    }
-    true
+fn dictionary_trial_max_distinct(present_count: usize) -> usize {
+    present_count * DICTIONARY_TRIAL_MAX_DISTINCT_NUM / DICTIONARY_TRIAL_MAX_DISTINCT_DEN
+}
+
+#[derive(Default)]
+struct StringTrial<'a> {
+    dictionary: Option<Option<PreparedDictionary<'a>>>,
+    present: Option<Vec<&'a str>>,
 }
 
 fn choose_string_transform(present: &[&str]) -> Transform {
@@ -3478,6 +3562,18 @@ fn min_max_f64(values: &[f64]) -> Option<(f64, f64)> {
     Some(iter.fold((first, first), |(min, max), v| (f64::min(min, v), f64::max(max, v))))
 }
 
+fn i64_stats(values: &[i64]) -> BlockStats {
+    let bounds = min_max(values);
+    BlockStats {
+        row_count: values.len() as u32,
+        null_count: 0,
+        min_i128: bounds.map(|(min, _)| i128::from(min)),
+        max_i128: bounds.map(|(_, max)| i128::from(max)),
+        min_f64: None,
+        max_f64: None,
+    }
+}
+
 fn stats_for(data: &ColumnData) -> BlockStats {
     let mut stats = BlockStats {
         row_count: data.row_count() as u32,
@@ -3494,12 +3590,7 @@ fn stats_for(data: &ColumnData) -> BlockStats {
                 stats.max_i128 = Some(i128::from(max));
             }
         }
-        ColumnData::I64(values) => {
-            if let Some((min, max)) = min_max(values) {
-                stats.min_i128 = Some(i128::from(min));
-                stats.max_i128 = Some(i128::from(max));
-            }
-        }
+        ColumnData::I64(values) => return i64_stats(values),
         ColumnData::U128(values) => {
             if let Some((min, max)) = min_max(values)
                 && let (Ok(min), Ok(max)) = (i128::try_from(min), i128::try_from(max))
@@ -3533,15 +3624,20 @@ const TRAILING_SAMPLE_WINDOWS: usize = 8;
 
 const TRAILING_SAMPLE_WINDOW_BYTES: usize = 2048;
 
+#[cfg(test)]
 fn pick_trailing(bytes: Vec<u8>, threshold: usize, lz4: Vec<u8>, zstd_framed: Vec<u8>) -> (Compression, Vec<u8>) {
+    pick_trailing_candidate(threshold, lz4, zstd_framed).unwrap_or((Compression::None, bytes))
+}
+
+fn pick_trailing_candidate(threshold: usize, lz4: Vec<u8>, zstd_framed: Vec<u8>) -> Option<(Compression, Vec<u8>)> {
     let lz4_wins = !lz4.is_empty() && lz4.len() < threshold;
     let zstd_wins = !zstd_framed.is_empty() && zstd_framed.len() < threshold && zstd_framed.len() < lz4.len();
     if zstd_wins {
-        (Compression::Zstd1, zstd_framed)
+        Some((Compression::Zstd1, zstd_framed))
     } else if lz4_wins {
-        (Compression::Lz4, lz4)
+        Some((Compression::Lz4, lz4))
     } else {
-        (Compression::None, bytes)
+        None
     }
 }
 
@@ -3617,58 +3713,59 @@ fn trailing_threshold(strategy: CascadeStrategy, len: usize) -> Option<usize> {
     }
 }
 
-fn apply_trailing(bytes: Vec<u8>, strategy: CascadeStrategy) -> (Compression, Vec<u8>) {
-    let Some(threshold) = trailing_threshold(strategy, bytes.len()) else {
-        return (Compression::None, bytes);
-    };
+fn trailing_candidate(bytes: &[u8], strategy: CascadeStrategy) -> Option<(Compression, Vec<u8>)> {
+    let threshold = trailing_threshold(strategy, bytes.len())?;
     if bytes.len() <= TRAILING_FULL_TRIAL_MAX_BYTES {
-        let lz4 = lz4_flex::compress_prepend_size(&bytes);
-        let zstd_framed = compress_zstd_framed(&bytes, 1);
-        return pick_trailing(bytes, threshold, lz4, zstd_framed);
+        let lz4 = lz4_flex::compress_prepend_size(bytes);
+        let zstd_framed = compress_zstd_framed(bytes, 1);
+        return pick_trailing_candidate(threshold, lz4, zstd_framed);
     }
-    let (sample_lz4, sample_zstd) = with_trailing_sample(&bytes, |sample| {
+    let (sample_lz4, sample_zstd) = with_trailing_sample(bytes, |sample| {
         (
             lz4_flex::compress_prepend_size(sample).len(),
             compress_zstd(sample, 1).len(),
         )
     });
     if sample_zstd < sample_lz4 {
-        let framed = compress_zstd_framed(&bytes, 1);
-        if !framed.is_empty() && framed.len() < threshold {
-            return (Compression::Zstd1, framed);
-        }
+        let framed = compress_zstd_framed(bytes, 1);
+        (!framed.is_empty() && framed.len() < threshold).then_some((Compression::Zstd1, framed))
     } else {
-        let lz4 = lz4_flex::compress_prepend_size(&bytes);
-        if !lz4.is_empty() && lz4.len() < threshold {
-            return (Compression::Lz4, lz4);
-        }
+        let lz4 = lz4_flex::compress_prepend_size(bytes);
+        (!lz4.is_empty() && lz4.len() < threshold).then_some((Compression::Lz4, lz4))
     }
-    (Compression::None, bytes)
 }
 
-fn apply_captured_trailing(body: Vec<u8>, captured: Compression, strategy: CascadeStrategy) -> (Compression, Vec<u8>) {
-    let Some(threshold) = trailing_threshold(strategy, body.len()) else {
-        return (Compression::None, body);
-    };
+fn apply_trailing(bytes: Vec<u8>, strategy: CascadeStrategy) -> (Compression, Vec<u8>) {
+    match trailing_candidate(&bytes, strategy) {
+        Some(compressed) => compressed,
+        None => (Compression::None, bytes),
+    }
+}
+
+fn captured_trailing_candidate(
+    body: &[u8],
+    captured: Compression,
+    strategy: CascadeStrategy,
+) -> Option<(Compression, Vec<u8>)> {
+    let threshold = trailing_threshold(strategy, body.len())?;
     match captured {
         Compression::Lz4 => {
-            let lz4 = lz4_flex::compress_prepend_size(&body);
-            if !lz4.is_empty() && lz4.len() < threshold {
-                return (Compression::Lz4, lz4);
-            }
-            (Compression::None, body)
+            let lz4 = lz4_flex::compress_prepend_size(body);
+            (!lz4.is_empty() && lz4.len() < threshold).then_some((Compression::Lz4, lz4))
         }
         Compression::Zstd1 | Compression::Zstd3 => {
             let level = if captured == Compression::Zstd3 { 3 } else { 1 };
-            let framed = compress_zstd_framed(&body, level);
-            if !framed.is_empty() && framed.len() < threshold {
-                return (captured, framed);
-            }
-            (Compression::None, body)
+            let framed = compress_zstd_framed(body, level);
+            (!framed.is_empty() && framed.len() < threshold).then_some((captured, framed))
         }
-        Compression::Deflate | Compression::SeekableZstd | Compression::StringZstd | Compression::None => {
-            (Compression::None, body)
-        }
+        Compression::Deflate | Compression::SeekableZstd | Compression::StringZstd | Compression::None => None,
+    }
+}
+
+fn apply_captured_trailing(body: Vec<u8>, captured: Compression, strategy: CascadeStrategy) -> (Compression, Vec<u8>) {
+    match captured_trailing_candidate(&body, captured, strategy) {
+        Some(compressed) => compressed,
+        None => (Compression::None, body),
     }
 }
 
@@ -3757,7 +3854,7 @@ pub fn encode_occurred_residual(ingested: &[i64], occurred: &[i64], strategy: Ca
         bytes: out.into_bytes(),
         fsst: None,
         pipeline: PipelineId::new(Transform::OccurredResidual, Compression::None, ValueKind::I64),
-        stats: stats_for(&ColumnData::I64(ingested.to_vec())),
+        stats: i64_stats(ingested),
         uncompressed_len: 4 + inner.uncompressed_len,
     })
 }
@@ -4070,6 +4167,7 @@ fn encode_chosen_form(
     shared: Option<&[String]>,
     string_zstd: bool,
 ) -> EncodedBlock {
+    let mut trial = StringTrial::default();
     let block = encode_selected_form(
         data,
         random_access,
@@ -4078,52 +4176,63 @@ fn encode_chosen_form(
         replay_trailing,
         replay_fsst,
         shared,
+        &mut trial,
     );
     if string_zstd
         && let ColumnData::Strings(values) = data
         && (forced.is_none() || replay_trailing.is_some_and(|captured| captured != Compression::None))
-        && let Some(candidate) = string_zstd_candidate(values, strategy, shared, block.bytes.len(), block.stats)
+        && let Some(candidate) = string_zstd_candidate(values, strategy, shared, block.bytes.len(), block.stats, trial)
     {
         return candidate;
     }
     block
 }
 
-fn string_zstd_candidate(
-    values: &StringColumn,
+fn string_zstd_candidate<'a>(
+    values: &'a StringColumn,
     strategy: CascadeStrategy,
     shared: Option<&[String]>,
     current_len: usize,
     stats: BlockStats,
+    trial: StringTrial<'a>,
 ) -> Option<EncodedBlock> {
     if strategy == CascadeStrategy::NoTrailing || !cascade_level_fits(2) {
         return None;
     }
-    let present = present_values(values);
+    let present = trial.present.unwrap_or_else(|| present_values(values));
     if present.is_empty() {
         return None;
     }
     let bar = current_len.saturating_mul(STRING_ZSTD_MIN_SAVINGS_NUM) / STRING_ZSTD_MIN_SAVINGS_DEN;
     let mut best: Option<(Transform, SideStream, Compression, Vec<u8>, u64)> = None;
     let mut consider = |transform: Transform, side: SideStream, body: &[u8]| {
-        let (compression, stored) = match string_zstd::compress(transform, side, body) {
-            Some(stored) => (Compression::StringZstd, stored),
-            None => (Compression::Lz4, lz4_flex::compress_prepend_size(body)),
+        let keeps =
+            |len: usize| len != 0 && len < bar && best.as_ref().is_none_or(|(_, _, _, kept, _)| len < kept.len());
+        let (compression, stored) = match string_zstd::compress_if(transform, side, body, keeps) {
+            string_zstd::Relayout::Kept(stored) => (Compression::StringZstd, stored),
+            string_zstd::Relayout::Refused => return,
+            string_zstd::Relayout::Unavailable => {
+                let stored = lz4_flex::compress_prepend_size(body);
+                if !keeps(stored.len()) {
+                    return;
+                }
+                (Compression::Lz4, stored)
+            }
         };
-        if !stored.is_empty()
-            && stored.len() < bar
-            && best.as_ref().is_none_or(|(_, _, _, kept, _)| stored.len() < kept.len())
-        {
-            best = Some((transform, side, compression, stored, body.len() as u64));
-        }
+        best = Some((transform, side, compression, stored, body.len() as u64));
     };
     let mut raw = Writer::new();
     if encode_raw_string(values, &present, &mut raw).is_ok() {
         consider(Transform::RawString, SideStream::None, raw.bytes());
     }
-    if dictionary_trial_worthwhile(&present) {
+    let max_distinct = dictionary_trial_max_distinct(present.len());
+    let prepared = match trial.dictionary {
+        Some(prepared) => prepared.filter(|prepared| prepared.dictionary.len() <= max_distinct),
+        None => prepare_dictionary_within(&present, max_distinct),
+    };
+    if let Some(prepared) = prepared {
         let mut dictionary = Writer::new();
-        if let Ok(side) = encode_dictionary_string_with(values, &present, strategy, shared, false, &mut dictionary) {
+        if let Ok(side) = encode_prepared_dictionary(values, &prepared, strategy, shared, false, &mut dictionary) {
             consider(Transform::DictionaryString, side, dictionary.bytes());
         }
     }
@@ -4137,14 +4246,19 @@ fn string_zstd_candidate(
     })
 }
 
-fn encode_selected_form(
-    data: &ColumnData,
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is an independent selection input threaded from the public entry points"
+)]
+fn encode_selected_form<'a>(
+    data: &'a ColumnData,
     random_access: bool,
     strategy: CascadeStrategy,
     forced: Option<Transform>,
     replay_trailing: Option<Compression>,
     replay_fsst: Option<&FsstTable>,
     shared: Option<&[String]>,
+    trial: &mut StringTrial<'a>,
 ) -> EncodedBlock {
     let forced =
         forced.filter(|transform| transform_matches_kind(*transform, data) || matches!(data, ColumnData::F64(_)));
@@ -4212,8 +4326,13 @@ fn encode_selected_form(
                 transform = Transform::FsstString;
             }
             let mut encoded = match transform {
-                Transform::DictionaryString => encode_dictionary_string(values, &present, strategy, shared, &mut out)
-                    .map(|side| (side, None, Vec::new())),
+                Transform::DictionaryString => {
+                    let prepared = prepare_dictionary(&present);
+                    let encoded = encode_prepared_dictionary(values, &prepared, strategy, shared, true, &mut out)
+                        .map(|side| (side, None, Vec::new()));
+                    trial.dictionary = Some(Some(prepared));
+                    encoded
+                }
                 Transform::FsstString => encode_fsst_string(values, &present, replay_fsst, &mut out),
                 _ => encode_raw_string(values, &present, &mut out).map(|()| (SideStream::None, None, Vec::new())),
             };
@@ -4229,17 +4348,21 @@ fn encode_selected_form(
             if (forced.is_none() || replay_trailing.is_some())
                 && matches!(transform, Transform::FsstString | Transform::FsstPackedString)
                 && encoded.is_ok()
-                && (dictionary_trial_worthwhile(&present) || shared_alphabet_covers(shared, &present))
             {
-                let mut trial = Writer::new();
-                if let Ok(side) = encode_dictionary_string(values, &present, strategy, shared, &mut trial)
-                    && trial.len() < out.len()
-                {
-                    out = trial;
-                    transform = Transform::DictionaryString;
-                    encoded = Ok((side, None, Vec::new()));
-                    dictionary_by_trial = true;
+                let prepared = prepare_dictionary_within(&present, dictionary_trial_max_distinct(present.len()))
+                    .or_else(|| shared_alphabet_covers(shared, &present).then(|| prepare_dictionary(&present)));
+                if let Some(prepared) = &prepared {
+                    let mut body = Writer::new();
+                    if let Ok(side) = encode_prepared_dictionary(values, prepared, strategy, shared, true, &mut body)
+                        && body.len() < out.len()
+                    {
+                        out = body;
+                        transform = Transform::DictionaryString;
+                        encoded = Ok((side, None, Vec::new()));
+                        dictionary_by_trial = true;
+                    }
                 }
+                trial.dictionary = Some(prepared);
             }
             #[expect(
                 clippy::expect_used,
@@ -4248,6 +4371,7 @@ fn encode_selected_form(
             let parts =
                 encoded.expect("string-block arena offsets fit u32: the writer bounds a granule far below that");
             (side, fsst, frame_breaks) = parts;
+            trial.present = Some(present);
             (transform, ValueKind::String)
         }
     };
@@ -4264,17 +4388,17 @@ fn encode_selected_form(
             Transform::FsstString | Transform::FsstPackedString | Transform::DeltaBitpack | Transform::ForBitpack
         )
     {
-        let fallback = body.clone();
-        let (compression, bytes) = match replay_trailing {
-            Some(captured) => apply_captured_trailing(body, captured, strategy),
-            None => apply_trailing(body, strategy),
+        let candidate = match replay_trailing {
+            Some(captured) => captured_trailing_candidate(&body, captured, strategy),
+            None => trailing_candidate(&body, strategy),
         };
-        if compression == Compression::None
-            || bytes.len() * FSST_TRAILING_MAX_RATIO_DEN <= fallback.len() * FSST_TRAILING_MAX_RATIO_NUM
-        {
-            (compression, bytes)
-        } else {
-            (Compression::None, fallback)
+        match candidate {
+            Some((compression, bytes))
+                if bytes.len() * FSST_TRAILING_MAX_RATIO_DEN <= body.len() * FSST_TRAILING_MAX_RATIO_NUM =>
+            {
+                (compression, bytes)
+            }
+            _ => (Compression::None, body),
         }
     } else if let Some(captured) = replay_trailing {
         apply_captured_trailing(body, captured, strategy)
@@ -4470,40 +4594,19 @@ fn decode_dictionary_string_range(
     }
     let present_start = nulls.present_before(start);
     let present_end = nulls.present_before(effective_end);
+    let dictionary;
     let mut entries: Vec<&str> = Vec::new();
     let mut alphabet: Option<&[String]> = None;
-    let owned: Vec<String>;
     match side {
         SideStream::FileScopeDictionary => {
             alphabet = Some(shared.ok_or(FormatError::Structural {
                 rule: "shared-scope dictionary block without its file alphabet",
             })?);
         }
-        SideStream::FsstDictionaryValues => {
-            let dict_count = reader.u32("dictionary count")? as usize;
-            owned = read_dictionary_values(&mut reader, dict_count, side)?;
-            entries.extend(owned.iter().map(String::as_str));
-        }
         _ => {
             let dict_count = reader.u32("dictionary count")? as usize;
-            let offsets = read_offsets(&mut reader, dict_count)?;
-            let data_len = offsets.last().copied().unwrap_or(0);
-            let data = reader.take(data_len, "dictionary data")?;
-            for pair in offsets.windows(2) {
-                let (lo, hi) = match pair {
-                    [lo, hi] => (*lo, *hi),
-                    _ => continue,
-                };
-                if hi < lo {
-                    return Err(FormatError::Structural {
-                        rule: "dictionary offsets must be non-decreasing",
-                    });
-                }
-                let bytes = slice(data, lo, hi - lo, "dictionary entry")?;
-                entries.push(simdutf8::basic::from_utf8(bytes).map_err(|_| FormatError::InvalidUtf8 {
-                    what: "dictionary entry",
-                })?);
-            }
+            dictionary = DictionaryValues::read(&mut reader, dict_count, side)?;
+            entries = dictionary.entries()?;
         }
     }
     let count = reader.u32("bitpack count")? as usize;
@@ -4526,6 +4629,10 @@ fn decode_dictionary_string_range(
         merge_nulls_range(
             &nulls,
             codes.len(),
+            codes
+                .iter()
+                .map(|&code| entry_at(code).map_or(0, str::len))
+                .fold(0usize, usize::saturating_add),
             |index| {
                 codes
                     .get(index)
@@ -4542,6 +4649,9 @@ fn decode_dictionary_string_range(
         return merge_nulls_range(
             &nulls,
             present_end - present_start,
+            entry_at(0)
+                .map_or(0, str::len)
+                .saturating_mul(present_end - present_start),
             |_| {
                 entry_at(0).ok_or(FormatError::RefOutOfRange {
                     what: "dictionary code",
@@ -4618,7 +4728,13 @@ fn fsst_shared_prefix(body: &[u8]) -> Result<(usize, usize), FormatError> {
     Ok((reader.position(), count))
 }
 
-pub(crate) fn fsst_packed_as_classic(body: &[u8]) -> Result<Vec<u8>, FormatError> {
+struct FsstPackedValues<'a> {
+    arena: &'a [u8],
+    offsets: Vec<usize>,
+    prefix_len: usize,
+}
+
+fn fsst_packed_values(body: &[u8]) -> Result<FsstPackedValues<'_>, FormatError> {
     let (prefix_len, count) = fsst_shared_prefix(body)?;
     let mut reader = Reader::new(body);
     reader.take(prefix_len, "fsst prefix")?;
@@ -4629,24 +4745,41 @@ pub(crate) fn fsst_packed_as_classic(body: &[u8]) -> Result<Vec<u8>, FormatError
         });
     }
     let arena = reader.take(reader.remaining(), "fsst data")?;
-    let prefix = body.get(..prefix_len).ok_or(FormatError::Structural {
-        rule: "fsst prefix out of range",
-    })?;
-    let mut out = Writer::with_capacity(prefix_len + (count + 1) * 4 + arena.len());
-    out.put_slice(prefix);
-    out.put_u32(0);
+    let mut offsets = Vec::with_capacity(count + 1);
+    offsets.push(0usize);
     let mut offset = 0u64;
     for len in lens {
         offset = offset.saturating_add(len);
         let stored = u32::try_from(offset).map_err(|_| FormatError::Structural {
             rule: "string arena offsets exceed the u32 range the format stores",
         })?;
-        out.put_u32(stored);
+        offsets.push(stored as usize);
     }
     if offset != arena.len() as u64 {
         return Err(FormatError::Structural {
             rule: "fsst packed lengths disagree with the arena",
         });
+    }
+    Ok(FsstPackedValues {
+        arena,
+        offsets,
+        prefix_len,
+    })
+}
+
+pub(crate) fn fsst_packed_as_classic(body: &[u8]) -> Result<Vec<u8>, FormatError> {
+    let FsstPackedValues {
+        arena,
+        offsets,
+        prefix_len,
+    } = fsst_packed_values(body)?;
+    let prefix = body.get(..prefix_len).ok_or(FormatError::Structural {
+        rule: "fsst prefix out of range",
+    })?;
+    let mut out = Writer::with_capacity(prefix_len + offsets.len() * 4 + arena.len());
+    out.put_slice(prefix);
+    for offset in &offsets {
+        out.put_u32(*offset as u32);
     }
     out.put_slice(arena);
     Ok(out.into_bytes())
@@ -4690,17 +4823,20 @@ pub(crate) fn classic_fsst_view(
     )))
 }
 
+fn offsets_text_len(offsets: &[usize], data: &[u8]) -> usize {
+    let first = offsets.first().copied().unwrap_or(0);
+    let last = offsets.last().copied().unwrap_or(0);
+    last.saturating_sub(first).min(data.len())
+}
+
 fn merge_nulls_range<'a>(
     nulls: &NullStream,
     count: usize,
+    text_bytes: usize,
     value: impl Fn(usize) -> Result<&'a str, FormatError>,
     start: usize,
     end: usize,
 ) -> Result<StringColumn, FormatError> {
-    let mut text_bytes = 0usize;
-    for index in 0..count {
-        text_bytes += value(index)?.len();
-    }
     let mut result = StringColumn::with_capacity(end.saturating_sub(start), text_bytes);
     let mut next = 0usize;
     nulls.each_row_range(start, end, |row_present| {
@@ -4751,19 +4887,46 @@ fn decode_fsst_string_range(body: &[u8], start: usize, end: usize) -> Result<Str
     let present_start = header.nulls.present_before(start);
     let present_end = header.nulls.present_before(effective_end);
     let (data, offsets) = value_bytes_for_range(body, &header, present_start, present_end, "fsst data")?;
+    fsst_range_column(&header, data, &offsets, start, effective_end)
+}
+
+fn decode_fsst_packed_string_range(body: &[u8], start: usize, end: usize) -> Result<StringColumn, FormatError> {
+    let packed = fsst_packed_values(body)?;
+    let header = read_string_header(Transform::FsstString, &mut Reader::new(body))?;
+    let effective_end = end.min(header.nulls.row_count());
+    if effective_end <= start {
+        return Ok(StringColumn::new());
+    }
+    let present_start = header.nulls.present_before(start);
+    let present_end = header.nulls.present_before(effective_end);
+    let offsets = packed
+        .offsets
+        .get(present_start..=present_end)
+        .ok_or(FormatError::Truncated { what: "string offset" })?;
+    fsst_range_column(&header, packed.arena, offsets, start, effective_end)
+}
+
+fn fsst_range_column(
+    header: &StringHeader<'_>,
+    data: &[u8],
+    offsets: &[usize],
+    start: usize,
+    end: usize,
+) -> Result<StringColumn, FormatError> {
     let arena = fsst_decompress_arena(
         header.fsst()?,
         data,
-        &offsets,
+        offsets,
         "fsst value",
         "fsst offsets must be non-decreasing",
     )?;
     merge_nulls_range(
         &header.nulls,
         arena.len(),
+        arena.text.len(),
         |index| fsst_arena_value(&arena, index),
         start,
-        effective_end,
+        end,
     )
 }
 
@@ -4782,10 +4945,12 @@ fn decode_raw_string_range(body: &[u8], start: usize, end: usize) -> Result<Stri
     let present_start = header.nulls.present_before(start);
     let present_end = header.nulls.present_before(effective_end);
     let (data, offsets) = value_bytes_for_range(body, &header, present_start, present_end, "raw string data")?;
+    let raw = RawValues::validated(data, &offsets)?;
     merge_nulls_range(
         &header.nulls,
         offsets.len().saturating_sub(1),
-        |index| raw_string_value(data, &offsets, index),
+        offsets_text_len(&offsets, data),
+        |index| raw.value(&offsets, index),
         start,
         effective_end,
     )
@@ -4803,6 +4968,49 @@ fn raw_string_value<'a>(data: &'a [u8], offsets: &[usize], index: usize) -> Resu
     }
     simdutf8::basic::from_utf8(slice(data, start, end - start, "raw string")?)
         .map_err(|_| FormatError::InvalidUtf8 { what: "raw string" })
+}
+
+enum RawValues<'a> {
+    Bytes(&'a [u8]),
+    Text { base: usize, text: &'a str },
+}
+
+impl<'a> RawValues<'a> {
+    fn validated(data: &'a [u8], offsets: &[usize]) -> Result<Self, FormatError> {
+        if let Some((base, text)) = raw_values_text(data, offsets) {
+            return Ok(Self::Text { base, text });
+        }
+        for index in 0..offsets.len().saturating_sub(1) {
+            raw_string_value(data, offsets, index)?;
+        }
+        Ok(Self::Bytes(data))
+    }
+
+    fn value(&self, offsets: &[usize], index: usize) -> Result<&'a str, FormatError> {
+        match *self {
+            Self::Bytes(data) => raw_string_value(data, offsets, index),
+            Self::Text { base, text } => offsets
+                .get(index)
+                .zip(offsets.get(index + 1))
+                .and_then(|(start, end)| text.get(start.checked_sub(base)?..end.checked_sub(base)?))
+                .ok_or(FormatError::InvalidUtf8 { what: "raw string" }),
+        }
+    }
+}
+
+fn raw_values_text<'a>(data: &'a [u8], offsets: &[usize]) -> Option<(usize, &'a str)> {
+    let (first, last) = (*offsets.first()?, *offsets.last()?);
+    if offsets
+        .windows(2)
+        .any(|pair| matches!(pair, [start, end] if end < start))
+    {
+        return None;
+    }
+    let text = simdutf8::basic::from_utf8(data.get(first..last)?).ok()?;
+    offsets
+        .iter()
+        .all(|&offset| text.is_char_boundary(offset - first))
+        .then_some((first, text))
 }
 
 fn read_windowed_string_header(
@@ -4872,18 +5080,23 @@ fn decode_string_framed_range(
             merge_nulls_range(
                 &header.nulls,
                 arena.len(),
+                arena.text.len(),
                 |index| fsst_arena_value(&arena, index),
                 start,
                 effective_end,
             )
         }
-        _ => merge_nulls_range(
-            &header.nulls,
-            offsets.len().saturating_sub(1),
-            |index| raw_string_value(&data, &offsets, index),
-            start,
-            effective_end,
-        ),
+        _ => {
+            let raw = RawValues::validated(&data, &offsets)?;
+            merge_nulls_range(
+                &header.nulls,
+                offsets.len().saturating_sub(1),
+                offsets_text_len(&offsets, &data),
+                |index| raw.value(&offsets, index),
+                start,
+                effective_end,
+            )
+        }
     }
 }
 
@@ -5075,11 +5288,9 @@ pub fn decode_block_range_shared(
             (ValueKind::String, Transform::FsstString) => {
                 Ok(ColumnData::Strings(decode_fsst_string_range(body, start, end)?))
             }
-            (ValueKind::String, Transform::FsstPackedString) => Ok(ColumnData::Strings(decode_fsst_string_range(
-                &fsst_packed_as_classic(body)?,
-                start,
-                end,
-            )?)),
+            (ValueKind::String, Transform::FsstPackedString) => {
+                Ok(ColumnData::Strings(decode_fsst_packed_string_range(body, start, end)?))
+            }
             (ValueKind::String, Transform::RawString) => {
                 Ok(ColumnData::Strings(decode_raw_string_range(body, start, end)?))
             }
@@ -5142,11 +5353,16 @@ pub fn decode_block_shared_with_body(
     body: &[u8],
     shared: Option<&[String]>,
 ) -> Result<ColumnData, FormatError> {
-    if let Some((classic, body)) = classic_fsst_view(pipeline, body)? {
-        return decode_block_shared_with_body(classic, &body, shared);
+    let transform = pipeline.transform()?;
+    if transform == Transform::FsstPackedString {
+        if pipeline.value_kind()? != ValueKind::String {
+            return Err(FormatError::Structural {
+                rule: "packed fsst transform on a non-string block",
+            });
+        }
+        return Ok(ColumnData::Strings(decode_fsst_packed_string(body)?));
     }
     let mut reader = Reader::new(body);
-    let transform = pipeline.transform()?;
     match pipeline.value_kind()? {
         ValueKind::U64 => Ok(ColumnData::U64(decode_ints_with(transform, &mut reader)?)),
         ValueKind::I64 => Ok(ColumnData::I64(decode_ints_with(transform, &mut reader)?)),

@@ -5,7 +5,7 @@ use blake3::CHUNK_LEN;
 use blake3::hazmat::*;
 use rayon::prelude::*;
 
-const PARALLEL_HASH_MIN_LEN: usize = 1 << 20;
+pub(crate) const PARALLEL_HASH_MIN_LEN: usize = 1 << 20;
 
 const NODE_LEN: usize = blake3::OUT_LEN * 2;
 
@@ -151,6 +151,9 @@ pub fn build_outboard_tree_and_root(content: &[u8], chunk_group_bytes: usize) ->
 }
 
 pub fn build_outboard_tree(content: &[u8], chunk_group_bytes: usize) -> Option<Vec<u8>> {
+    if outboard_tree_bytes(content.len(), chunk_group_bytes) == 0 {
+        return None;
+    }
     build_outboard_tree_and_root(content, chunk_group_bytes).tree
 }
 
