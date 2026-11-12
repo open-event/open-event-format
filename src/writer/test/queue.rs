@@ -44,7 +44,7 @@ fn record(i: u64, epoch: u64) -> PendingRecord {
 
 #[test]
 fn a_queued_payload_comes_back_encoded_and_still_means_the_same_value() {
-    let value = VariantValue::Object(BTreeMap::from([
+    let value = VariantValue::object(BTreeMap::from([
         ("amount".to_owned(), VariantValue::Int(4_200)),
         (
             "nested".to_owned(),
@@ -69,7 +69,7 @@ fn a_queued_payload_comes_back_encoded_and_still_means_the_same_value() {
 #[test]
 fn a_corrupt_queued_payload_refuses_instead_of_travelling_on() {
     let mut original = record(0, 1);
-    original.event.payload = PayloadInput::Variant(VariantValue::Object(BTreeMap::from([(
+    original.event.payload = PayloadInput::Variant(VariantValue::object(BTreeMap::from([(
         "amount".to_owned(),
         VariantValue::Int(4_200),
     )])));

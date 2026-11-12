@@ -51,7 +51,7 @@ fn row(i: u64) -> OeRow {
                 tenant_id: TenantId::new_test_id(7),
                 trace_id_hash_low: 5,
             },
-            payload: PayloadInput::Variant(VariantValue::Object(payload)),
+            payload: PayloadInput::Variant(VariantValue::object(payload)),
             provenance: None,
             relationships: None,
             source_delivery: None,
@@ -155,7 +155,7 @@ fn time_series_file(reading: impl Fn(u64) -> f64) -> BuiltOe {
         .map(|i| {
             let mut row = row(i);
             let payload = BTreeMap::from([("used".to_owned(), VariantValue::Double(reading(i)))]);
-            row.event.payload = PayloadInput::Variant(VariantValue::Object(payload));
+            row.event.payload = PayloadInput::Variant(VariantValue::object(payload));
             row
         })
         .collect();

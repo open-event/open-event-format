@@ -120,7 +120,7 @@ fn row(i: u64, payload: StdBTreeMap<String, VariantValue>) -> OeRow {
                 schema_version: 1,
                 flags: EventFlags(0),
             },
-            payload: PayloadInput::Variant(VariantValue::Object(payload)),
+            payload: PayloadInput::Variant(VariantValue::object(payload)),
             source_schema: None,
             source_delivery: None,
             connector_delivery_hash_low: i,
@@ -819,7 +819,7 @@ fn spread_graph_file() -> BuiltOe {
             } else {
                 VariantValue::String(noise(i, 64 * 1024))
             };
-            let mut row = source_form_row(i, VariantValue::Object(StdBTreeMap::from([("blob".to_owned(), blob)])));
+            let mut row = source_form_row(i, VariantValue::object(StdBTreeMap::from([("blob".to_owned(), blob)])));
             row.external_id = Some(event_id(i));
             row
         })

@@ -63,7 +63,7 @@ pub struct EventColumns<'a> {
     event_ids: &'a [String],
     event_type: &'a [String],
     occurred: &'a [i64],
-    payload: Vec<(&'a str, &'a Column)>,
+    payload: Vec<(std::sync::Arc<str>, &'a Column)>,
     roots: Option<&'a Vec<String>>,
     source: &'a [String],
 }
@@ -82,7 +82,7 @@ impl<'a> EventColumns<'a> {
             payload: dataset
                 .columns
                 .iter()
-                .filter_map(|(name, column)| name.strip_prefix("payload.").map(|field| (field, column)))
+                .filter_map(|(name, column)| name.strip_prefix("payload.").map(|field| (field.into(), column)))
                 .collect(),
             roots,
             source: dataset.strs("source"),
@@ -97,7 +97,7 @@ impl<'a> EventColumns<'a> {
                 Column::I64(values) => VariantValue::Int(values[i]),
                 Column::Str(values) => VariantValue::String(values[i].clone()),
             };
-            fields.insert((*name).to_owned(), value);
+            fields.insert(name.clone(), value);
         }
         let relationships = match self.roots {
             Some(roots) if !roots[i].is_empty() => {

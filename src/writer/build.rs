@@ -752,7 +752,7 @@ fn collect_key_names<'a>(value: &'a VariantValue, out: &mut Vec<&'a str>) {
         }
         VariantValue::Object(fields) => {
             for (key, field_value) in fields {
-                out.push(key.as_str());
+                out.push(key);
                 collect_key_names(field_value, out);
             }
         }

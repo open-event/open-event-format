@@ -290,7 +290,7 @@ fn protobuf_maps_every_field_kind() {
         message.set_field_by_name("seen_at", Value::Message(seen_at));
         message.set_field_by_name("small", Value::F32(1.5));
     });
-    let expected = VariantValue::Object(BTreeMap::from([
+    let expected = VariantValue::object(BTreeMap::from([
         ("amount".to_owned(), VariantValue::Int(-12)),
         (
             "big".to_owned(),
@@ -303,7 +303,7 @@ fn protobuf_maps_every_field_kind() {
         ("flag".to_owned(), VariantValue::Bool(true)),
         (
             "inner".to_owned(),
-            VariantValue::Object(BTreeMap::from([(
+            VariantValue::object(BTreeMap::from([(
                 "note".to_owned(),
                 VariantValue::String("hi".to_owned()),
             )])),
@@ -311,7 +311,7 @@ fn protobuf_maps_every_field_kind() {
         ("kind".to_owned(), VariantValue::String("KIND_WON".to_owned())),
         (
             "labels".to_owned(),
-            VariantValue::Object(BTreeMap::from([
+            VariantValue::object(BTreeMap::from([
                 ("a".to_owned(), VariantValue::String("KIND_WON".to_owned())),
                 ("b".to_owned(), VariantValue::Int(7)),
             ])),
@@ -339,7 +339,7 @@ fn protobuf_omits_unset_fields_and_drops_unknown_ones() {
     body.extend_from_slice(&[0x98, 0x06, 0x01]);
     assert_eq!(
         transcode(SourceFormat::Protobuf(&descriptor), &body).unwrap(),
-        VariantValue::Object(BTreeMap::from([("amount".to_owned(), VariantValue::Int(3))]))
+        VariantValue::object(BTreeMap::from([("amount".to_owned(), VariantValue::Int(3))]))
     );
 }
 

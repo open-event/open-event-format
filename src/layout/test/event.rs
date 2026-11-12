@@ -16,7 +16,7 @@ fn tenant() -> TenantId {
 }
 
 fn payload(sequence: u64) -> VariantValue {
-    VariantValue::Object(BTreeMap::from([
+    VariantValue::object(BTreeMap::from([
         ("n".to_owned(), VariantValue::Int(sequence as i64)),
         ("text".to_owned(), VariantValue::String(format!("message {sequence}"))),
     ]))

@@ -178,7 +178,7 @@ fn row(i: u64, note: &str) -> OeRow {
                 schema_version: 2,
                 flags: EventFlags(0),
             },
-            payload: PayloadInput::Variant(VariantValue::Object(payload)),
+            payload: PayloadInput::Variant(VariantValue::object(payload)),
             source_schema: None,
             source_delivery: None,
             connector_delivery_hash_low: i,
@@ -482,7 +482,7 @@ fn graph_event_id(sn: u64) -> Vec<u8> {
 fn graph_row(sn: u64, body: &str) -> BuildRow {
     let mut row = source_form_row(
         sn,
-        VariantValue::Object(BTreeMap::from([(
+        VariantValue::object(BTreeMap::from([(
             "body".to_owned(),
             VariantValue::String(body.to_owned()),
         )])),

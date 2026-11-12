@@ -62,7 +62,7 @@ fn a_payload_without_content_or_tags_is_refused_rather_than_guessed() {
     let mut fields = BTreeMap::new();
     fields.insert("content".to_owned(), VariantValue::String("x".to_owned()));
     assert_eq!(
-        provenance.canonical_bytes(&VariantValue::Object(fields)),
+        provenance.canonical_bytes(&VariantValue::object(fields)),
         Err(ProvenanceError::PayloadShape { field: TAGS_FIELD })
     );
     assert_eq!(

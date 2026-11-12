@@ -455,7 +455,7 @@ fn freetext_row(i: u64, note: Option<&str>) -> OeRow {
                 schema_version: 1,
                 flags: EventFlags(0),
             },
-            payload: PayloadInput::Variant(VariantValue::Object(payload)),
+            payload: PayloadInput::Variant(VariantValue::object(payload)),
             source_schema: None,
             source_delivery: None,
             connector_delivery_hash_low: i,
@@ -690,7 +690,10 @@ fn mixed_payload_rows(count: u64) -> Vec<OeRow> {
         if ordinal.is_multiple_of(3)
             && let PayloadInput::Variant(VariantValue::Object(fields)) = &mut row.event.payload
         {
-            fields.insert("extra".to_owned(), VariantValue::String(format!("extra-{ordinal}")));
+            fields.insert(
+                "extra".to_owned().into(),
+                VariantValue::String(format!("extra-{ordinal}")),
+            );
         }
     }
     rows[7].event.payload = PayloadInput::ExternalRef("oej://tenant/3/blob/7".to_owned());
@@ -745,7 +748,7 @@ fn batched_reads_over_long_text_agree_and_fsst_plaintext_size_matches_decode() {
     for (ordinal, row) in rows.iter_mut().enumerate() {
         if let PayloadInput::Variant(VariantValue::Object(fields)) = &mut row.event.payload {
             fields.insert(
-                "label".to_owned(),
+                "label".to_owned().into(),
                 VariantValue::String(format!("label-{ordinal}-{}", "x".repeat(ordinal % 40))),
             );
         }
@@ -1886,7 +1889,7 @@ fn shared_string_view_dictionaries_are_prepared_lazily() {
             let PayloadInput::Variant(VariantValue::Object(payload)) = &mut row.event.payload else {
                 unreachable!("the fixture carries an object payload")
             };
-            payload.insert("kind".to_owned(), VariantValue::String(format!("k{}", i % 4)));
+            payload.insert("kind".to_owned().into(), VariantValue::String(format!("k{}", i % 4)));
             row
         })
         .collect();
@@ -2094,7 +2097,7 @@ fn decoded_block_cache_stays_within_its_budget_and_reads_stay_correct() {
             let value = file.payload(ordinal).unwrap();
             assert_eq!(
                 value,
-                PayloadRead::Value(VariantValue::Object(expected)),
+                PayloadRead::Value(VariantValue::object(expected)),
                 "pass {pass} row {ordinal}"
             );
             assert!(

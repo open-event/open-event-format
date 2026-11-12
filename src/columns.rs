@@ -467,10 +467,10 @@ impl PathStatistics {
             let Some(kind) = scalar_kind(value) else {
                 continue;
             };
-            if let Some(observation) = self.paths.get_mut(path.as_str()) {
+            if let Some(observation) = self.paths.get_mut(&**path) {
                 observation.record(kind);
             } else {
-                self.paths.entry(path.clone()).or_default().record(kind);
+                self.paths.entry(path.to_string()).or_default().record(kind);
             }
         }
     }
