@@ -93,12 +93,7 @@ pub(crate) fn row_event_id(file: &OeFile, row_ordinal: u64) -> Result<u128, Form
         .ok_or(FormatError::RefOutOfRange {
             what: "row ordinal beyond granule directory",
         })?;
-    let read = file.read_column(column_ids::EVENT_ID, granule.granule_id)?;
-    let ColumnData::U128(event_ids) = &read.data else {
-        return Err(FormatError::Structural {
-            rule: "the event id column holds 128-bit ids",
-        });
-    };
+    let event_ids = granule_event_ids(file, granule.granule_id)?;
     row_ordinal
         .checked_sub(granule.first_row_ordinal)
         .and_then(|row| usize::try_from(row).ok())
@@ -138,3 +133,25 @@ pub(crate) fn decode_plaintext(plaintext: &[u8]) -> Result<VariantValue, FormatE
 #[cfg(test)]
 #[path = "test/subject_payload.rs"]
 mod tests;
+
+/// The EVENT_ID column of `granule_id`, decoded once and reused while consecutive rows stay in the same granule.
+fn granule_event_ids(file: &OeFile, granule_id: u32) -> Result<std::sync::Arc<[u128]>, FormatError> {
+    if let Some((cached_id, ids)) = file
+        .event_ids
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        && *cached_id == granule_id
+    {
+        return Ok(ids.clone());
+    }
+    let read = file.read_column(column_ids::EVENT_ID, granule_id)?;
+    let ColumnData::U128(event_ids) = &read.data else {
+        return Err(FormatError::Structural {
+            rule: "the event id column holds 128-bit ids",
+        });
+    };
+    let ids: std::sync::Arc<[u128]> = event_ids.as_slice().into();
+    *file.event_ids.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((granule_id, ids.clone()));
+    Ok(ids)
+}

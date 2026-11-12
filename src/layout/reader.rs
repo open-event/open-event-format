@@ -1490,6 +1490,10 @@ pub struct OeFile {
     column_cache_bytes: AtomicU64,
     decoded_cache_budget: u64,
     dictionary_decodes: AtomicU64,
+    /// The last granule's decoded envelope columns, so per-row `envelope`/`event` calls in one granule decode once.
+    pub(super) envelope_columns: std::sync::Mutex<Option<(u32, Arc<super::event::EnvelopeColumns>)>>,
+    /// The last granule's EVENT_ID column, so per-row event-id lookups in one granule decode it once.
+    pub(crate) event_ids: std::sync::Mutex<Option<(u32, Arc<[u128]>)>>,
     footer: Arc<Footer>,
     granule_dictionaries: DashMap<u32, DictionarySlot, ahash::RandomState>,
     granule_dictionaries_bytes: AtomicU64,
@@ -1882,6 +1886,8 @@ impl OeFile {
             column_cache_bytes: AtomicU64::new(0),
             decoded_cache_budget,
             dictionary_decodes: AtomicU64::new(0),
+            envelope_columns: std::sync::Mutex::new(None),
+            event_ids: std::sync::Mutex::new(None),
             granule_dictionaries: DashMap::default(),
             granule_dictionaries_bytes: AtomicU64::new(0),
             graph_edges: DashMap::default(),

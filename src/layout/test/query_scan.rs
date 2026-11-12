@@ -799,7 +799,7 @@ fn a_time_ordered_scan_without_a_limit_hands_batches_over_in_visit_order() {
             &[column_ids::OCCURRED_AT],
             &all_granules(&file),
             &request,
-            |batch, row| even(batch, row),
+            even,
             |selected| {
                 sunk.push((selected.batch.granule_id, selected.rows.len()));
                 Ok(())

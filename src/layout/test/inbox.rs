@@ -135,8 +135,12 @@ impl AckWatermarks for Acks {
 struct Deletes(HashMap<u128, DeletionVector>);
 
 impl DeletesAndCorrections for Deletes {
-    fn deletion_vector(&self, _tenant_id: TenantId, file_id: u128) -> Result<Option<DeletionVector>, EntityScanError> {
-        Ok(self.0.get(&file_id).cloned())
+    fn deletion_vector(
+        &self,
+        _tenant_id: TenantId,
+        file_id: u128,
+    ) -> Result<Option<std::sync::Arc<DeletionVector>>, EntityScanError> {
+        Ok(self.0.get(&file_id).cloned().map(std::sync::Arc::new))
     }
 
     fn is_correction(&self, _tenant_id: TenantId, _point: SequencePoint) -> Result<bool, EntityScanError> {

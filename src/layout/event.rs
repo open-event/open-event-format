@@ -18,7 +18,30 @@ impl OeFile {
     pub fn envelope(&self, row_ordinal: u64) -> Result<EventEnvelope, FormatError> {
         let granule = self.granule_for_row(row_ordinal)?;
         let index = row_ordinal - granule.first_row_ordinal;
-        EnvelopeColumns::read(self, granule.granule_id)?.envelope(self, index as usize)
+        self.cached_envelope_columns(granule.granule_id)?
+            .envelope(self, index as usize)
+    }
+
+    /// Decoded envelope columns of `granule_id`, reusing the last granule's decode across calls.
+    pub(crate) fn cached_envelope_columns(
+        &self,
+        granule_id: u32,
+    ) -> Result<std::sync::Arc<EnvelopeColumns>, FormatError> {
+        if let Some((cached_id, columns)) = self
+            .envelope_columns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            && *cached_id == granule_id
+        {
+            return Ok(columns.clone());
+        }
+        let columns = std::sync::Arc::new(EnvelopeColumns::read(self, granule_id)?);
+        *self
+            .envelope_columns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((granule_id, columns.clone()));
+        Ok(columns)
     }
 
     pub fn event(&self, row_ordinal: u64) -> Result<(EventEnvelope, PayloadRead), FormatError> {
@@ -97,80 +120,129 @@ impl OeFile {
 
 impl LiveOverlaySegment {
     pub fn event(&self, row: usize) -> Result<(EventEnvelope, PayloadRead), FormatError> {
-        self.event_with_dictionary(row, &mut None)
+        OverlayRows::new(self)?.event(row)
+    }
+}
+
+/// One overlay segment's v1 columns resolved by name once, plus its variant dictionary decoded on first use, so
+/// reading many rows of a segment neither searches the schema nor re-decodes the dictionary per row.
+pub(crate) struct OverlayRows<'a> {
+    segment: &'a LiveOverlaySegment,
+    dictionary: Option<KeyDictionary>,
+    account_id: &'a StringArray,
+    account_id_hash_low: &'a UInt64Array,
+    actor_id: &'a StringArray,
+    actor_id_hash_low: &'a UInt64Array,
+    dedupe_hash_high: &'a UInt64Array,
+    dedupe_hash_low: &'a UInt64Array,
+    entity_id: &'a StringArray,
+    entity_id_hash_high: &'a UInt64Array,
+    entity_id_hash_low: &'a UInt64Array,
+    entity_type: &'a StringArray,
+    event_id: &'a FixedSizeBinaryArray,
+    event_type: &'a StringArray,
+    flags: &'a UInt32Array,
+    ingested_at: &'a TimestampNanosecondArray,
+    occurred_at: &'a TimestampNanosecondArray,
+    payload_flags: &'a UInt32Array,
+    payload_ref: &'a UInt64Array,
+    schema_version: &'a UInt32Array,
+    source: &'a StringArray,
+    stream_id: &'a UInt64Array,
+    stream_sequence: &'a UInt64Array,
+    trace_id_hash_low: &'a UInt64Array,
+}
+
+impl<'a> OverlayRows<'a> {
+    pub(crate) fn new(segment: &'a LiveOverlaySegment) -> Result<Self, FormatError> {
+        Ok(Self {
+            segment,
+            dictionary: None,
+            account_id: overlay_column(segment, "account_id")?,
+            account_id_hash_low: overlay_column(segment, "account_id_hash_low")?,
+            actor_id: overlay_column(segment, "actor_id")?,
+            actor_id_hash_low: overlay_column(segment, "actor_id_hash_low")?,
+            dedupe_hash_high: overlay_column(segment, "dedupe_hash_high")?,
+            dedupe_hash_low: overlay_column(segment, "dedupe_hash_low")?,
+            entity_id: overlay_column(segment, "entity_id")?,
+            entity_id_hash_high: overlay_column(segment, "entity_id_hash_high")?,
+            entity_id_hash_low: overlay_column(segment, "entity_id_hash_low")?,
+            entity_type: overlay_column(segment, "entity_type")?,
+            event_id: overlay_column(segment, "event_id")?,
+            event_type: overlay_column(segment, "event_type")?,
+            flags: overlay_column(segment, "flags")?,
+            ingested_at: overlay_column(segment, "ingested_at")?,
+            occurred_at: overlay_column(segment, "occurred_at")?,
+            payload_flags: overlay_column(segment, "payload_flags")?,
+            payload_ref: overlay_column(segment, "payload_ref")?,
+            schema_version: overlay_column(segment, "schema_version")?,
+            source: overlay_column(segment, "source")?,
+            stream_id: overlay_column(segment, "stream_id")?,
+            stream_sequence: overlay_column(segment, "stream_sequence")?,
+            trace_id_hash_low: overlay_column(segment, "trace_id_hash_low")?,
+        })
     }
 
-    pub(crate) fn event_with_dictionary(
-        &self,
-        row: usize,
-        dictionary: &mut Option<KeyDictionary>,
-    ) -> Result<(EventEnvelope, PayloadRead), FormatError> {
-        if row >= self.batch.num_rows() {
+    pub(crate) fn event(&mut self, row: usize) -> Result<(EventEnvelope, PayloadRead), FormatError> {
+        if row >= self.segment.batch.num_rows() {
             return Err(FormatError::RefOutOfRange { what: "overlay row" });
         }
-        let u64_at = |name| overlay_column::<UInt64Array>(self, name).map(|column| column.value(row));
-        let u32_at = |name| overlay_column::<UInt32Array>(self, name).map(|column| column.value(row));
-        let time_at = |name| {
-            overlay_column::<TimestampNanosecondArray>(self, name)
-                .map(|column| TimestampValue::from_physical_nanos(column.value(row)))
-        };
-        let text_at = |name| {
-            overlay_column::<StringArray>(self, name)
-                .map(|column| column.is_valid(row).then(|| column.value(row).to_owned()))
-        };
-        let required_text_at = |name| {
-            text_at(name)?.ok_or(FormatError::Structural {
+        let time_at = |column: &TimestampNanosecondArray| TimestampValue::from_physical_nanos(column.value(row));
+        let text_at = |column: &StringArray| column.is_valid(row).then(|| column.value(row).to_owned());
+        let required_text_at = |column: &StringArray| {
+            text_at(column).ok_or(FormatError::Structural {
                 rule: "LiveOverlay required string column holds a null",
             })
         };
-        let event_id: [u8; 16] = overlay_column::<FixedSizeBinaryArray>(self, "event_id")?
+        let event_id: [u8; 16] = self
+            .event_id
             .value(row)
             .try_into()
             .map_err(|_| FormatError::Structural {
                 rule: "event_id must be 16 bytes",
             })?;
         let envelope = EventEnvelope {
-            account_id: text_at("account_id")?,
-            account_id_hash_low: u64_at("account_id_hash_low")?,
-            actor_id: text_at("actor_id")?,
-            actor_id_hash_low: u64_at("actor_id_hash_low")?,
-            dedupe_hash_high: u64_at("dedupe_hash_high")?,
-            dedupe_hash_low: u64_at("dedupe_hash_low")?,
-            entity_id: text_at("entity_id")?,
-            entity_id_hash_high: u64_at("entity_id_hash_high")?,
-            entity_id_hash_low: u64_at("entity_id_hash_low")?,
-            entity_type: required_text_at("entity_type")?,
+            account_id: text_at(self.account_id),
+            account_id_hash_low: self.account_id_hash_low.value(row),
+            actor_id: text_at(self.actor_id),
+            actor_id_hash_low: self.actor_id_hash_low.value(row),
+            dedupe_hash_high: self.dedupe_hash_high.value(row),
+            dedupe_hash_low: self.dedupe_hash_low.value(row),
+            entity_id: text_at(self.entity_id),
+            entity_id_hash_high: self.entity_id_hash_high.value(row),
+            entity_id_hash_low: self.entity_id_hash_low.value(row),
+            entity_type: required_text_at(self.entity_type)?,
             event_id: EventId::from_uuid(Uuid::from_u128(u128::from_le_bytes(event_id))),
-            event_type: required_text_at("event_type")?,
-            flags: EventFlags(u32_at("flags")?),
-            ingested_at: time_at("ingested_at")?,
-            occurred_at: time_at("occurred_at")?,
-            schema_version: u32_at("schema_version")?,
-            source: required_text_at("source")?,
-            stream_id: StreamId(u64_at("stream_id")?),
-            stream_sequence: u64_at("stream_sequence")?,
-            tenant_id: self.meta.tenant_id,
-            trace_id_hash_low: u64_at("trace_id_hash_low")?,
+            event_type: required_text_at(self.event_type)?,
+            flags: EventFlags(self.flags.value(row)),
+            ingested_at: time_at(self.ingested_at),
+            occurred_at: time_at(self.occurred_at),
+            schema_version: self.schema_version.value(row),
+            source: required_text_at(self.source)?,
+            stream_id: StreamId(self.stream_id.value(row)),
+            stream_sequence: self.stream_sequence.value(row),
+            tenant_id: self.segment.meta.tenant_id,
+            trace_id_hash_low: self.trace_id_hash_low.value(row),
         };
-        let payload_ref = u64_at("payload_ref")?;
+        let payload_ref = self.payload_ref.value(row);
         let len = (payload_ref >> 32) as usize;
         let payload = if len == 0 {
             PayloadRead::None
         } else {
             let bytes = slice(
-                &self.meta.payload_arena,
+                &self.segment.meta.payload_arena,
                 (payload_ref & 0xFFFF_FFFF) as usize,
                 len,
                 "overlay payload",
             )?;
-            if u32_at("payload_flags")? & PAYLOAD_FLAG_EXTERNAL_REF != 0 {
+            if self.payload_flags.value(row) & PAYLOAD_FLAG_EXTERNAL_REF != 0 {
                 PayloadRead::External(String::from_utf8(bytes.to_vec()).map_err(|_| FormatError::InvalidUtf8 {
                     what: "overlay external payload reference",
                 })?)
             } else {
-                let dictionary = match dictionary {
+                let dictionary = match &mut self.dictionary {
                     Some(dictionary) => dictionary,
-                    None => dictionary.insert(decode_variant_dictionary(&self.meta.variant_dictionary)?),
+                    slot @ None => slot.insert(decode_variant_dictionary(&self.segment.meta.variant_dictionary)?),
                 };
                 PayloadRead::Value(VariantRef::new(bytes).decode(dictionary)?)
             }
@@ -243,6 +315,7 @@ fn read_strings(file: &OeFile, column_id: u32, granule_id: u32) -> Result<(Vec<u
     Ok((presence, values))
 }
 
+#[derive(Debug)]
 struct IdColumn {
     dense_index: Option<Vec<Option<u32>>>,
     values: StringColumn,
@@ -328,6 +401,7 @@ fn dictionary_entry<'a>(values: &'a [String], ids: &[u64], row: usize) -> Result
         })
 }
 
+#[derive(Debug)]
 pub(crate) struct EnvelopeColumns {
     account_id: IdColumn,
     account_id_hash_low: Vec<u64>,

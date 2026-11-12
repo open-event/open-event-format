@@ -258,8 +258,8 @@ impl WorkerCommitPipeline {
         if let Err(error) = storage.sync(self.shard) {
             let (absent, present): (Vec<StagedFrame>, Vec<StagedFrame>) = frames.into_iter().partition(|frame| {
                 storage
-                    .read(self.shard, frame.offset, frame.bytes.len() as u32)
-                    .is_ok_and(|stored| stored != frame.bytes)
+                    .read_matches(self.shard, frame.offset, &frame.bytes)
+                    .is_ok_and(|matches| !matches)
             });
             for frame in &absent {
                 self.queue.abort_flush(frame.region);
@@ -272,10 +272,10 @@ impl WorkerCommitPipeline {
 
         for frame in &frames {
             let verified = storage
-                .read(self.shard, frame.offset, frame.bytes.len() as u32)
+                .read_matches(self.shard, frame.offset, &frame.bytes)
                 .map_err(FlushError::Storage)
-                .and_then(|stored| {
-                    if stored == frame.bytes {
+                .and_then(|matches| {
+                    if matches {
                         Ok(())
                     } else {
                         Err(FlushError::Format(FormatError::Structural {

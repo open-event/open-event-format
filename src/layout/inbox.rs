@@ -42,7 +42,7 @@ pub fn read_inbox(
             &granules,
             recipient,
             acked,
-            (deleted.as_ref(), redactions.as_ref()),
+            (deleted.as_deref(), redactions.as_deref()),
             &mut events,
         )?;
     }

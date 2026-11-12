@@ -523,11 +523,7 @@ fn compaction_applies_field_redactions_and_external_deletion_vectors() {
     published.advance_head(head_id, head_id + 1).unwrap();
 
     let resolver = crate::corrections::CorrectionResolver::new([]);
-    let manifest_deletes = crate::deletion_store::ManifestDeletes {
-        corrections: &resolver,
-        manifest: &head,
-        objects: Some(&objects),
-    };
+    let manifest_deletes = crate::deletion_store::ManifestDeletes::new(&resolver, &head, Some(&objects));
     let first_file = open_built(&first);
     let scan = |low: u64, file: &OeFile, deletes: &dyn crate::layout::entity_scan::DeletesAndCorrections| {
         crate::layout::entity_scan::EntityScan {

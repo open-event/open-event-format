@@ -363,3 +363,24 @@ fn a_reader_of_a_preallocated_shard_sees_frames_appended_into_the_zero_tail() {
     assert_eq!(journal.extent(shard).unwrap(), logical + second.len() as u64);
     assert_eq!(journal.read(shard, logical, second.len() as u32).unwrap(), second);
 }
+
+#[test]
+fn read_matches_compares_stored_frames_in_chunks_without_copying_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut journal = FileJournalStorage::open(dir.path()).unwrap();
+    let shard = ShardId(1);
+    let blocks = 200 * 1024 / BLOCK + 1;
+    let mut big = frame(7, blocks);
+    journal.append(shard, &frame(1, 1)).unwrap();
+    journal.append(shard, &big).unwrap();
+    journal.sync(shard).unwrap();
+    assert_eq!(journal.read_matches(shard, BLOCK as u64, &big), Ok(true));
+    let last = big.len() - 1;
+    big[last] ^= 1;
+    assert_eq!(journal.read_matches(shard, BLOCK as u64, &big), Ok(false));
+    assert_eq!(journal.read_matches(shard, 0, &frame(2, 1)), Ok(false));
+    assert_eq!(
+        journal.read_matches(shard, 2 * BLOCK as u64, &big),
+        Err(StorageError::OutOfBounds)
+    );
+}

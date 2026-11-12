@@ -1,25 +1,30 @@
-use super::event::{EnvelopeColumns, overlay_column, read_entity_hashes, read_u64s};
+use super::event::{EnvelopeColumns, OverlayRows, overlay_column, read_entity_hashes, read_u64s};
 use super::footer::SortDirection;
 use super::reader::{OeFile, PayloadRead};
 use crate::artifacts::overlay::{LiveOverlaySegment, LiveOverlayStore};
 use crate::columns::column_ids;
 use crate::deletes::{CorrectionMetadata, CorrectionType, DeletionVector};
 use crate::error::{EntityScanError, FormatError};
-use crate::events::variant::{KeyDictionary, VariantValue};
+use crate::events::variant::VariantValue;
 use crate::events::{EventEnvelope, EventId, SequencePoint, TenantId};
 use crate::field_deletion_store::FieldRedactions;
 use arrow_array::UInt64Array;
 use hashbrown::HashMap;
 use std::ops::RangeInclusive;
+use std::sync::Arc;
 
 pub trait DeletesAndCorrections {
-    fn deletion_vector(&self, tenant_id: TenantId, file_id: u128) -> Result<Option<DeletionVector>, EntityScanError>;
+    fn deletion_vector(
+        &self,
+        tenant_id: TenantId,
+        file_id: u128,
+    ) -> Result<Option<Arc<DeletionVector>>, EntityScanError>;
 
     fn field_redactions(
         &self,
         _tenant_id: TenantId,
         _file_id: u128,
-    ) -> Result<Option<FieldRedactions>, EntityScanError> {
+    ) -> Result<Option<Arc<FieldRedactions>>, EntityScanError> {
         Ok(None)
     }
 
@@ -110,7 +115,7 @@ impl EntityScan {
         let mut reader = EventReader {
             envelopes: HashMap::new(),
             files: &files,
-            overlay_dictionaries: HashMap::new(),
+            overlay_rows: HashMap::new(),
             redactions: &redactions,
             segments: &segments,
         };
@@ -141,7 +146,7 @@ impl EntityScan {
         source: RowSource,
         event: (EventEnvelope, PayloadRead),
         deletes: &dyn DeletesAndCorrections,
-        deletion_vectors: &[Option<DeletionVector>],
+        deletion_vectors: &[Option<Arc<DeletionVector>>],
         reader: &mut EventReader<'_>,
     ) -> Result<Option<(EventEnvelope, PayloadRead)>, EntityScanError> {
         let (files, segments) = (reader.files, reader.segments);
@@ -261,12 +266,12 @@ impl EntityScan {
 struct EventReader<'a> {
     envelopes: HashMap<(usize, u32), EnvelopeColumns>,
     files: &'a [&'a OeFile],
-    overlay_dictionaries: HashMap<usize, Option<KeyDictionary>>,
-    redactions: &'a [Option<FieldRedactions>],
+    overlay_rows: HashMap<usize, OverlayRows<'a>>,
+    redactions: &'a [Option<Arc<FieldRedactions>>],
     segments: &'a [&'a LiveOverlaySegment],
 }
 
-impl EventReader<'_> {
+impl<'a> EventReader<'a> {
     fn read(&mut self, source: RowSource) -> Result<(EventEnvelope, PayloadRead), FormatError> {
         match source {
             RowSource::File {
@@ -291,20 +296,24 @@ impl EventReader<'_> {
                     .envelope(file, row_in_granule)
                     .map_err(|_| FormatError::RefOutOfRange { what: "row in granule" })?;
                 let payload = file.payload(row_ordinal)?;
-                let payload = match self.redactions.get(index).and_then(Option::as_ref) {
+                let payload = match self.redactions.get(index).and_then(Option::as_deref) {
                     Some(redactions) => redactions.redact_payload(row_ordinal, payload),
                     None => payload,
                 };
                 Ok((envelope, payload))
             }
-            RowSource::Overlay { row, segment } => self
-                .segments
-                .get(segment)
-                .copied()
-                .ok_or(FormatError::RefOutOfRange {
-                    what: "overlay segment",
-                })?
-                .event_with_dictionary(row, self.overlay_dictionaries.entry(segment).or_default()),
+            RowSource::Overlay { row, segment } => {
+                let rows = match self.overlay_rows.entry(segment) {
+                    hashbrown::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                    hashbrown::hash_map::Entry::Vacant(entry) => {
+                        let resolved = self.segments.get(segment).copied().ok_or(FormatError::RefOutOfRange {
+                            what: "overlay segment",
+                        })?;
+                        entry.insert(OverlayRows::new(resolved)?)
+                    }
+                };
+                rows.event(row)
+            }
         }
     }
 }
@@ -361,7 +370,7 @@ fn locate(
         })
 }
 
-fn is_deleted(deletion_vectors: &[Option<DeletionVector>], source: RowSource) -> bool {
+fn is_deleted(deletion_vectors: &[Option<Arc<DeletionVector>>], source: RowSource) -> bool {
     match source {
         RowSource::File { file, row_ordinal, .. } => deletion_vectors
             .get(file)
