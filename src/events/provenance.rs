@@ -5,7 +5,6 @@ use crate::error::ProvenanceError;
 use hex_simd::AsOut;
 use k256::schnorr::signature::hazmat::PrehashVerifier;
 use k256::schnorr::{Signature, VerifyingKey};
-use sha2::{Digest, Sha256};
 use std::fmt;
 use std::fmt::Write as _;
 
@@ -76,9 +75,7 @@ impl SignedEventProvenance {
     }
 
     pub fn recompute_protocol_event_id(canonical: &[u8]) -> [u8; PROTOCOL_ID_BYTES] {
-        let mut hasher = Sha256::new();
-        hasher.update(canonical);
-        hasher.finalize().into()
+        sha256_digest(canonical)
     }
 
     pub fn verify(&self, payload: &VariantValue) -> Result<(), ProvenanceError> {
@@ -112,10 +109,19 @@ pub fn verify_ed25519(
     message: &[u8],
     signature: &[u8; SIGNATURE_BYTES],
 ) -> Result<(), ProvenanceError> {
-    let key = ed25519_dalek::VerifyingKey::from_bytes(public_key).map_err(|_| ProvenanceError::MalformedKey)?;
-    let signature = ed25519_dalek::Signature::from_bytes(signature);
-    key.verify_strict(message, &signature)
-        .map_err(|_| ProvenanceError::SignatureRejected)
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        crate::security::aws_lc::ed25519_verify(public_key, message, signature)
+            .then_some(())
+            .ok_or(ProvenanceError::SignatureRejected)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let key = ed25519_dalek::VerifyingKey::from_bytes(public_key).map_err(|_| ProvenanceError::MalformedKey)?;
+        let signature = ed25519_dalek::Signature::from_bytes(signature);
+        key.verify_strict(message, &signature)
+            .map_err(|_| ProvenanceError::SignatureRejected)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -244,9 +250,15 @@ fn is_token(text: &str) -> bool {
 }
 
 pub fn sha256_digest(preimage: &[u8]) -> [u8; PROTOCOL_ID_BYTES] {
-    let mut hasher = Sha256::new();
-    hasher.update(preimage);
-    hasher.finalize().into()
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        crate::security::aws_lc::sha256(preimage)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(preimage).into()
+    }
 }
 
 pub fn hex_lower(bytes: &[u8]) -> String {

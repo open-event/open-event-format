@@ -47,7 +47,7 @@ fn payload_aead_uses_the_pinned_cipher() {
     assert_eq!(
         AeadScheme::default(),
         AeadScheme::AesGcm256,
-        "default AEAD must be AES-256-GCM (hardware-only `hardware-rust-crypto`)"
+        "default AEAD must be AES-256-GCM (AWS-LC via `aws-lc-rs`)"
     );
 
     for scheme in [AeadScheme::AesGcm256, AeadScheme::XChaCha20Poly1305] {
@@ -56,8 +56,8 @@ fn payload_aead_uses_the_pinned_cipher() {
                 assert_eq!(scheme.nonce_len(), 12, "AES-256-GCM nonce must be 96 bits (12 bytes)");
                 assert_eq!(
                     scheme.crate_name(),
-                    "hardware-rust-crypto",
-                    "must name the hardware-rust-crypto crate"
+                    "aws-lc-rs",
+                    "must name the aws-lc-rs crate"
                 );
             }
             AeadScheme::XChaCha20Poly1305 => {
@@ -68,8 +68,8 @@ fn payload_aead_uses_the_pinned_cipher() {
                 );
                 assert_eq!(
                     scheme.crate_name(),
-                    "chacha20poly1305",
-                    "must name the RustCrypto chacha20poly1305 crate"
+                    "aws-lc-rs",
+                    "must name the aws-lc-rs crate"
                 );
             }
         }

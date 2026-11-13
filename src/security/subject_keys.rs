@@ -392,9 +392,9 @@ impl SubjectKeyStore for FileSubjectKeyStore {
             }) => (self.unwrap(subject, &wrapped, scheme)?, scheme, epoch_high_water),
             None => {
                 let mut material = zeroize::Zeroizing::new([0u8; 32]);
-                getrandom::fill(material.as_mut()).map_err(|error| StorageError::Io {
+                crate::security::fill_random(material.as_mut()).ok_or_else(|| StorageError::Io {
                     op: "generate subject key",
-                    detail: error.to_string(),
+                    detail: "random source unavailable".to_owned(),
                 })?;
                 (ContentKey::new(*material), self.scheme, 0)
             }

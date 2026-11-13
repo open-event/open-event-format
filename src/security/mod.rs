@@ -1,13 +1,11 @@
 use crate::events::TenantId;
 #[cfg(target_arch = "wasm32")]
 use aes_gcm::{Aes256Gcm, Nonce as AesNonce};
+#[cfg(target_arch = "wasm32")]
 use chacha20poly1305::aead::{Aead, AeadInOut, KeyInit, Payload};
+#[cfg(target_arch = "wasm32")]
 use chacha20poly1305::{Key as XChaChaKey, XChaCha20Poly1305, XNonce};
-#[cfg(not(target_arch = "wasm32"))]
-use hardware_rust_crypto::aes_gcm::{HardwareAes256Gcm, HardwareAes256GcmKeyState};
 use hashbrown::{HashMap, HashSet};
-use hkdf::Hkdf;
-use sha2::Sha256;
 use std::fmt;
 use std::mem::size_of;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -17,6 +15,8 @@ pub use subject_fields::*;
 pub use subject_keys::*;
 pub use subject_payload::*;
 
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod aws_lc;
 mod constant;
 mod state_chunk;
 mod subject_fields;
@@ -43,9 +43,13 @@ const CONTENT_KEY_BLOCK_SEAL_INFO: &[u8] = b"open-event/content-key/block-seal/v
 const KEY_LEN: usize = 32;
 
 fn derive_wrapping_key(input_key_material: &[u8; KEY_LEN], info: &[u8]) -> Option<zeroize::Zeroizing<[u8; KEY_LEN]>> {
-    let hkdf = Hkdf::<Sha256>::new(None, input_key_material);
     let mut key = zeroize::Zeroizing::new([0u8; KEY_LEN]);
-    hkdf.expand(info, &mut *key).ok()?;
+    #[cfg(not(target_arch = "wasm32"))]
+    aws_lc::hkdf_sha256_expand(input_key_material, info, &mut key)?;
+    #[cfg(target_arch = "wasm32")]
+    hkdf::Hkdf::<sha2::Sha256>::new(None, input_key_material)
+        .expand(info, &mut *key)
+        .ok()?;
     Some(key)
 }
 
@@ -62,6 +66,14 @@ fn derive_block_subkey(
     block.copy_from_slice(&block_id.to_le_bytes());
     epoch.copy_from_slice(&key_epoch.to_le_bytes());
     derive_wrapping_key(content_key, &info)
+}
+
+/// Fills `out` from the cryptographic random source (AWS-LC natively, the platform source on wasm).
+pub(crate) fn fill_random(out: &mut [u8]) -> Option<()> {
+    #[cfg(not(target_arch = "wasm32"))]
+    return aws_lc::fill_random(out);
+    #[cfg(target_arch = "wasm32")]
+    return getrandom::fill(out).ok();
 }
 
 fn split_nonce(sealed: &[u8], scheme: AeadScheme) -> Option<(&[u8], &[u8])> {
@@ -88,33 +100,16 @@ impl AeadScheme {
 
     pub const fn crate_name(self) -> &'static str {
         match self {
-            AeadScheme::AesGcm256 => "hardware-rust-crypto",
-            AeadScheme::XChaCha20Poly1305 => "chacha20poly1305",
+            AeadScheme::AesGcm256 | AeadScheme::XChaCha20Poly1305 => "aws-lc-rs",
         }
     }
 
     pub(crate) fn seal(self, key: &[u8; KEY_LEN], nonce: &[u8], aad: &[u8], plaintext: &[u8]) -> Option<Vec<u8>> {
-        match self {
-            #[cfg(not(target_arch = "wasm32"))]
-            AeadScheme::AesGcm256 => HardwareAes256Gcm::new(key)
-                .ok()?
-                .encrypt_with_nonce(nonce, aad, plaintext)
-                .ok(),
-            #[cfg(target_arch = "wasm32")]
-            AeadScheme::AesGcm256 => {
-                let nonce: [u8; 12] = nonce.try_into().ok()?;
-                let payload = Payload { msg: plaintext, aad };
-                Aes256Gcm::new(&(*key).into())
-                    .encrypt(&AesNonce::from(nonce), payload)
-                    .ok()
-            }
-            AeadScheme::XChaCha20Poly1305 => {
-                let nonce: [u8; 24] = nonce.try_into().ok()?;
-                let key: XChaChaKey = (*key).into();
-                let payload = Payload { msg: plaintext, aad };
-                XChaCha20Poly1305::new(&key).encrypt(&XNonce::from(nonce), payload).ok()
-            }
-        }
+        let mut out = Vec::with_capacity(plaintext.len() + AEAD_TAG_LEN);
+        out.extend_from_slice(plaintext);
+        let tag = self.seal_in_place(key, nonce, aad, &mut out)?;
+        out.extend_from_slice(&tag);
+        Some(out)
     }
 
     /// Seals `data` in place: it leaves as ciphertext of the same length and the tag is returned. Same bytes as
@@ -128,10 +123,9 @@ impl AeadScheme {
     ) -> Option<[u8; AEAD_TAG_LEN]> {
         match self {
             #[cfg(not(target_arch = "wasm32"))]
-            AeadScheme::AesGcm256 => HardwareAes256GcmKeyState::new(key)
-                .ok()?
-                .seal_in_place_detached(nonce, aad, data)
-                .ok(),
+            AeadScheme::AesGcm256 => aws_lc::aes_gcm_seal_in_place(key, nonce, aad, data),
+            #[cfg(not(target_arch = "wasm32"))]
+            AeadScheme::XChaCha20Poly1305 => aws_lc::xchacha_seal_in_place(key, nonce, aad, data),
             #[cfg(target_arch = "wasm32")]
             AeadScheme::AesGcm256 => {
                 let nonce: [u8; 12] = nonce.try_into().ok()?;
@@ -140,6 +134,7 @@ impl AeadScheme {
                     .ok()?;
                 tag.as_slice().try_into().ok()
             }
+            #[cfg(target_arch = "wasm32")]
             AeadScheme::XChaCha20Poly1305 => {
                 let nonce: [u8; 24] = nonce.try_into().ok()?;
                 let key: XChaChaKey = (*key).into();
@@ -154,10 +149,9 @@ impl AeadScheme {
     pub(crate) fn open(self, key: &[u8; KEY_LEN], nonce: &[u8], aad: &[u8], ciphertext: &[u8]) -> Option<Vec<u8>> {
         match self {
             #[cfg(not(target_arch = "wasm32"))]
-            AeadScheme::AesGcm256 => HardwareAes256Gcm::new(key)
-                .ok()?
-                .decrypt_with_nonce(nonce, aad, ciphertext)
-                .ok(),
+            AeadScheme::AesGcm256 => aws_lc::aes_gcm_open(key, nonce, aad, ciphertext),
+            #[cfg(not(target_arch = "wasm32"))]
+            AeadScheme::XChaCha20Poly1305 => aws_lc::xchacha_open(key, nonce, aad, ciphertext),
             #[cfg(target_arch = "wasm32")]
             AeadScheme::AesGcm256 => {
                 let nonce: [u8; 12] = nonce.try_into().ok()?;
@@ -166,6 +160,7 @@ impl AeadScheme {
                     .decrypt(&AesNonce::from(nonce), payload)
                     .ok()
             }
+            #[cfg(target_arch = "wasm32")]
             AeadScheme::XChaCha20Poly1305 => {
                 let nonce: [u8; 24] = nonce.try_into().ok()?;
                 let key: XChaChaKey = (*key).into();
@@ -381,7 +376,7 @@ fn wrap_key_material(
     scheme: AeadScheme,
 ) -> Option<Vec<u8>> {
     let mut nonce = vec![0u8; scheme.nonce_len()];
-    getrandom::fill(&mut nonce).ok()?;
+    fill_random(&mut nonce)?;
     let ciphertext = scheme.seal(wrapping_key, &nonce, aad, material)?;
     let mut wrapped = nonce;
     wrapped.extend_from_slice(&ciphertext);

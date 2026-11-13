@@ -32,8 +32,8 @@ impl FileKeys {
     pub(crate) fn random() -> Result<Self, VectorError> {
         let mut data_key = Zeroizing::new([0u8; KEY_LEN]);
         let mut nonce_prefix = [0u8; NONCE_PREFIX_LEN];
-        getrandom::fill(data_key.as_mut()).map_err(|_| VectorError::Random)?;
-        getrandom::fill(&mut nonce_prefix).map_err(|_| VectorError::Random)?;
+        crate::security::fill_random(data_key.as_mut()).ok_or(VectorError::Random)?;
+        crate::security::fill_random(&mut nonce_prefix).ok_or(VectorError::Random)?;
         Ok(FileKeys {
             data_key,
             nonce_prefix,
@@ -89,7 +89,7 @@ impl FileKeys {
 
     pub(crate) fn header(&self, wrapping: &WrappingKey) -> Result<Vec<u8>, VectorError> {
         let mut wrap_nonce = [0u8; WRAP_NONCE_LEN];
-        getrandom::fill(&mut wrap_nonce).map_err(|_| VectorError::Random)?;
+        crate::security::fill_random(&mut wrap_nonce).ok_or(VectorError::Random)?;
         let wrapped = AeadScheme::XChaCha20Poly1305
             .seal(wrapping.bytes(), &wrap_nonce, &self.wrap_aad(), self.data_key.as_ref())
             .ok_or(VectorError::Authentication { what: "wrap data key" })?;
