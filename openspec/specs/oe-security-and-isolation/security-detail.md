@@ -33,8 +33,8 @@ Encryption granularity follows the data-class label. Columns, payload-arena rows
 Every one of the controls above — chunk-level AEAD, footer encryption, payload-arena encryption, embedding/vector-block encryption, and the per-subject content-key path — is sealed with a single pinned authenticated cipher, never a hand-rolled or unlisted one:
 
 ```text
-default       AES-256-GCM              via the hardware-only `hardware-rust-crypto` crate (AES-NI/PCLMULQDQ, ARMv8 AES/PMULL); 96-bit (12-byte) nonce
-alternative   XChaCha20-Poly1305       via the RustCrypto `chacha20poly1305` crate; 192-bit (24-byte) nonce
+default       AES-256-GCM              via AWS-LC (`aws-lc-rs`); 96-bit (12-byte) nonce
+alternative   XChaCha20-Poly1305       via AWS-LC; 192-bit (24-byte) nonce
 forbidden     any XOR / stream keystream with no Poly1305 or GMAC tag
 ```
 
