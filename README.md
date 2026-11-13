@@ -2,7 +2,7 @@
   <h1>Open Event Format</h1>
   <h3>A columnar file format and append-only journal built for event streams.<br/>Written once, queried fast, instant deletes.</h3>
   <p>
-    0.05 ms 1% time windows, 0.10 ms event-by-id lookups, and instant redactions over 1M chat events
+    0.05 ms 1% time windows, 0.09 ms event-by-id lookups, and instant redactions over 1M chat events
   </p>
   <p>
     <a href="#getting-started">Quickstart</a> •
@@ -20,11 +20,11 @@
 OE is a file format for events. Events first land in **OEJ**, an append-only journal that is the durable record, then get packed into **OE** files: immutable, self-describing column files for analytical queries. Everything is checksummed end to end, so corruption is always caught and never served.
 
 - **Built for events, not generic tables**: Every file carries a full event envelope (ids, streams, tenants, sequence numbers, timestamps, relationships) next to a schemaless variant payload, with vector columns for embeddings stored alongside events.
-- **Durable journal**: OEJ writes append-only frames, each acknowledged only after sync. 141k events/s @ 3.083 ms p99.
+- **Durable journal**: OEJ writes append-only frames, each acknowledged only after sync. 180k events/s @ 2.312 ms p99.
 - **Columnar files**: Stripes, granules and projections with per-column encodings chosen per block. Column data maps onto Arrow arrays for the query engine that embeds OE.
 - **Point lookups without a database**: Time-window and entity-hash granule filters, an external-id index, thread (root reference) lookups, IN-list pruning and boolean (AND/OR) filter planning on encoded blocks answer "latest 50 in this room" or "this event by id" without scanning.
 - **Redaction without rewrites**: Removing an event records a deletion vector of a few bytes instead of rewriting the file. Corrections and splice rewrites reuse untouched granules.
-- **Integrity end to end**: CRC-64/NVMe and BLAKE3 checksums, optional BLAKE3 proof trees, and Ed25519-signed seals. A reader verifies on open, or opens lazily and verifies what it touches.
+- **Integrity end to end**: CRC-64/NVMe and BLAKE3 checksums, optional BLAKE3 proof trees, and Ed25519-signed seals, with all native cryptography (AES-256-GCM, XChaCha20-Poly1305, HKDF-SHA-256, SHA-256, Ed25519, randomness) provided by AWS-LC. A reader verifies on open, or opens lazily and verifies what it touches.
 - **Erasure and isolation**: Crypto-shredding, subject-sealed payloads and encrypted footers with ChaCha20-Poly1305 and AES-GCM, for data that has to be forgettable.
 - **Hardened**: `unsafe` is denied outside one documented FSST call site, `unwrap`/`panic`/indexing are denied by Clippy, and every file structure has a fuzz target.
 
@@ -49,14 +49,14 @@ For comparison across a million chat events, single thread, file held in memory:
 
 | Operation | OE | Parquet | Vortex |
 | --- | --- | --- | --- |
-| 1% time window | **0.05 ms** | 2.19 ms | 0.52 ms |
-| Every reply in a thread | **0.26 ms** | 17.29 ms | 2.87 ms |
-| One event by id | **0.10 ms** | 5.07 ms | 0.68 ms |
-| Latest 50 messages in a room | **1.83 ms** | 44.62 ms | 2.14 ms |
-| Redact 1 event | **0.00 ms** | 1,960.39 ms | 2,647.15 ms |
-| Redact 1% of events | **17.66 ms** | 2,101.46 ms | 2,973.54 ms |
+| 1% time window | **0.05 ms** | 2.60 ms | 0.82 ms |
+| Every reply in a thread | **0.30 ms** | 22.27 ms | 3.21 ms |
+| One event by id | **0.09 ms** | 5.55 ms | 0.68 ms |
+| Latest 50 messages in a room | **1.91 ms** | 46.19 ms | 2.41 ms |
+| Redact 1 event | **0.00 ms** | 2,228.90 ms | 2,785.56 ms |
+| Redact 1% of events | **14.69 ms** | 2,115.93 ms | 3,112.20 ms |
 | Size per event | 55.1 bytes | **37.7 bytes** | 48.1 bytes |
-| Write | 4,864 ms | **1,131 ms** | 2,220 ms |
+| Write | 3,354 ms | **1,263 ms** | 2,237 ms |
 
 <br/>
 
