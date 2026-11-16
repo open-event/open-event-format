@@ -107,6 +107,136 @@ pub fn write_multivector_segment(
     write_segment_inner(spec, &rows, wrapping, &FileKeys::random_multivector()?, Some(offsets))
 }
 
+/// The live documents of a multivector segment: a document keeps its live token rows and disappears when none is
+/// live (deleting a document's event id deletes all its token rows).
+pub fn read_live_documents<S: SegmentSource>(
+    segment: &SegmentReader<S>,
+    deletes: Option<&SegmentDeletes>,
+) -> Result<MultivectorInput, VectorError> {
+    let offsets = segment.document_offsets().ok_or_else(|| VectorError::InvalidInput {
+        rule: "not a multivector (version 5) segment".to_owned(),
+    })?;
+    let rows = segment.read_all()?;
+    let mut out = MultivectorInput {
+        integer_columns: rows
+            .integer_columns
+            .iter()
+            .map(|(name, _)| (name.clone(), Vec::new()))
+            .collect(),
+        string_columns: rows
+            .string_columns
+            .iter()
+            .map(|(name, _)| (name.clone(), Vec::new()))
+            .collect(),
+        ..MultivectorInput::default()
+    };
+    for bounds in offsets.windows(2) {
+        let (Some(start), Some(end)) = (bounds.first(), bounds.get(1)) else {
+            continue;
+        };
+        let live: Vec<usize> = (*start..*end)
+            .filter(|row| deletes.is_none_or(|deletes| !deletes.is_deleted(*row)))
+            .filter_map(|row| usize::try_from(row).ok())
+            .collect();
+        let Some(first) = live.first().copied() else {
+            continue;
+        };
+        out.event_ids
+            .push(rows.event_ids.get(first).cloned().unwrap_or_default());
+        for ((_, into), (_, from)) in out.string_columns.iter_mut().zip(&rows.string_columns) {
+            into.push(from.get(first).cloned().unwrap_or_default());
+        }
+        for ((_, into), (_, from)) in out.integer_columns.iter_mut().zip(&rows.integer_columns) {
+            into.push(from.get(first).copied().unwrap_or_default());
+        }
+        out.documents
+            .push(live.iter().filter_map(|row| rows.vectors.get(*row).cloned()).collect());
+    }
+    Ok(out)
+}
+
+/// Merges multivector segments into one version 5 segment, keeping each document's tokens together and dropping
+/// documents with no live token. With `cluster`, documents are grouped by k-means partition of their mean token
+/// vector (see `merge_segments_clustered`).
+pub fn merge_multivector_segments<S: SegmentSource>(
+    segments: &[SegmentReader<S>],
+    deletes: &[Option<&SegmentDeletes>],
+    spec: &SegmentSpec,
+    wrapping: &WrappingKey,
+    cluster: Option<&super::ivf::PartitionParams>,
+) -> Result<Vec<u8>, VectorError> {
+    let mut merged: Option<MultivectorInput> = None;
+    for (index, segment) in segments.iter().enumerate() {
+        segment.manifest().model.require_same(&spec.model)?;
+        let input = read_live_documents(segment, deletes.get(index).copied().flatten())?;
+        match &mut merged {
+            None => merged = Some(input),
+            Some(merged) => {
+                let names = |input: &MultivectorInput| {
+                    (
+                        input
+                            .string_columns
+                            .iter()
+                            .map(|(name, _)| name.clone())
+                            .collect::<Vec<_>>(),
+                        input
+                            .integer_columns
+                            .iter()
+                            .map(|(name, _)| name.clone())
+                            .collect::<Vec<_>>(),
+                    )
+                };
+                if names(merged) != names(&input) {
+                    return Err(VectorError::InvalidInput {
+                        rule: "merged segments hold the same columns".to_owned(),
+                    });
+                }
+                merged.event_ids.extend(input.event_ids);
+                merged.documents.extend(input.documents);
+                for ((_, into), (_, from)) in merged.string_columns.iter_mut().zip(input.string_columns) {
+                    into.extend(from);
+                }
+                for ((_, into), (_, from)) in merged.integer_columns.iter_mut().zip(input.integer_columns) {
+                    into.extend(from);
+                }
+            }
+        }
+    }
+    let mut merged = merged.unwrap_or_default();
+    if let Some(params) = cluster {
+        let dimension = spec.model.dimension as usize;
+        let means: Vec<Vec<f32>> = merged
+            .documents
+            .iter()
+            .map(|tokens| super::kernel::ball_of(dimension, tokens.iter().map(Vec::as_slice)).0)
+            .collect();
+        let order = super::segment::clustered_order(&means, dimension, params);
+        fn pick<T: Clone>(values: &[T], order: &[usize]) -> Vec<T> {
+            order.iter().filter_map(|row| values.get(*row).cloned()).collect()
+        }
+        merged = MultivectorInput {
+            event_ids: pick(&merged.event_ids, &order),
+            integer_columns: merged
+                .integer_columns
+                .iter()
+                .map(|(name, values)| (name.clone(), pick(values, &order)))
+                .collect(),
+            string_columns: merged
+                .string_columns
+                .iter()
+                .map(|(name, values)| (name.clone(), pick(values, &order)))
+                .collect(),
+            documents: pick(&merged.documents, &order),
+        };
+    }
+    if merged.documents.is_empty() {
+        return Err(VectorError::InvalidInput {
+            rule: "a merged multivector segment needs a live document".to_owned(),
+        });
+    }
+    write_multivector_segment(spec, &merged, wrapping)
+}
+
 /// Exact MaxSim of `document` for `query` under `metric` (L2 similarity is `-distance²`), for reference and tests.
 pub fn max_sim(query: &[Vec<f32>], document: &[Vec<f32>], metric: VectorMetric) -> f32 {
     let similarity = |left: &[f32], right: &[f32]| -> f32 {

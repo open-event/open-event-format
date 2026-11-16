@@ -1583,7 +1583,24 @@ pub fn merge_segments_with_deletes<S: SegmentSource>(
     spec: &SegmentSpec,
     wrapping: &WrappingKey,
 ) -> Result<Vec<u8>, VectorError> {
+    if all_multivector(segments)? {
+        return super::multivector::merge_multivector_segments(segments, deletes, spec, wrapping, None);
+    }
     write_segment(spec, &merged_input(segments, deletes, spec)?, wrapping)
+}
+
+/// Whether every segment is multivector (false when none is; a mix is an error).
+fn all_multivector<S: SegmentSource>(segments: &[SegmentReader<S>]) -> Result<bool, VectorError> {
+    let multivector = segments
+        .iter()
+        .filter(|segment| segment.document_offsets().is_some())
+        .count();
+    if multivector != 0 && multivector != segments.len() {
+        return Err(VectorError::InvalidInput {
+            rule: "multivector and single-vector segments cannot be merged together".to_owned(),
+        });
+    }
+    Ok(multivector != 0)
 }
 
 /// `merge_segments_with_deletes`, writing the live rows grouped by k-means partition (`params`) instead of in
@@ -1600,6 +1617,9 @@ pub fn merge_segments_clustered<S: SegmentSource>(
     wrapping: &WrappingKey,
     params: &super::ivf::PartitionParams,
 ) -> Result<Vec<u8>, VectorError> {
+    if all_multivector(segments)? {
+        return super::multivector::merge_multivector_segments(segments, deletes, spec, wrapping, Some(params));
+    }
     let merged = merged_input(segments, deletes, spec)?;
     let order = clustered_order(&merged.vectors, spec.model.dimension as usize, params);
     write_segment(spec, &permuted(merged, &order), wrapping)
@@ -1701,11 +1721,6 @@ fn merged_input<S: SegmentSource>(
     let mut merged: Option<SegmentInput> = None;
     for (index, segment) in segments.iter().enumerate() {
         segment.manifest().model.require_same(&spec.model)?;
-        if segment.document_offsets().is_some() {
-            return Err(VectorError::InvalidInput {
-                rule: "multivector segments cannot be merged as single-vector rows".to_owned(),
-            });
-        }
         let input = segment.read_live(deletes.get(index).copied().flatten())?;
         match &mut merged {
             None => merged = Some(input),

@@ -351,11 +351,15 @@ fn multivector_segments_are_version_5_and_honour_filters_and_deletes() {
     assert!(search_multivector_segments(std::slice::from_ref(&plain), &[], &search).is_err());
     assert!(
         merge_segments(
-            std::slice::from_ref(&segment),
+            &[
+                multivector_segment(&docs, "$x", &model, VectorElement::U1),
+                segment_of(&docs[0], "$p", &model, VectorElement::U1)
+            ],
             &spec(model.clone(), vec![VectorElement::F32]),
             &key(1)
         )
-        .is_err()
+        .is_err(),
+        "multivector and plain segments do not merge together"
     );
 
     let readers = vec![segment];
@@ -539,4 +543,93 @@ fn an_unlimited_range_search_over_the_cap_is_truncated_to_the_best_hits() {
     .unwrap();
     assert!(!stats.range_truncated, "an explicit limit is not a truncation");
     assert_eq!(limited, truncated);
+}
+
+/// Merging multivector segments keeps each document's tokens together, drops deleted documents and answers MaxSim
+/// like the inputs; a clustered merge groups documents by mean token and answers the same.
+#[test]
+fn multivector_segments_merge_with_deletes() {
+    let dimension = 64;
+    let model = model(dimension, VectorMetric::Dot);
+    let parts = [documents(120, dimension, 3), documents(90, dimension, 11)];
+    let representations = vec![VectorElement::I8, VectorElement::F32];
+    let segments: Vec<_> = parts
+        .iter()
+        .enumerate()
+        .map(|(index, docs)| multivector_segment(docs, &format!("$m{index}d"), &model, VectorElement::I8))
+        .collect();
+    let gone = [(0usize, 5u64), (0, 77), (1, 0), (1, 89)];
+    let deletes: Vec<SegmentDeletes> = (0..2)
+        .map(|segment| {
+            gone.iter()
+                .filter(|(at, _)| *at == segment)
+                .fold(SegmentDeletes::new(), |deletes, (_, doc)| {
+                    deletes.with_deleted(segments[segment].document_rows(*doc).unwrap())
+                })
+        })
+        .collect();
+    let deletes: Vec<Option<&SegmentDeletes>> = deletes.iter().map(Some).collect();
+    let segment_spec = spec(model.clone(), representations);
+    let merged = SegmentReader::open(
+        merge_segments_with_deletes(&segments, &deletes, &segment_spec, &key(1)).unwrap(),
+        &key(1),
+    )
+    .unwrap();
+    let clustered = SegmentReader::open(
+        merge_segments_clustered(&segments, &deletes, &segment_spec, &key(1), &PartitionParams::default()).unwrap(),
+        &key(1),
+    )
+    .unwrap();
+    let live_tokens: usize = parts
+        .iter()
+        .enumerate()
+        .flat_map(|(segment, docs)| {
+            docs.iter()
+                .enumerate()
+                .filter(move |(doc, _)| !gone.contains(&(segment, *doc as u64)))
+                .map(|(_, tokens)| tokens.len())
+        })
+        .sum();
+    for reader in [&merged, &clustered] {
+        assert_eq!(reader.version(), SEGMENT_VERSION_MULTIVECTOR);
+        assert_eq!(reader.document_count(), 206);
+        assert_eq!(reader.row_count(), live_tokens as u64);
+        let documents = read_live_documents(reader, None).unwrap();
+        assert!(documents.event_ids.iter().all(|id| {
+            let (segment, doc) = id.trim_start_matches("$m").split_once('d').unwrap();
+            let (segment, doc): (usize, usize) = (segment.parse().unwrap(), doc.parse().unwrap());
+            documents.documents[documents.event_ids.iter().position(|other| other == id).unwrap()]
+                == parts[segment][doc]
+        }));
+    }
+    let first = read_live_documents(&merged, None).unwrap();
+    assert_eq!(first.event_ids[0], "$m0d0");
+    assert_eq!(
+        first.integer_columns[0].1[..5],
+        [0, 1, 2, 3, 4],
+        "metadata travels with documents"
+    );
+    assert_eq!(first.integer_columns[0].1[5], 6, "document 5 was deleted");
+
+    for query_index in 0..6usize {
+        let source = &parts[query_index % 2][query_index * 31 % 90];
+        let mut query: Vec<Vec<f32>> = source.iter().take(3).cloned().collect();
+        query.push(unit(9_100 + query_index as u64, dimension));
+        let search = MultivectorSearch::new(&model, &query, 10);
+        let truth = brute_max_sim(&parts, &query, VectorMetric::Dot, |segment, doc| {
+            !gone.contains(&(segment, doc as u64))
+        });
+        let (before, _) = search_multivector_segments(&segments, &deletes, &search).unwrap();
+        for reader in [&merged, &clustered] {
+            let (after, _) = search_multivector_segments(std::slice::from_ref(reader), &[], &search).unwrap();
+            assert_eq!(
+                after.iter().map(|hit| &hit.event_id).collect::<Vec<_>>(),
+                before.iter().map(|hit| &hit.event_id).collect::<Vec<_>>()
+            );
+            for (hit, (id, score)) in after.iter().zip(&truth) {
+                assert_eq!(&hit.event_id, id);
+                assert!((hit.score - score).abs() < 1e-3);
+            }
+        }
+    }
 }
