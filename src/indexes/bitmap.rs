@@ -153,7 +153,7 @@ impl RoaringRangeBitmap {
         Self { runs }
     }
 
-    pub(crate) fn union(&self, other: &Self) -> Self {
+    fn union(&self, other: &Self) -> Self {
         let mut runs: Vec<RowRange> = Vec::with_capacity(self.runs.len() + other.runs.len());
         let mut a = 0usize;
         let mut b = 0usize;
