@@ -483,3 +483,56 @@ fn pre_and_post_filtering_return_the_same_hits() {
         }
     }
 }
+
+/// Default settings (`DEFAULT_OVERSAMPLE` as the rerank patience) on tight clusters written in row order, where every
+/// member of the query's cluster has a similar RaBitQ upper bound: recall@10 stays at least 0.95 and the rerank set
+/// stays near the cluster size.
+#[test]
+fn default_settings_keep_recall_on_tight_clusters() {
+    let k = 10;
+    for (dimension, noise) in [(64u32, 0.5f32), (64, 0.2), (32, 0.3), (128, 0.2)] {
+        let vectors = clustered_in_order(64, 125, dimension, noise);
+        for metric in [VectorMetric::Cosine, VectorMetric::L2] {
+            let model = model(dimension, metric);
+            for coarse in [VectorElement::U1, VectorElement::I8] {
+                let bytes = write_segment(
+                    &spec(model.clone(), vec![coarse, VectorElement::F32]),
+                    &vectors_input(&vectors),
+                    &key(1),
+                )
+                .unwrap();
+                let segments = vec![SegmentReader::open(bytes, &key(1)).unwrap()];
+                let queries = 30;
+                let (mut found, mut reranked) = (0usize, 0u64);
+                for query_index in 0..queries {
+                    let centre = unit(5_000_000 + (query_index * 13 % 64) as u64, dimension);
+                    let direction = unit(777_000 + query_index as u64, dimension);
+                    let mut query: Vec<f32> = centre.iter().zip(&direction).map(|(c, d)| c + noise * d).collect();
+                    let norm = query.iter().map(|v| v * v).sum::<f32>().sqrt();
+                    query.iter_mut().for_each(|v| *v /= norm);
+                    let search = VectorSearch {
+                        filter: SearchFilter::default(),
+                        k,
+                        model: &model,
+                        oversample: DEFAULT_OVERSAMPLE,
+                        query: &query,
+                    };
+                    let truth = exact_top(&vectors, &query, metric, k);
+                    let (hits, stats) = search_segments_with_stats(&segments, &[], &search).unwrap();
+                    found += hits.iter().filter(|hit| truth.contains(&hit.row)).count();
+                    reranked += stats.rows_reranked;
+                }
+                let recall = found as f64 / (queries * k) as f64;
+                let mean = reranked as f64 / queries as f64;
+                println!(
+                    "d{dimension} noise {noise} {metric:?} {coarse:?}: recall@{k} {recall:.3}, reranked {mean:.1}"
+                );
+                assert!(recall >= 0.95, "d{dimension} {metric:?} {coarse:?} recall {recall}");
+                assert!(
+                    mean <= 200.0,
+                    "d{dimension} {metric:?} {coarse:?} reranked {mean} of 8000"
+                );
+            }
+        }
+    }
+}

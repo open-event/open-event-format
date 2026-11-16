@@ -27,7 +27,9 @@ pub struct VectorSearch<'a> {
     pub k: usize,
     pub model: &'a EmbeddingModel,
     /// Version 1–3 segments rerank `k × oversample` coarse candidates. Version 4 segments rerank by error bounds
-    /// and use `oversample` only as a cap of `k × oversample` reranked rows per segment; 0 means no cap.
+    /// (decreasing upper bound until it falls below the k-th exact score) and use `oversample` as a patience: a
+    /// segment stops reranking after `k × oversample` consecutive rows that did not enter its top k; 0 means no
+    /// limit. Range searches ignore it.
     pub oversample: usize,
     pub query: &'a [f32],
 }
@@ -374,7 +376,7 @@ impl<S: SegmentSource> SegmentScan<'_, S> {
                 coarse.column_id,
                 fine.column_id,
                 super::segment::BoundedSearch {
-                    cap: (self.search.oversample > 0).then_some(self.search.oversample),
+                    cap: (self.search.oversample > 0 && !self.range.is_bounded()).then_some(self.search.oversample),
                     filter,
                     k,
                     model: self.search.model,

@@ -1011,7 +1011,8 @@ impl<S: SegmentSource> SegmentReader<S> {
     /// both `threshold` (the caller's running k-th best exact score from other segments) and the k-th best lower
     /// bound seen so far. Candidates are reranked in decreasing upper bound until the next upper bound falls below
     /// the k-th best exact score, so the rerank set follows the bounds rather than a fixed `k × oversample`.
-    /// `cap`, when set, limits the rerank set to `k × cap` rows. A whole segment whose score bound is below
+    /// `cap`, when set, stops the rerank after `k × cap` consecutive rows that did not enter the top k. A whole
+    /// segment whose score bound is below
     /// `threshold` is skipped without opening a block. Older (unbounded) codes keep the fixed oversample rerank.
     pub(crate) fn search_bounded(
         &self,
@@ -1104,12 +1105,16 @@ impl<S: SegmentSource> SegmentReader<S> {
         let fine_query = self.codec.query(fine_meta.element, query);
         let fine_width = fine_meta.row_width();
         let fine_column = self.column_by_id(fine)?;
-        let limit = cap.map_or(usize::MAX, |cap| k.saturating_mul(cap.max(1)));
+        // `cap` is a patience: stop once `k × cap` consecutive reranks failed to enter the top k. Rows are reranked
+        // in decreasing upper bound, so a long run without improvement means the remaining rows are unlikely to
+        // matter, while a tight cluster whose members keep improving the result is reranked in full.
+        let patience = cap.map_or(usize::MAX, |cap| k.saturating_mul(cap.max(1)));
+        let mut since_improvement = 0usize;
         let mut exact = TopK::new(k);
         let mut opened: std::collections::HashMap<SubBlock, Zeroizing<Vec<u8>>> = std::collections::HashMap::new();
-        for (reranked, (row, upper)) in candidates.into_iter().enumerate() {
+        for (row, upper) in candidates {
             let bar = exact.threshold().map_or(threshold, |kth| kth.max(threshold));
-            if reranked >= limit || upper < bar {
+            if since_improvement >= patience || upper < bar {
                 break;
             }
             let (granule, local) = self.locate(row)?;
@@ -1124,8 +1129,11 @@ impl<S: SegmentSource> SegmentReader<S> {
                 .ok_or_else(truncated)?;
             let score = fine_query.score(bytes);
             stats.rows_reranked += 1;
-            if in_range(score) {
+            if in_range(score) && score >= bar {
+                since_improvement = 0;
                 exact.offer(ScoredRow { row, score });
+            } else {
+                since_improvement += 1;
             }
         }
         Ok(exact.into_sorted())
