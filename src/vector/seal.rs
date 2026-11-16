@@ -41,6 +41,18 @@ impl FileKeys {
         })
     }
 
+    pub(crate) fn random_multivector() -> Result<Self, VectorError> {
+        Ok(FileKeys {
+            version: SEGMENT_VERSION_MULTIVECTOR,
+            ..Self::random()?
+        })
+    }
+
+    /// Whether the footer ends with multivector document offsets.
+    pub(crate) fn multivector(&self) -> bool {
+        self.version >= SEGMENT_VERSION_MULTIVECTOR
+    }
+
     #[cfg(test)]
     pub(crate) fn random_shared_nonce() -> Result<Self, VectorError> {
         Ok(FileKeys {
@@ -139,7 +151,8 @@ impl FileKeys {
         let version = u16::from_le_bytes([header.get(4).copied().unwrap_or(0), header.get(5).copied().unwrap_or(0)]);
         if !matches!(
             version,
-            SEGMENT_VERSION
+            SEGMENT_VERSION_MULTIVECTOR
+                | SEGMENT_VERSION
                 | SEGMENT_VERSION_SUBBLOCKS
                 | SEGMENT_VERSION_GRANULE_VECTORS
                 | SEGMENT_VERSION_SHARED_NONCE

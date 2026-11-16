@@ -932,7 +932,7 @@ fn a_first_version_segment_still_reads_and_is_never_written_again() {
     assert_eq!(read.string_columns, rows.string_columns);
     assert_eq!(read.integer_columns, rows.integer_columns);
 
-    for (bytes, relabelled) in [(&legacy, 2u8), (&current, 1u8)] {
+    for (bytes, relabelled) in [(&legacy, 2u8), (&current, 1u8), (&current, 5u8)] {
         let mut bytes = bytes.clone();
         bytes[4] = relabelled;
         assert!(matches!(
@@ -941,7 +941,7 @@ fn a_first_version_segment_still_reads_and_is_never_written_again() {
         ));
     }
     let mut unknown = legacy.clone();
-    unknown[4] = 5;
+    unknown[4] = 6;
     assert!(matches!(
         SegmentReader::open(unknown, &key(1)),
         Err(VectorError::Format(_))
@@ -1216,3 +1216,6 @@ mod rabitq;
 
 #[path = "ivf.rs"]
 mod ivf;
+
+#[path = "features.rs"]
+mod features;

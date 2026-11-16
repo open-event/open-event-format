@@ -168,14 +168,14 @@ impl SegmentCodec {
         }
     }
 
-    /// An upper bound on any row's exact score in this segment (`+∞` without version 4 parameters).
-    pub(crate) fn segment_upper(&self, query: &[f32]) -> f32 {
+    /// Lower and upper bounds on any row's exact score in this segment (`±∞` without version 4 parameters).
+    pub(crate) fn segment_bounds(&self, query: &[f32]) -> (f32, f32) {
         let Some((_, params)) = &self.v4 else {
-            return f32::INFINITY;
+            return (f32::NEG_INFINITY, f32::INFINITY);
         };
         let centre = |index: usize| params.centre.get(index).copied().unwrap_or(0.0);
         let slack = 1e-4;
-        match self.metric {
+        let (lower, upper) = match self.metric {
             VectorMetric::L2 => {
                 let distance = query
                     .iter()
@@ -183,7 +183,10 @@ impl SegmentCodec {
                     .map(|(index, value)| (value - centre(index)).powi(2))
                     .sum::<f32>()
                     .sqrt();
-                -(distance - params.radius).max(0.0).powi(2) + slack
+                (
+                    -(distance + params.radius).powi(2),
+                    -(distance - params.radius).max(0.0).powi(2),
+                )
             }
             VectorMetric::Cosine | VectorMetric::Dot => {
                 let norm = query.iter().map(|value| value * value).sum::<f32>().sqrt();
@@ -192,9 +195,10 @@ impl SegmentCodec {
                     .enumerate()
                     .map(|(index, value)| value * centre(index))
                     .sum();
-                at_centre + norm * params.radius + slack
+                (at_centre - norm * params.radius, at_centre + norm * params.radius)
             }
-        }
+        };
+        (lower - slack * (1.0 + lower.abs()), upper + slack)
     }
 }
 

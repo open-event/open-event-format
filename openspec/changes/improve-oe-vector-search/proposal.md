@@ -46,6 +46,28 @@ vectorise.
   candidates, widen once, then fall back to pre-filtering) when granule statistics estimate the filter keeps at
   least 75% of rows. Results equal the pre-filter path.
 
+- Range search (issue #98 item 8a): `search_segments_in_range` with `ScoreRange { min, max }` in score order (L2
+  score is `-distance²`; `ScoreRange::l2_radius`, `l2_annulus`). `limit: None` returns every row in range, capped at
+  `MAX_RANGE_RESULTS` with `SearchStats::range_truncated`. The range minimum joins the running threshold; segments
+  (new segment lower bound from the version 4 centre and radius), partitions (new `PartitionIndex::lower_bound`) and
+  coarse rows whose lower bound exceeds the maximum are skipped; a row's lower bound raises the bar only if its upper
+  bound is within the maximum. Hits are filtered on the exact fine score. Version 1–3 coarse codes have no bounds, so
+  ranged searches score those segments on the fine column.
+- Multivector (issue #98 item 8b): vector segment version 5 = version 4 plus a footer tail of document offsets
+  (`u64` document count, then count + 1 first-token rows, starting at 0, strictly increasing, ending at the row
+  count). Each token is one row and repeats its document's event id and metadata, so filters, deletes and row reads
+  are unchanged. Only `write_multivector_segment` writes version 5; single-vector segments stay version 4 and
+  versions 1–4 read unchanged. `search_multivector_segments` scores `Σ_q max_t sim(q, t)` (MaxSim): WARP-style
+  candidate generation keeps the best `token_candidates` coarse token rows per query token by upper bound, imputes
+  the best dropped upper bound for a document missing from a query token's candidates, reranks documents exactly on
+  the fine column in decreasing imputed bound and, if the never-seen bound can still reach the k-th score, scores
+  the rest, so results equal brute-force MaxSim. `max_rerank` caps reranking (approximate). `merge_segments` refuses
+  multivector segments.
+- Hybrid (issue #98 item 8c): `reciprocal_rank_fusion` over weighted ranked id lists and `hybrid_rrf` (vector
+  `SearchHit`s + a ranked text id list), `RrfParams { k = 60, weights, limit }`. OE's text-token index is a pruning
+  filter, not a ranked text search, so the text list comes from the caller. Only the first occurrence in a list
+  counts; ties break by best rank, then list order, then event id.
+
 ## Impact
 
 - `oe-vector-columns`: segment layout version 3; older segments remain readable.

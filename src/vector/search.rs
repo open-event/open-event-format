@@ -16,7 +16,7 @@ pub struct SearchFilter {
 }
 
 impl SearchFilter {
-    fn is_empty(&self) -> bool {
+    pub(super) fn is_empty(&self) -> bool {
         self.room_ids.is_none() && self.senders.is_none() && self.time_range.is_none()
     }
 }
@@ -53,6 +53,52 @@ pub struct SearchStats {
     pub segments_post_filtered: usize,
     /// Published partition indexes that failed to load or verify and were ignored.
     pub indexes_rejected: usize,
+    /// A range search with no `k` matched more than its limit; the best `limit` hits were returned.
+    pub range_truncated: bool,
+}
+
+/// Score bounds for a range search, in the metric's score order (higher is closer). For L2 the score is
+/// `-distance²`, so a distance radius `r` is `min = -r²`; `ScoreRange::l2_radius` builds that.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ScoreRange {
+    /// Hits score at least this.
+    pub min: Option<f32>,
+    /// Hits score at most this.
+    pub max: Option<f32>,
+}
+
+impl ScoreRange {
+    /// Rows within L2 distance `radius` of the query.
+    pub fn l2_radius(radius: f32) -> Self {
+        Self {
+            min: Some(-(radius * radius)),
+            max: None,
+        }
+    }
+
+    /// Rows at L2 distance in `[inner, outer]` from the query.
+    pub fn l2_annulus(inner: f32, outer: f32) -> Self {
+        Self {
+            min: Some(-(outer * outer)),
+            max: Some(-(inner * inner)),
+        }
+    }
+
+    pub fn contains(&self, score: f32) -> bool {
+        self.min.is_none_or(|min| score >= min) && self.max.is_none_or(|max| score <= max)
+    }
+
+    fn floor(&self) -> f32 {
+        self.min.unwrap_or(f32::NEG_INFINITY)
+    }
+
+    fn ceiling(&self) -> f32 {
+        self.max.unwrap_or(f32::INFINITY)
+    }
+
+    fn is_bounded(&self) -> bool {
+        self.min.is_some() || self.max.is_some()
+    }
 }
 
 /// How a metadata filter is applied to one segment.
@@ -135,6 +181,52 @@ pub fn search_segments_indexed<S: SegmentSource>(
     search: &VectorSearch<'_>,
     options: SearchOptions,
 ) -> Result<(Vec<SearchHit>, SearchStats), VectorError> {
+    search_ranged(segments, deletes, indexes, search, ScoreRange::default(), options)
+}
+
+/// Range search: every live row (passing the filter) whose exact fine score lies in `range`, best first.
+///
+/// `limit` caps the hits like `k` (`search.k` is ignored); `None` means "all in range", capped at
+/// `MAX_RANGE_RESULTS`, with `SearchStats::range_truncated` set if more matched. Segment, partition and row
+/// bounds skip work that cannot fall in the range: a segment or partition whose upper bound is below `min` or
+/// whose lower bound is above `max`, and coarse rows likewise. Results are exact with respect to the fine
+/// representation (version 1–3 coarse codes have no bounds, so such segments are scored on the fine column).
+pub fn search_segments_in_range<S: SegmentSource>(
+    segments: &[SegmentReader<S>],
+    deletes: &[Option<&SegmentDeletes>],
+    indexes: &[Option<&PartitionIndex>],
+    search: &VectorSearch<'_>,
+    range: ScoreRange,
+    limit: Option<usize>,
+    options: SearchOptions,
+) -> Result<(Vec<SearchHit>, SearchStats), VectorError> {
+    if range.min.zip(range.max).is_some_and(|(min, max)| min > max) || range.min.is_some_and(f32::is_nan) {
+        return Err(VectorError::InvalidInput {
+            rule: "range minimum above its maximum".to_owned(),
+        });
+    }
+    let cap = limit.unwrap_or(MAX_RANGE_RESULTS);
+    let wanted = if limit.is_none() { cap.saturating_add(1) } else { cap };
+    let ranged = VectorSearch {
+        k: wanted,
+        ..search.clone()
+    };
+    let (mut hits, mut stats) = search_ranged(segments, deletes, indexes, &ranged, range, options)?;
+    if hits.len() > cap {
+        hits.truncate(cap);
+        stats.range_truncated = true;
+    }
+    Ok((hits, stats))
+}
+
+fn search_ranged<S: SegmentSource>(
+    segments: &[SegmentReader<S>],
+    deletes: &[Option<&SegmentDeletes>],
+    indexes: &[Option<&PartitionIndex>],
+    search: &VectorSearch<'_>,
+    range: ScoreRange,
+    options: SearchOptions,
+) -> Result<(Vec<SearchHit>, SearchStats), VectorError> {
     let mut stats = SearchStats::default();
     let mut hits: Vec<(usize, ScoredRow)> = Vec::new();
     for (index, segment) in segments.iter().enumerate() {
@@ -159,9 +251,11 @@ pub fn search_segments_indexed<S: SegmentSource>(
             hits.last().map_or(f32::NEG_INFINITY, |(_, row)| row.score)
         } else {
             f32::NEG_INFINITY
-        };
+        }
+        .max(range.floor());
         let scan = SegmentScan {
             options,
+            range,
             partitions: indexes.get(index).copied().flatten(),
             search,
             segment,
@@ -256,6 +350,7 @@ fn all_rows<S: SegmentSource>(segment: &SegmentReader<S>) -> [RowRange; 1] {
 /// One segment's search: an optional partition index over the bounded two-stage scan.
 struct SegmentScan<'a, S> {
     options: SearchOptions,
+    range: ScoreRange,
     partitions: Option<&'a PartitionIndex>,
     search: &'a VectorSearch<'a>,
     segment: &'a SegmentReader<S>,
@@ -285,6 +380,8 @@ impl<S: SegmentSource> SegmentScan<'_, S> {
                     model: self.search.model,
                     query: self.search.query,
                     threshold,
+                    ceiling: self.range.ceiling(),
+                    ranged: self.range.is_bounded(),
                 },
                 stats,
             )
@@ -298,14 +395,27 @@ impl<S: SegmentSource> SegmentScan<'_, S> {
         let ranked = partitions.ranked(self.search.query);
         let mut probed = vec![false; ranked.len()];
         let mut best = TopK::new(k);
+        let ceiling = self.range.ceiling();
         let mut first_round = true;
+        // Partitions entirely above a range's maximum never hold a hit.
+        for (partition, _) in &ranked {
+            if partitions.above(*partition, self.search.query, ceiling)
+                && let Some(slot) = probed.get_mut(*partition)
+            {
+                *slot = true;
+                stats.partitions_pruned += 1;
+            }
+        }
         loop {
             let bar = best.threshold().map_or(threshold, |kth| kth.max(threshold));
             let probe: Vec<usize> = if first_round {
                 partitions
                     .closest(self.search.query)
                     .into_iter()
-                    .filter(|partition| ranked.iter().any(|(p, upper)| p == partition && *upper >= bar))
+                    .filter(|partition| {
+                        !probed.get(*partition).copied().unwrap_or(true)
+                            && ranked.iter().any(|(p, upper)| p == partition && *upper >= bar)
+                    })
                     .take(self.options.nprobes.max(1))
                     .collect()
             } else {
@@ -380,13 +490,13 @@ fn sort_hits(hits: &mut [(usize, ScoredRow)]) {
 }
 
 /// The filter's allowed string values as byte sets, built once per search.
-struct AllowedValues<'a> {
+pub(super) struct AllowedValues<'a> {
     rooms: Option<HashSet<&'a [u8]>>,
     senders: Option<HashSet<&'a [u8]>>,
 }
 
 impl<'a> AllowedValues<'a> {
-    fn new(filter: &'a SearchFilter) -> Self {
+    pub(super) fn new(filter: &'a SearchFilter) -> Self {
         let set = |values: &'a Option<Vec<String>>| {
             values
                 .as_ref()
@@ -441,7 +551,7 @@ fn granule_matches<S: SegmentSource>(
     Ok(keep)
 }
 
-fn row_filter<S: SegmentSource>(
+pub(super) fn row_filter<S: SegmentSource>(
     segment: &SegmentReader<S>,
     filter: &SearchFilter,
     allowed: &AllowedValues<'_>,

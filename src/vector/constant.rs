@@ -5,6 +5,10 @@ pub const BLOCK_ALIGNMENT: usize = 64;
 pub const SEGMENT_MAGIC: &[u8; 4] = b"OEFV";
 /// Version 4: U1 columns hold RaBitQ codes and I8 columns per-dimension segment-level int8 (see `codec`).
 pub const SEGMENT_VERSION: u16 = 4;
+/// Version 5: a version 4 segment whose rows are the token vectors of multivector documents; the footer ends
+/// with the document offsets (`u64` count, then `count + 1` first-row offsets). Written only for multivector input,
+/// so single-vector segments stay version 4.
+pub const SEGMENT_VERSION_MULTIVECTOR: u16 = 5;
 pub const SEGMENT_VERSION_SUBBLOCKS: u16 = 3;
 pub const SEGMENT_VERSION_GRANULE_VECTORS: u16 = 2;
 pub const SEGMENT_VERSION_SHARED_NONCE: u16 = 1;
@@ -32,3 +36,7 @@ pub const RABITQ_EPSILON: f32 = 2.5;
 /// Sign-flip + Hadamard rounds in the RaBitQ rotation.
 pub const RABITQ_ROTATION_ROUNDS: usize = 3;
 pub(crate) const RABITQ_SEED_CONTEXT: &str = "oe 2026 vector rabitq rotation seed v1";
+/// Result cap for a range search with no `k` (`search_segments_in_range` with `limit: None`).
+pub const MAX_RANGE_RESULTS: usize = 100_000;
+/// Per-query-token coarse candidates gathered by a multivector search.
+pub const DEFAULT_TOKEN_CANDIDATES: usize = 256;

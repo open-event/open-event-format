@@ -46,7 +46,24 @@ pub(crate) fn write_segment_sealed_by(
     wrapping: &WrappingKey,
     keys: &FileKeys,
 ) -> Result<Vec<u8>, VectorError> {
+    write_segment_inner(spec, input, wrapping, keys, None)
+}
+
+/// Token rows of multivector documents: `documents[d]` is document `d`'s first row, `documents[len - 1]` the row
+/// count. `keys` must be a version 5 key set exactly when `documents` is given.
+pub(crate) fn write_segment_inner(
+    spec: &SegmentSpec,
+    input: &SegmentInput,
+    wrapping: &WrappingKey,
+    keys: &FileKeys,
+    documents: Option<Vec<u64>>,
+) -> Result<Vec<u8>, VectorError> {
     validate(spec, input)?;
+    if documents.is_some() != keys.multivector() {
+        return Err(VectorError::InvalidInput {
+            rule: "document offsets are written exactly in version 5 segments".to_owned(),
+        });
+    }
     let rows = input.event_ids.len();
     let granules: Vec<(usize, usize)> = if rows == 0 {
         vec![(0, 0)]
@@ -168,6 +185,7 @@ pub(crate) fn write_segment_sealed_by(
         centroid,
         codec: params,
         columns,
+        documents,
         granule_rows: granules.iter().map(|(start, end)| (end - start) as u32).collect(),
         manifest: SegmentManifest {
             content_hash,
@@ -269,7 +287,7 @@ pub enum ColumnStats {
 }
 
 /// A granule and the index of one sealed block within it.
-type SubBlock = (usize, usize);
+pub(super) type SubBlock = (usize, usize);
 
 /// Sealed blocks covering `rows` rows of `part_rows` each: one for an empty granule, at least one otherwise.
 fn part_count(rows: usize, part_rows: usize) -> usize {
@@ -277,11 +295,11 @@ fn part_count(rows: usize, part_rows: usize) -> usize {
 }
 
 #[derive(Debug, Clone)]
-struct StoredColumn {
+pub(super) struct StoredColumn {
     /// Per granule: its sealed blocks in row order (one, except vector columns from version 3) and its stats.
     blocks: Vec<(Vec<BlockRef>, Option<ColumnStats>)>,
     column_id: u32,
-    part_rows: usize,
+    pub(super) part_rows: usize,
     kind: ColumnKind,
     name: String,
 }
@@ -292,6 +310,8 @@ struct SegmentFooter {
     /// Version 4 only.
     codec: Option<CodecParams>,
     columns: Vec<StoredColumn>,
+    /// Version 5 only: first token row of each document, then the row count.
+    documents: Option<Vec<u64>>,
     granule_rows: Vec<u32>,
     manifest: SegmentManifest,
     vector_columns: Vec<VectorColumnMeta>,
@@ -352,10 +372,19 @@ impl SegmentFooter {
                 out.put_slice(&offset.to_le_bytes());
             }
         }
+        if let Some(documents) = &self.documents {
+            out.put_u64(documents.len().saturating_sub(1) as u64);
+            documents.iter().for_each(|offset| out.put_u64(*offset));
+        }
         out.into_bytes()
     }
 
-    fn decode(bytes: &[u8], vector_subblocks: bool, segment_codec: bool) -> Result<Self, VectorError> {
+    fn decode(
+        bytes: &[u8],
+        vector_subblocks: bool,
+        segment_codec: bool,
+        multivector: bool,
+    ) -> Result<Self, VectorError> {
         let mut reader = Reader::new(bytes);
         let manifest = SegmentManifest::decode_from(&mut reader)?;
         let granule_count = reader.u32("granule count")? as usize;
@@ -466,6 +495,23 @@ impl SegmentFooter {
         } else {
             None
         };
+        let documents = if multivector {
+            let count = reader.u64("document count")?;
+            let count = usize::try_from(count).map_err(|_| truncated())?;
+            let mut offsets = Vec::with_capacity(reader.capacity_hint(count.saturating_add(1), 8));
+            for _ in 0..=count {
+                offsets.push(reader.u64("document offset")?);
+            }
+            let ordered = offsets.windows(2).all(|pair| pair.first() < pair.get(1));
+            if offsets.first() != Some(&0) || offsets.last() != Some(&manifest.row_count) || !ordered {
+                return Err(VectorError::Format(crate::error::FormatError::Structural {
+                    rule: "multivector document offsets start at 0, increase and end at the row count",
+                }));
+            }
+            Some(offsets)
+        } else {
+            None
+        };
         if reader.remaining() != 0 {
             return Err(VectorError::Format(crate::error::FormatError::Structural {
                 rule: "vector segment footer has trailing bytes",
@@ -482,6 +528,7 @@ impl SegmentFooter {
             centroid,
             codec,
             columns,
+            documents,
             granule_rows,
             manifest,
             vector_columns,
@@ -536,6 +583,10 @@ pub(crate) struct BoundedSearch<'a> {
     pub(crate) query: &'a [f32],
     /// Rows scoring below this cannot enter the caller's result (`-∞` when nothing is known yet).
     pub(crate) threshold: f32,
+    /// Range search: rows scoring above this are excluded (`+∞` for a plain top-k search).
+    pub(crate) ceiling: f32,
+    /// Whether the search has score bounds (forces an exact fine scan for codes without bounds).
+    pub(crate) ranged: bool,
 }
 
 fn check_query_width(meta: &VectorColumnMeta, query: &[f32]) -> Result<(), VectorError> {
@@ -583,6 +634,7 @@ impl<S: SegmentSource> SegmentReader<S> {
             &keys.open(FOOTER_BLOCK_INDEX, &sealed)?,
             keys.vector_subblocks(),
             keys.segment_codec(),
+            keys.multivector(),
         )?;
         let codec = match &footer.codec {
             Some(params) => SegmentCodec::v4(&footer.manifest.model, params.clone()),
@@ -600,6 +652,16 @@ impl<S: SegmentSource> SegmentReader<S> {
     /// The segment layout version from the header.
     pub fn version(&self) -> u16 {
         self.keys.version
+    }
+
+    /// A query prepared for one representation of this segment.
+    pub(super) fn coded_query(&self, element: VectorElement, query: &[f32]) -> super::codec::CodedQuery {
+        self.codec.query(element, query)
+    }
+
+    /// Lower and upper bounds on any row's exact score (`±∞` without version 4 parameters).
+    pub(super) fn segment_bounds(&self, query: &[f32]) -> (f32, f32) {
+        self.codec.segment_bounds(query)
     }
 
     #[cfg(test)]
@@ -635,6 +697,32 @@ impl<S: SegmentSource> SegmentReader<S> {
             .take(granule)
             .map(|rows| u64::from(*rows))
             .sum()
+    }
+
+    /// Multivector (version 5) segments: the first token row of each document, then the row count.
+    pub fn document_offsets(&self) -> Option<&[u64]> {
+        self.footer.documents.as_deref()
+    }
+
+    /// Documents in a multivector segment (0 otherwise).
+    pub fn document_count(&self) -> u64 {
+        self.footer
+            .documents
+            .as_ref()
+            .map_or(0, |offsets| offsets.len().saturating_sub(1) as u64)
+    }
+
+    /// The document holding token `row` of a multivector segment.
+    pub fn document_of(&self, row: u64) -> Option<u64> {
+        let offsets = self.footer.documents.as_ref()?;
+        (row < self.row_count()).then(|| offsets.partition_point(|first| *first <= row).saturating_sub(1) as u64)
+    }
+
+    /// The token rows of `document` in a multivector segment.
+    pub fn document_rows(&self, document: u64) -> Option<std::ops::Range<u64>> {
+        let offsets = self.footer.documents.as_ref()?;
+        let index = usize::try_from(document).ok()?;
+        Some(*offsets.get(index)?..*offsets.get(index.checked_add(1)?)?)
     }
 
     pub fn centroid(&self) -> Option<&[f32]> {
@@ -884,7 +972,7 @@ impl<S: SegmentSource> SegmentReader<S> {
     }
 
     /// Calls `visit(first_row, plaintext)` for each sealed block of a column that `filter` touches, in row order.
-    fn scan_parts(
+    pub(super) fn scan_parts(
         &self,
         column_id: u32,
         filter: Option<&RoaringRangeBitmap>,
@@ -939,14 +1027,31 @@ impl<S: SegmentSource> SegmentReader<S> {
             model,
             query,
             threshold,
+            ceiling,
+            ranged,
         } = search;
+        let in_range = |score: f32| score >= threshold && score <= ceiling;
         let coarse_meta = self.vector_meta(coarse, model)?;
         let fine_meta = self.vector_meta(fine, model)?;
         check_query_width(coarse_meta, query)?;
         let coarse_query = self.codec.query(coarse_meta.element, query);
-        if coarse == fine {
+        if coarse == fine || (ranged && !coarse_query.bounded()) {
             stats.rows_scanned += filter.map_or(self.row_count(), RoaringRangeBitmap::count);
-            return self.top_k(fine, query, model, filter, k);
+            if !ranged {
+                return self.top_k(fine, query, model, filter, k);
+            }
+            let fine_query = self.codec.query(fine_meta.element, query);
+            let width = fine_meta.row_width();
+            let mut best = TopK::new(k);
+            self.scan_parts(fine, filter, |first_row, plaintext| {
+                for_each_row(width, plaintext, first_row, filter, |row, bytes| {
+                    let score = fine_query.score(bytes);
+                    if in_range(score) {
+                        best.offer(ScoredRow { row, score });
+                    }
+                });
+            })?;
+            return Ok(best.into_sorted());
         }
         if !coarse_query.bounded() {
             let wanted = k.saturating_mul(cap.unwrap_or(DEFAULT_OVERSAMPLE).max(1));
@@ -956,7 +1061,8 @@ impl<S: SegmentSource> SegmentReader<S> {
             let rows: Vec<u64> = candidates.iter().map(|row| row.row).collect();
             return self.rescore(fine, query, model, &rows);
         }
-        if self.codec.segment_upper(query) < threshold {
+        let (segment_lower, segment_upper) = self.codec.segment_bounds(query);
+        if segment_upper < threshold || segment_lower > ceiling {
             stats.segments_skipped += 1;
             return Ok(Vec::new());
         }
@@ -970,13 +1076,17 @@ impl<S: SegmentSource> SegmentReader<S> {
             for_each_row(width, plaintext, first_row, filter, |row, bytes| {
                 stats.rows_scanned += 1;
                 let estimate = coarse_query.estimate(bytes);
-                if estimate.upper < bar {
+                if estimate.upper < bar || estimate.lower > ceiling {
                     return;
                 }
-                lowers.offer(ScoredRow {
-                    row,
-                    score: estimate.lower,
-                });
+                // A row whose exact score may exceed the ceiling may be dropped, so its lower bound does not
+                // guarantee a result and cannot raise the bar.
+                if estimate.upper <= ceiling {
+                    lowers.offer(ScoredRow {
+                        row,
+                        score: estimate.lower,
+                    });
+                }
                 candidates.push((row, estimate.upper));
             });
             if let Some(lower) = lowers.threshold() {
@@ -1012,11 +1122,11 @@ impl<S: SegmentSource> SegmentReader<S> {
                 .get(&at)
                 .and_then(|plaintext| plaintext.get(local * fine_width..(local + 1) * fine_width))
                 .ok_or_else(truncated)?;
-            exact.offer(ScoredRow {
-                row,
-                score: fine_query.score(bytes),
-            });
+            let score = fine_query.score(bytes);
             stats.rows_reranked += 1;
+            if in_range(score) {
+                exact.offer(ScoredRow { row, score });
+            }
         }
         Ok(exact.into_sorted())
     }
@@ -1087,7 +1197,7 @@ impl<S: SegmentSource> SegmentReader<S> {
             .collect()
     }
 
-    fn locate(&self, row: u64) -> Result<(usize, usize), VectorError> {
+    pub(super) fn locate(&self, row: u64) -> Result<(usize, usize), VectorError> {
         let mut first = 0u64;
         for (granule, rows) in self.footer.granule_rows.iter().enumerate() {
             let rows = u64::from(*rows);
@@ -1101,7 +1211,7 @@ impl<S: SegmentSource> SegmentReader<S> {
         })
     }
 
-    fn vector_meta(&self, column_id: u32, model: &EmbeddingModel) -> Result<&VectorColumnMeta, VectorError> {
+    pub(super) fn vector_meta(&self, column_id: u32, model: &EmbeddingModel) -> Result<&VectorColumnMeta, VectorError> {
         let meta = self
             .footer
             .vector_columns
@@ -1132,7 +1242,7 @@ impl<S: SegmentSource> SegmentReader<S> {
         Ok(column)
     }
 
-    fn column_by_id(&self, column_id: u32) -> Result<&StoredColumn, VectorError> {
+    pub(super) fn column_by_id(&self, column_id: u32) -> Result<&StoredColumn, VectorError> {
         self.footer
             .columns
             .iter()
@@ -1166,7 +1276,12 @@ impl<S: SegmentSource> SegmentReader<S> {
     }
 
     /// Opens the one sealed block holding a granule's rows `part × part_rows ..`.
-    fn open_part(&self, column: &StoredColumn, granule: usize, part: usize) -> Result<Zeroizing<Vec<u8>>, VectorError> {
+    pub(super) fn open_part(
+        &self,
+        column: &StoredColumn,
+        granule: usize,
+        part: usize,
+    ) -> Result<Zeroizing<Vec<u8>>, VectorError> {
         let block = self.granule_parts(column, granule)?.get(part).ok_or_else(truncated)?;
         self.open_sealed(block)
     }
@@ -1207,6 +1322,11 @@ pub fn merge_segments_with_deletes<S: SegmentSource>(
     let mut merged: Option<SegmentInput> = None;
     for (index, segment) in segments.iter().enumerate() {
         segment.manifest().model.require_same(&spec.model)?;
+        if segment.document_offsets().is_some() {
+            return Err(VectorError::InvalidInput {
+                rule: "multivector segments cannot be merged as single-vector rows".to_owned(),
+            });
+        }
         let input = segment.read_live(deletes.get(index).copied().flatten())?;
         match &mut merged {
             None => merged = Some(input),

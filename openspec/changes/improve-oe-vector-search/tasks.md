@@ -51,3 +51,19 @@
       are fewer partitions than natural clusters (200 clusters, 90 partitions probed ~35). Filter selectivity is
       estimated from min/max granule stats only, so most string filters look unselective and are post-filtered
       first.
+- [x] Range search (`search_segments_in_range`, `ScoreRange`, `MAX_RANGE_RESULTS`, `SearchStats::range_truncated`):
+      segment lower/upper bounds (`SegmentCodec::segment_bounds`), partition lower bounds and row bounds skip work
+      outside the range. Tests: band ranges for Dot and L2 with I8 and U1 coarse codes equal brute force (recall 1.0;
+      I8 reranks ~690 rows of 28 800 scanned over 12 queries), the partition index gives the same answer, `Some(limit)`
+      returns the best of the range, an L2 radius skips the far segment, inverted ranges are rejected.
+- [x] Multivector segments (version 5 document offsets, `write_multivector_segment`, `document_offsets` /
+      `document_of` / `document_rows`) and MaxSim search (`search_multivector_segments`, `MultivectorSearch`,
+      `max_sim`). Tests: 700 documents × 2–10 tokens × 128 dims in 2 segments, Dot and L2, U1 and I8 coarse, default
+      and 3 token candidates: top-10 equals brute-force MaxSim (200/200); I8 scores ~2 300 of 42 000 tokens exactly.
+      Version 5 header, plain segments stay version 4, filters, deletes, `max_rerank`, invalid input.
+- [x] RRF (`reciprocal_rank_fusion`, `hybrid_rrf`, `RrfParams`, `DEFAULT_RRF_K`) with tests for weights, ties,
+      duplicates, limit and determinism.
+- [ ] Not done: multivector segments cannot be merged or partition-indexed for MaxSim search (`merge_segments`
+      refuses them); MaxSim search visits segments in order without a centroid ordering; RaBitQ (U1) bounds at these
+      sizes are loose, so U1 range and MaxSim searches rerank a large share of rows (still exact). Range search
+      over version 1–3 segments scans the fine column. No ranked text search exists in OE to wire into `hybrid_rrf`.

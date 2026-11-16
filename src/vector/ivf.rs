@@ -224,6 +224,32 @@ impl PartitionIndex {
     }
 
     /// Partitions ordered by decreasing upper bound, with that bound.
+    /// A lower bound on the exact score of every row in `partition` (used to skip partitions above a range's
+    /// maximum score).
+    pub fn lower_bound(&self, partition: &Partition, query: &[f32]) -> f32 {
+        let bound = match self.model.metric {
+            VectorMetric::Cosine | VectorMetric::Dot => {
+                let dot: f32 = partition.centroid.iter().zip(query).map(|(a, b)| a * b).sum();
+                let norm = query.iter().map(|v| v * v).sum::<f32>().sqrt();
+                dot - norm * partition.radius
+            }
+            VectorMetric::L2 => {
+                let distance = squared_distance(&partition.centroid, query).sqrt() + partition.radius;
+                -(distance * distance)
+            }
+        };
+        bound - 1e-4 * (1.0 + bound.abs())
+    }
+
+    /// Whether every row of partition `index` is known to score above `ceiling`.
+    pub(crate) fn above(&self, index: usize, query: &[f32], ceiling: f32) -> bool {
+        ceiling < f32::INFINITY
+            && self
+                .partitions
+                .get(index)
+                .is_some_and(|partition| self.lower_bound(partition, query) > ceiling)
+    }
+
     pub(crate) fn ranked(&self, query: &[f32]) -> Vec<(usize, f32)> {
         let mut ranked: Vec<(usize, f32)> = self
             .partitions
