@@ -43,6 +43,8 @@ pub struct SearchStats {
     pub segments_skipped: usize,
     /// Coarse rows estimated.
     pub rows_scanned: u64,
+    /// Coarse sub-blocks never opened because their stored ball bound could not reach the k-th score (or range).
+    pub subblocks_skipped: u64,
     /// Rows whose coarse upper bound survived the scan (bound-driven segments only).
     pub rows_candidate: u64,
     /// Rows scored with the fine representation.

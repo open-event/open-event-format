@@ -358,3 +358,56 @@ impl PartialEq for Ranked {
 }
 
 impl Eq for Ranked {}
+
+/// Lower and upper bounds on the score (as the kernels compute it) of any vector within `radius` of `centre`, for a
+/// query of norm `query_norm`, widened slightly for float rounding.
+pub(crate) fn ball_bounds(
+    metric: VectorMetric,
+    centre: &[f32],
+    radius: f32,
+    query: &[f32],
+    query_norm: f32,
+) -> (f32, f32) {
+    let (lower, upper) = match metric {
+        VectorMetric::Cosine | VectorMetric::Dot => {
+            let dot: f32 = centre.iter().zip(query).map(|(a, b)| a * b).sum();
+            (dot - query_norm * radius, dot + query_norm * radius)
+        }
+        VectorMetric::L2 => {
+            let distance = centre
+                .iter()
+                .zip(query)
+                .map(|(a, b)| (a - b) * (a - b))
+                .sum::<f32>()
+                .sqrt();
+            let gap = (distance - radius).max(0.0);
+            let far = distance + radius;
+            (-(far * far), -(gap * gap))
+        }
+    };
+    (lower - 1e-4 * (1.0 + lower.abs()), upper + 1e-4 * (1.0 + upper.abs()))
+}
+
+/// The centre (mean) and radius (largest distance to the centre, widened for rounding) of `rows`.
+pub(crate) fn ball_of<'a>(dimension: usize, rows: impl Iterator<Item = &'a [f32]> + Clone) -> (Vec<f32>, f32) {
+    let mut sum = vec![0f64; dimension];
+    let mut count = 0usize;
+    for row in rows.clone() {
+        sum.iter_mut().zip(row).for_each(|(t, v)| *t += f64::from(*v));
+        count += 1;
+    }
+    let centre: Vec<f32> = sum.iter().map(|t| (*t / count.max(1) as f64) as f32).collect();
+    let radius = rows
+        .map(|row| {
+            row.iter()
+                .zip(&centre)
+                .map(|(a, b)| {
+                    let d = f64::from(*a) - f64::from(*b);
+                    d * d
+                })
+                .sum::<f64>()
+                .sqrt()
+        })
+        .fold(0f64, f64::max);
+    (centre, (radius * (1.0 + 1e-4) + 1e-5) as f32)
+}

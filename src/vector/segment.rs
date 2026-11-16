@@ -204,6 +204,9 @@ pub(crate) fn write_segment_inner(
 
     file.resize(file.len().next_multiple_of(BLOCK_ALIGNMENT), 0);
     let centroid = centroid(&spec.model, &input.vectors);
+    let subblock_balls = keys
+        .segment_codec()
+        .then(|| subblock_balls(spec, &codec, &input.vectors, &granules));
     let content_hash = *blake3::hash(file.get(HEADER_LEN..).unwrap_or_default()).as_bytes();
     let footer = SegmentFooter {
         centroid,
@@ -223,6 +226,7 @@ pub(crate) fn write_segment_inner(
                 room_id: spec.room_id.clone(),
             },
         },
+        subblock_balls,
         vector_columns,
     };
     let plaintext = Zeroizing::new(footer.encode(keys.vector_subblocks()));
@@ -234,6 +238,78 @@ pub(crate) fn write_segment_inner(
     file.extend_from_slice(&(sealed.len() as u64).to_le_bytes());
     file.extend_from_slice(SEGMENT_MAGIC);
     Ok(file)
+}
+
+/// Per vector sub-block, the centre and radius of its rows as the finest representation stores them (so the ball
+/// bounds the exact scores the rerank computes).
+fn subblock_balls(
+    spec: &SegmentSpec,
+    codec: &SegmentCodec,
+    vectors: &[Vec<f32>],
+    granules: &[(usize, usize)],
+) -> Vec<(Vec<f32>, f32)> {
+    let dimension = spec.model.dimension as usize;
+    let finest = spec
+        .representations
+        .iter()
+        .copied()
+        .max_by_key(|element| element.precision());
+    let mut balls = Vec::new();
+    for (start, end) in granules {
+        for part in 0..part_count(end - start, VECTOR_SUBBLOCK_ROWS) {
+            let part_start = start + part * VECTOR_SUBBLOCK_ROWS;
+            let part_end = (part_start + VECTOR_SUBBLOCK_ROWS).min(*end);
+            let rows: Vec<Vec<f32>> = vectors
+                .get(part_start..part_end)
+                .unwrap_or_default()
+                .iter()
+                .map(|vector| match finest {
+                    Some(element @ (VectorElement::F16 | VectorElement::I8 | VectorElement::U1)) => {
+                        let mut bytes = Vec::new();
+                        codec.encode_row(element, vector, &mut bytes);
+                        codec.decode_row(element, &bytes)
+                    }
+                    _ => vector.clone(),
+                })
+                .collect();
+            balls.push(super::kernel::ball_of(dimension, rows.iter().map(Vec::as_slice)));
+        }
+    }
+    balls
+}
+
+/// Rewrites a version 4+ segment's footer without the sub-block ball tail, as segments written before it had none.
+#[cfg(test)]
+pub(crate) fn strip_subblock_balls(bytes: &[u8], wrapping: &WrappingKey) -> Result<Vec<u8>, VectorError> {
+    let reader = SegmentReader::open(bytes, wrapping)?;
+    let mut footer = reader.footer.clone();
+    footer.subblock_balls = None;
+    let trailer = bytes.len().checked_sub(TRAILER_LEN).ok_or_else(truncated)?;
+    let footer_offset = usize::try_from(u64::from_le_bytes(array8(
+        bytes.get(trailer..trailer + 8).unwrap_or_default(),
+    )))
+    .map_err(|_| truncated())?;
+    let sealed = reader
+        .keys
+        .seal(FOOTER_BLOCK_INDEX, &footer.encode(reader.keys.vector_subblocks()))?;
+    let mut out = bytes.get(..footer_offset).ok_or_else(truncated)?.to_vec();
+    out.extend_from_slice(&sealed);
+    out.extend_from_slice(&(footer_offset as u64).to_le_bytes());
+    out.extend_from_slice(&(sealed.len() as u64).to_le_bytes());
+    out.extend_from_slice(SEGMENT_MAGIC);
+    Ok(out)
+}
+
+#[cfg(test)]
+fn array8(bytes: &[u8]) -> [u8; 8] {
+    bytes.try_into().unwrap_or([0; 8])
+}
+
+#[cfg(test)]
+impl<S> SegmentReader<S> {
+    pub(crate) fn has_subblock_balls(&self) -> bool {
+        self.footer.subblock_balls.is_some()
+    }
 }
 
 pub fn rewrap_segment(bytes: &[u8], old: &WrappingKey, new: &WrappingKey) -> Result<Vec<u8>, VectorError> {
@@ -312,6 +388,16 @@ pub enum ColumnStats {
 
 /// A granule and the index of one sealed block within it.
 pub(super) type SubBlock = (usize, usize);
+
+/// One sealed block of a column with score bounds for its rows.
+#[derive(Debug, Clone, Copy)]
+struct PartRef {
+    first_row: u64,
+    granule: usize,
+    lower: f32,
+    part: usize,
+    upper: f32,
+}
 /// Opened (decrypted) blocks by `(column id, granule, part)`, shared by the probe rounds of one segment search so
 /// no block is decrypted twice.
 pub(crate) type PartCache =
@@ -342,8 +428,14 @@ struct SegmentFooter {
     documents: Option<Vec<u64>>,
     granule_rows: Vec<u32>,
     manifest: SegmentManifest,
+    /// Optional footer tail (version 4 and later): per vector sub-block, in row order, the centre and radius of
+    /// its finest-representation rows. Lets a scan skip sub-blocks whose score bound cannot reach the k-th score.
+    subblock_balls: Option<Vec<(Vec<f32>, f32)>>,
     vector_columns: Vec<VectorColumnMeta>,
 }
+
+/// Footer tail tag for `SegmentFooter::subblock_balls`.
+const FOOTER_TAIL_SUBBLOCK_BALLS: u8 = 1;
 
 impl SegmentFooter {
     fn encode(&self, vector_subblocks: bool) -> Vec<u8> {
@@ -403,6 +495,14 @@ impl SegmentFooter {
         if let Some(documents) = &self.documents {
             out.put_u64(documents.len().saturating_sub(1) as u64);
             documents.iter().for_each(|offset| out.put_u64(*offset));
+        }
+        if let Some(balls) = &self.subblock_balls {
+            out.put_u8(FOOTER_TAIL_SUBBLOCK_BALLS);
+            out.put_u32(balls.len() as u32);
+            for (centre, radius) in balls {
+                centre.iter().for_each(|value| out.put_slice(&value.to_le_bytes()));
+                out.put_slice(&radius.to_le_bytes());
+            }
         }
         out.into_bytes()
     }
@@ -540,6 +640,35 @@ impl SegmentFooter {
         } else {
             None
         };
+        let mut subblock_balls = None;
+        if segment_codec && reader.remaining() != 0 {
+            let structural = |rule| VectorError::Format(crate::error::FormatError::Structural { rule });
+            if reader.u8("footer tail tag")? != FOOTER_TAIL_SUBBLOCK_BALLS {
+                return Err(structural("unknown vector segment footer tail"));
+            }
+            let count = reader.u32("sub-block ball count")? as usize;
+            let expected: usize = granule_rows
+                .iter()
+                .map(|rows| part_count(*rows as usize, VECTOR_SUBBLOCK_ROWS))
+                .sum();
+            if count != expected {
+                return Err(structural("one sub-block ball per vector sub-block"));
+            }
+            let dimension = manifest.model.dimension as usize;
+            let mut balls = Vec::with_capacity(reader.capacity_hint(count, 4 * dimension + 4));
+            for _ in 0..count {
+                let mut centre = Vec::with_capacity(dimension);
+                for _ in 0..dimension {
+                    centre.push(f32::from_le_bytes(array4(reader.take(4, "sub-block centre")?)));
+                }
+                let radius = f32::from_le_bytes(array4(reader.take(4, "sub-block radius")?));
+                if !radius.is_finite() || radius < 0.0 || centre.iter().any(|value| !value.is_finite()) {
+                    return Err(structural("sub-block ball is finite"));
+                }
+                balls.push((centre, radius));
+            }
+            subblock_balls = Some(balls);
+        }
         if reader.remaining() != 0 {
             return Err(VectorError::Format(crate::error::FormatError::Structural {
                 rule: "vector segment footer has trailing bytes",
@@ -559,6 +688,7 @@ impl SegmentFooter {
             documents,
             granule_rows,
             manifest,
+            subblock_balls,
             vector_columns,
         };
         if footer.granule_rows.iter().map(|rows| u64::from(*rows)).sum::<u64>() != footer.manifest.row_count
@@ -1006,26 +1136,22 @@ impl<S: SegmentSource> SegmentReader<S> {
         &self,
         column_id: u32,
         filter: Option<&RoaringRangeBitmap>,
-        visit: impl FnMut(u64, &[u8]),
-    ) -> Result<(), VectorError> {
-        self.scan_parts_with(column_id, filter, None, |_, _| true, visit)
-    }
-
-    /// `scan_parts`, skipping blocks for which `keep(first_row, rows)` is false and reusing (and filling) `cache`.
-    pub(super) fn scan_parts_with(
-        &self,
-        column_id: u32,
-        filter: Option<&RoaringRangeBitmap>,
-        cache: Option<&PartCache>,
-        mut keep: impl FnMut(u64, u64) -> bool,
         mut visit: impl FnMut(u64, &[u8]),
     ) -> Result<(), VectorError> {
         let column = self.column_by_id(column_id)?;
+        for part in self.parts_touched(column, filter) {
+            visit(part.first_row, &self.open_part(column, part.granule, part.part)?);
+        }
+        Ok(())
+    }
+
+    /// The blocks of `column` that `filter` touches, in row order, with unbounded scores.
+    fn parts_touched(&self, column: &StoredColumn, filter: Option<&RoaringRangeBitmap>) -> Vec<PartRef> {
         let part_rows = column.part_rows as u64;
+        let mut parts = Vec::new();
         let mut granule_first = 0u64;
         for granule in 0..self.granule_count() {
-            let granule_rows = self.granule_rows(granule) as u64;
-            let granule_end = granule_first + granule_rows;
+            let granule_end = granule_first + self.granule_rows(granule) as u64;
             let mut first_row = granule_first;
             let mut part = 0;
             while first_row < granule_end {
@@ -1036,15 +1162,21 @@ impl<S: SegmentSource> SegmentReader<S> {
                         .get(ranges.partition_point(|range| range.end <= first_row))
                         .is_some_and(|range| range.start < first_row + rows)
                 });
-                if wanted && keep(first_row, rows) {
-                    visit(first_row, &self.cached_part(column, granule, part, cache)?);
+                if wanted {
+                    parts.push(PartRef {
+                        first_row,
+                        granule,
+                        lower: f32::NEG_INFINITY,
+                        part,
+                        upper: f32::INFINITY,
+                    });
                 }
                 first_row += rows;
                 part += 1;
             }
             granule_first = granule_end;
         }
-        Ok(())
+        parts
     }
 
     /// `open_part` through an optional cache of opened blocks.
@@ -1131,70 +1263,128 @@ impl<S: SegmentSource> SegmentReader<S> {
             return Ok(Vec::new());
         }
 
+        let local_cache = PartCache::default();
+        let shared = cache;
+        let cache = shared.unwrap_or(&local_cache);
+        let fine_query = self.codec.query(fine_meta.element, query);
+        let fine_width = fine_meta.row_width();
+        let fine_column = self.column_by_id(fine)?;
+        let mut seeded: std::collections::HashMap<u64, f32> = std::collections::HashMap::new();
         let width = coarse_meta.row_width();
         let mut lowers = TopK::new(k);
         let mut bar = threshold;
         let mut candidates: Vec<(u64, f32)> = Vec::new();
         let mut prune_at = k.saturating_mul(4).saturating_add(1024);
-        self.scan_parts_with(
-            coarse,
-            filter,
-            cache,
-            |_, _| true,
-            |first_row, plaintext| {
-                for_each_row(width, plaintext, first_row, filter, |row, bytes| {
-                    stats.rows_scanned += 1;
-                    let estimate = coarse_query.estimate(bytes);
-                    if estimate.upper < bar || estimate.lower > ceiling {
-                        return;
-                    }
-                    // A row whose exact score may exceed the ceiling may be dropped, so its lower bound does not
-                    // guarantee a result and cannot raise the bar.
-                    if estimate.upper <= ceiling {
-                        lowers.offer(ScoredRow {
-                            row,
-                            score: estimate.lower,
-                        });
-                    }
-                    candidates.push((row, estimate.upper));
-                });
-                if let Some(lower) = lowers.threshold() {
-                    bar = bar.max(lower);
+        // Visit coarse sub-blocks best ball bound first (row order without balls), skipping those whose ball
+        // cannot reach the bar: on clustered rows the bar rises within the first few sub-blocks.
+        let coarse_column = self.column_by_id(coarse)?;
+        let mut parts = self.parts_touched(coarse_column, filter);
+        let balls = self
+            .footer
+            .subblock_balls
+            .as_ref()
+            .filter(|_| coarse_column.part_rows == VECTOR_SUBBLOCK_ROWS);
+        if let Some(balls) = balls {
+            let norm = query.iter().map(|v| v * v).sum::<f32>().sqrt();
+            for part in &mut parts {
+                if let Some((centre, radius)) = balls.get((part.first_row / VECTOR_SUBBLOCK_ROWS as u64) as usize) {
+                    (part.lower, part.upper) = super::kernel::ball_bounds(model.metric, centre, *radius, query, norm);
                 }
-                if candidates.len() > prune_at {
-                    candidates.retain(|(_, upper)| *upper >= bar);
-                    prune_at = candidates.len().saturating_mul(2).saturating_add(1024);
+            }
+            parts.sort_by(|left, right| {
+                right
+                    .upper
+                    .total_cmp(&left.upper)
+                    .then(left.first_row.cmp(&right.first_row))
+            });
+            // Seed the bar with exact scores from the best-bound sub-blocks until `k` rows are known: coarse lower
+            // bounds are loose, while an exact k-th score lets the ball bounds skip most far sub-blocks.
+            // Only worth a fine block when the balls separate: enough sub-blocks bound below the best one's centre.
+            let separated = parts.first().is_some_and(|best| {
+                let centre = best.lower / 2.0 + best.upper / 2.0;
+                let below = parts.iter().filter(|part| part.upper < centre).count();
+                below >= 2 && below * 4 >= parts.len()
+            });
+            if separated && fine_column.part_rows == VECTOR_SUBBLOCK_ROWS {
+                let mut seed = TopK::new(k);
+                for part in parts.iter().take_while(|part| part.upper >= bar) {
+                    if seed.threshold().is_some() {
+                        break;
+                    }
+                    let plaintext = self.cached_part(fine_column, part.granule, part.part, Some(cache))?;
+                    for_each_row(fine_width, &plaintext, part.first_row, filter, |row, bytes| {
+                        let score = fine_query.score(bytes);
+                        stats.rows_reranked += 1;
+                        seeded.insert(row, score);
+                        if in_range(score) {
+                            seed.offer(ScoredRow { row, score });
+                        }
+                    });
                 }
-            },
-        )?;
+                if let Some(kth) = seed.threshold() {
+                    bar = bar.max(kth);
+                }
+            }
+        }
+        for part in parts {
+            if part.upper < bar || part.lower > ceiling {
+                stats.subblocks_skipped += 1;
+                continue;
+            }
+            let plaintext = self.cached_part(coarse_column, part.granule, part.part, shared)?;
+            for_each_row(width, &plaintext, part.first_row, filter, |row, bytes| {
+                stats.rows_scanned += 1;
+                let estimate = coarse_query.estimate(bytes);
+                if estimate.upper < bar || estimate.lower > ceiling {
+                    return;
+                }
+                // A row whose exact score may exceed the ceiling may be dropped, so its lower bound does not
+                // guarantee a result and cannot raise the bar.
+                if estimate.upper <= ceiling {
+                    lowers.offer(ScoredRow {
+                        row,
+                        score: estimate.lower,
+                    });
+                }
+                candidates.push((row, estimate.upper));
+            });
+            if let Some(lower) = lowers.threshold() {
+                bar = bar.max(lower);
+            }
+            if candidates.len() > prune_at {
+                candidates.retain(|(_, upper)| *upper >= bar);
+                prune_at = candidates.len().saturating_mul(2).saturating_add(1024);
+            }
+        }
         candidates.retain(|(_, upper)| *upper >= bar);
         candidates.sort_by(|left, right| right.1.total_cmp(&left.1).then(left.0.cmp(&right.0)));
         stats.rows_candidate += candidates.len() as u64;
 
-        let fine_query = self.codec.query(fine_meta.element, query);
-        let fine_width = fine_meta.row_width();
-        let fine_column = self.column_by_id(fine)?;
         // `cap` is a patience: stop once `k × cap` consecutive reranks failed to enter the top k. Rows are reranked
         // in decreasing upper bound, so a long run without improvement means the remaining rows are unlikely to
         // matter, while a tight cluster whose members keep improving the result is reranked in full.
         let patience = cap.map_or(usize::MAX, |cap| k.saturating_mul(cap.max(1)));
         let mut since_improvement = 0usize;
         let mut exact = TopK::new(k);
-        let local_cache = PartCache::default();
-        let cache = cache.unwrap_or(&local_cache);
         for (row, upper) in candidates {
             let bar = exact.threshold().map_or(threshold, |kth| kth.max(threshold));
             if since_improvement >= patience || upper < bar {
                 break;
             }
-            let (granule, local) = self.locate(row)?;
-            let plaintext = self.cached_part(fine_column, granule, local / fine_column.part_rows, Some(cache))?;
-            let local = local % fine_column.part_rows;
-            let bytes = plaintext
-                .get(local * fine_width..(local + 1) * fine_width)
-                .ok_or_else(truncated)?;
-            let score = fine_query.score(bytes);
-            stats.rows_reranked += 1;
+            let score = match seeded.get(&row) {
+                Some(score) => *score,
+                None => {
+                    let (granule, local) = self.locate(row)?;
+                    let plaintext =
+                        self.cached_part(fine_column, granule, local / fine_column.part_rows, Some(cache))?;
+                    let local = local % fine_column.part_rows;
+                    let bytes = plaintext
+                        .get(local * fine_width..(local + 1) * fine_width)
+                        .ok_or_else(truncated)?;
+                    stats.rows_reranked += 1;
+                    fine_query.score(bytes)
+                }
+            };
             if in_range(score) && score >= bar {
                 since_improvement = 0;
                 exact.offer(ScoredRow { row, score });
@@ -1393,6 +1583,121 @@ pub fn merge_segments_with_deletes<S: SegmentSource>(
     spec: &SegmentSpec,
     wrapping: &WrappingKey,
 ) -> Result<Vec<u8>, VectorError> {
+    write_segment(spec, &merged_input(segments, deletes, spec)?, wrapping)
+}
+
+/// `merge_segments_with_deletes`, writing the live rows grouped by k-means partition (`params`) instead of in
+/// segment order, so similar vectors share sealed sub-blocks. Event ids and every column move with their rows.
+///
+/// Time-ordered segments mix every topic in each 128-row sub-block, so neither a partition index nor the
+/// sub-block balls can avoid decrypting most blocks. After a clustered merge a query's neighbours sit in a few
+/// sub-blocks: the ball bounds skip the rest in a plain scan and a partition index's probes touch few blocks.
+/// Granule timestamp statistics become less selective in exchange.
+pub fn merge_segments_clustered<S: SegmentSource>(
+    segments: &[SegmentReader<S>],
+    deletes: &[Option<&super::deletes::SegmentDeletes>],
+    spec: &SegmentSpec,
+    wrapping: &WrappingKey,
+    params: &super::ivf::PartitionParams,
+) -> Result<Vec<u8>, VectorError> {
+    let merged = merged_input(segments, deletes, spec)?;
+    let order = clustered_order(&merged.vectors, spec.model.dimension as usize, params);
+    write_segment(spec, &permuted(merged, &order), wrapping)
+}
+
+/// Row order grouping rows by k-means partition, partitions chained nearest centroid next, rows within a partition
+/// in their original order.
+pub(super) fn clustered_order(
+    vectors: &[Vec<f32>],
+    dimension: usize,
+    params: &super::ivf::PartitionParams,
+) -> Vec<usize> {
+    let n = vectors.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let wanted = params
+        .partitions
+        .unwrap_or_else(|| (n as f64).sqrt().ceil() as usize)
+        .clamp(1, n);
+    let assignment = super::ivf::kmeans(vectors, dimension, wanted, params);
+    let mut groups: Vec<Vec<usize>> = vec![Vec::new(); wanted];
+    for (row, slot) in assignment.iter().enumerate() {
+        if let Some(group) = groups.get_mut(*slot) {
+            group.push(row);
+        }
+    }
+    groups.retain(|rows| !rows.is_empty());
+    let centres: Vec<Vec<f32>> = groups
+        .iter()
+        .map(|rows| {
+            super::kernel::ball_of(
+                dimension,
+                rows.iter().filter_map(|row| vectors.get(*row)).map(Vec::as_slice),
+            )
+            .0
+        })
+        .collect();
+    let distance = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum::<f32>();
+    let mut chain = Vec::with_capacity(groups.len());
+    let mut used = vec![false; groups.len()];
+    let mut current = 0usize;
+    for _ in 0..groups.len() {
+        if let Some(slot) = used.get_mut(current) {
+            *slot = true;
+        }
+        chain.push(current);
+        let Some(from) = centres.get(current) else {
+            break;
+        };
+        let next = centres
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !used.get(*index).copied().unwrap_or(true))
+            .min_by(|left, right| {
+                distance(from, left.1)
+                    .total_cmp(&distance(from, right.1))
+                    .then(left.0.cmp(&right.0))
+            });
+        match next {
+            Some((index, _)) => current = index,
+            None => break,
+        }
+    }
+    chain
+        .into_iter()
+        .filter_map(|group| groups.get(group))
+        .flat_map(|rows| rows.iter().copied())
+        .collect()
+}
+
+/// `input` with its rows in `order` (every column, event ids included).
+pub(super) fn permuted(input: SegmentInput, order: &[usize]) -> SegmentInput {
+    fn pick<T: Clone>(values: &[T], order: &[usize]) -> Vec<T> {
+        order.iter().filter_map(|row| values.get(*row).cloned()).collect()
+    }
+    SegmentInput {
+        event_ids: pick(&input.event_ids, order),
+        integer_columns: input
+            .integer_columns
+            .iter()
+            .map(|(name, values)| (name.clone(), pick(values, order)))
+            .collect(),
+        string_columns: input
+            .string_columns
+            .iter()
+            .map(|(name, values)| (name.clone(), pick(values, order)))
+            .collect(),
+        vectors: pick(&input.vectors, order),
+    }
+}
+
+/// The live rows of `segments`, concatenated in segment order.
+fn merged_input<S: SegmentSource>(
+    segments: &[SegmentReader<S>],
+    deletes: &[Option<&super::deletes::SegmentDeletes>],
+    spec: &SegmentSpec,
+) -> Result<SegmentInput, VectorError> {
     let mut merged: Option<SegmentInput> = None;
     for (index, segment) in segments.iter().enumerate() {
         segment.manifest().model.require_same(&spec.model)?;
@@ -1435,7 +1740,7 @@ pub fn merge_segments_with_deletes<S: SegmentSource>(
             }
         }
     }
-    write_segment(spec, &merged.unwrap_or_default(), wrapping)
+    Ok(merged.unwrap_or_default())
 }
 
 fn centroid(model: &EmbeddingModel, vectors: &[Vec<f32>]) -> Vec<f32> {

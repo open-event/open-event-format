@@ -7,6 +7,7 @@
 //! segment's wrapping key because centroids and row lists leak information about the data.
 
 use super::error::VectorError;
+use super::kernel::{ball_bounds, ball_of};
 use super::model::{EmbeddingModel, VectorMetric};
 use super::seal::WrappingKey;
 use super::segment::{SegmentReader, SegmentSource};
@@ -86,7 +87,12 @@ fn nearest(centroids: &[Vec<f32>], row: &[f32]) -> usize {
 }
 
 /// Deterministic Lloyd k-means: seeded distinct initial rows, a fixed number of iterations, L2 assignment.
-fn kmeans(vectors: &[Vec<f32>], dimension: usize, partitions: usize, params: &PartitionParams) -> Vec<usize> {
+pub(super) fn kmeans(
+    vectors: &[Vec<f32>],
+    dimension: usize,
+    partitions: usize,
+    params: &PartitionParams,
+) -> Vec<usize> {
     let n = vectors.len();
     let mut order: Vec<usize> = (0..n).collect();
     let mut state = params.seed;
@@ -155,33 +161,13 @@ impl PartitionIndex {
                 .into_iter()
                 .filter(|rows| !rows.is_empty())
                 .map(|rows| {
-                    let mut sum = vec![0f64; dimension];
-                    for row in &rows {
-                        if let Some(vector) = vectors.get(*row as usize) {
-                            sum.iter_mut().zip(vector).for_each(|(t, v)| *t += f64::from(*v));
-                        }
-                    }
-                    let centroid: Vec<f32> = sum.iter().map(|t| (*t / rows.len() as f64) as f32).collect();
-                    let radius = rows
-                        .iter()
-                        .filter_map(|row| vectors.get(*row as usize))
-                        .map(|vector| {
-                            vector
-                                .iter()
-                                .zip(&centroid)
-                                .map(|(a, b)| {
-                                    let d = f64::from(*a) - f64::from(*b);
-                                    d * d
-                                })
-                                .sum::<f64>()
-                                .sqrt()
-                        })
-                        .fold(0f64, f64::max);
-                    Partition {
-                        centroid,
-                        radius: (radius * (1.0 + 1e-4) + 1e-5) as f32,
-                        rows,
-                    }
+                    let (centroid, radius) = ball_of(
+                        dimension,
+                        rows.iter()
+                            .filter_map(|row| vectors.get(*row as usize))
+                            .map(Vec::as_slice),
+                    );
+                    Partition { centroid, radius, rows }
                 })
                 .collect()
         };
@@ -208,37 +194,18 @@ impl PartitionIndex {
 
     /// An upper bound on the score of any row of `partition` for `query` (scores as the kernels compute them).
     pub fn upper_bound(&self, partition: &Partition, query: &[f32]) -> f32 {
-        let bound = match self.model.metric {
-            VectorMetric::Cosine | VectorMetric::Dot => {
-                let dot: f32 = partition.centroid.iter().zip(query).map(|(a, b)| a * b).sum();
-                let norm = query.iter().map(|v| v * v).sum::<f32>().sqrt();
-                dot + norm * partition.radius
-            }
-            VectorMetric::L2 => {
-                let distance = squared_distance(&partition.centroid, query).sqrt();
-                let gap = (distance - partition.radius).max(0.0);
-                -(gap * gap)
-            }
-        };
-        bound + 1e-4 * (1.0 + bound.abs())
+        self.bounds(partition, query).1
     }
 
-    /// Partitions ordered by decreasing upper bound, with that bound.
     /// A lower bound on the exact score of every row in `partition` (used to skip partitions above a range's
     /// maximum score).
     pub fn lower_bound(&self, partition: &Partition, query: &[f32]) -> f32 {
-        let bound = match self.model.metric {
-            VectorMetric::Cosine | VectorMetric::Dot => {
-                let dot: f32 = partition.centroid.iter().zip(query).map(|(a, b)| a * b).sum();
-                let norm = query.iter().map(|v| v * v).sum::<f32>().sqrt();
-                dot - norm * partition.radius
-            }
-            VectorMetric::L2 => {
-                let distance = squared_distance(&partition.centroid, query).sqrt() + partition.radius;
-                -(distance * distance)
-            }
-        };
-        bound - 1e-4 * (1.0 + bound.abs())
+        self.bounds(partition, query).0
+    }
+
+    fn bounds(&self, partition: &Partition, query: &[f32]) -> (f32, f32) {
+        let norm = query.iter().map(|v| v * v).sum::<f32>().sqrt();
+        ball_bounds(self.model.metric, &partition.centroid, partition.radius, query, norm)
     }
 
     /// Whether every row of partition `index` is known to score above `ceiling`.

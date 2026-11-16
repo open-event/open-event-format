@@ -624,6 +624,7 @@ struct Measured {
     probed: f64,
     recall: f64,
     partitions: usize,
+    skipped: f64,
 }
 
 fn measure(vectors: &[Vec<f32>], segment: &SegmentReader<Vec<u8>>, clusters: usize, metric: VectorMetric) -> Measured {
@@ -633,7 +634,7 @@ fn measure(vectors: &[Vec<f32>], segment: &SegmentReader<Vec<u8>>, clusters: usi
     let all = segment.read_all().unwrap().vectors;
     let segments = std::slice::from_ref(segment);
     let queries = 30;
-    let (mut scan_blocks, mut index_blocks, mut probed, mut found) = (0u64, 0u64, 0u64, 0usize);
+    let (mut scan_blocks, mut index_blocks, mut probed, mut found, mut skipped) = (0u64, 0u64, 0u64, 0usize, 0u64);
     for query_index in 0..queries {
         let centre = unit(5_000_000 + (query_index * 13 % clusters) as u64, dimension);
         let direction = unit(777_000 + query_index as u64, dimension);
@@ -648,7 +649,8 @@ fn measure(vectors: &[Vec<f32>], segment: &SegmentReader<Vec<u8>>, clusters: usi
             query: &query,
         };
         let before = segment.blocks_opened();
-        let (scanned, _) = search_segments_with_stats(segments, &[], &search).unwrap();
+        let (scanned, scan_stats) = search_segments_with_stats(segments, &[], &search).unwrap();
+        skipped += scan_stats.subblocks_skipped;
         let middle = segment.blocks_opened();
         let (indexed, stats) =
             search_segments_indexed(segments, &[], &[Some(&index)], &search, SearchOptions::default()).unwrap();
@@ -679,6 +681,7 @@ fn measure(vectors: &[Vec<f32>], segment: &SegmentReader<Vec<u8>>, clusters: usi
         probed: probed as f64 / n,
         recall: found as f64 / (n * 10.0),
         partitions: index.partitions.len(),
+        skipped: skipped as f64 / n,
     }
 }
 
@@ -690,7 +693,10 @@ fn many_natural_clusters_probe_incrementally() {
     let ordered = clustered_in_order(200, 40, dimension, 0.5);
     for metric in [VectorMetric::Cosine, VectorMetric::L2] {
         let model = model(dimension, metric);
-        for (layout, vectors) in [("cluster order", ordered.clone()), ("time order", shuffled(ordered.clone(), 11))] {
+        for (layout, vectors) in [
+            ("cluster order", ordered.clone()),
+            ("time order", shuffled(ordered.clone(), 11)),
+        ] {
             let segment = SegmentReader::open(
                 write_segment(
                     &spec(model.clone(), vec![VectorElement::U1, VectorElement::F32]),
@@ -707,7 +713,123 @@ fn many_natural_clusters_probe_incrementally() {
                 m.scan_blocks, m.index_blocks, m.probed, m.partitions, m.recall
             );
             assert_eq!(m.recall, 1.0);
-            assert!(m.index_blocks <= m.scan_blocks, "{metric:?} {layout}: indexed opens more blocks");
+            assert!(
+                m.index_blocks <= m.scan_blocks,
+                "{metric:?} {layout}: indexed opens more blocks"
+            );
         }
+    }
+}
+
+/// Time-ordered rows (every sub-block mixes topics) merged with `merge_segments_clustered`: the plain scan skips
+/// most sub-blocks by their ball bounds and the indexed search opens a fraction of the blocks, with the same
+/// answer by event id as the time-ordered segment.
+#[test]
+fn a_clustered_merge_cuts_blocks_opened_on_time_ordered_segments() {
+    let dimension = 64;
+    let vectors = shuffled(clustered_in_order(50, 160, dimension, 0.5), 11);
+    for metric in [VectorMetric::Cosine, VectorMetric::L2] {
+        let model = model(dimension, metric);
+        let segment_spec = spec(model.clone(), vec![VectorElement::U1, VectorElement::F32]);
+        let halves: Vec<SegmentReader<Vec<u8>>> = vectors
+            .chunks(4000)
+            .enumerate()
+            .map(|(half, rows)| {
+                let mut input = vectors_input(rows);
+                input.event_ids = (0..rows.len()).map(|row| format!("$h{half}r{row}")).collect();
+                SegmentReader::open(write_segment(&segment_spec, &input, &key(1)).unwrap(), &key(1)).unwrap()
+            })
+            .collect();
+        let time = SegmentReader::open(merge_segments(&halves, &segment_spec, &key(1)).unwrap(), &key(1)).unwrap();
+        let clustered = SegmentReader::open(
+            merge_segments_clustered(&halves, &[], &segment_spec, &key(1), &PartitionParams::default()).unwrap(),
+            &key(1),
+        )
+        .unwrap();
+        assert_eq!(clustered.row_count(), 8000);
+        let (before, after) = (time.read_all().unwrap(), clustered.read_all().unwrap());
+        let by_id: std::collections::HashMap<&String, &Vec<f32>> =
+            before.event_ids.iter().zip(&before.vectors).collect();
+        assert!(
+            after
+                .event_ids
+                .iter()
+                .zip(&after.vectors)
+                .all(|(id, vector)| by_id[id] == vector)
+        );
+        assert_ne!(after.event_ids, before.event_ids);
+
+        let time_measured = measure(&vectors, &time, 50, metric);
+        let clustered_measured = measure(&vectors, &clustered, 50, metric);
+        for (layout, m) in [("time order", &time_measured), ("clustered merge", &clustered_measured)] {
+            println!(
+                "{metric:?} {layout}: blocks per query scan {:.1} (sub-blocks skipped {:.1}) indexed {:.1}; \
+                 probed {:.1}/{}; recall {:.3}",
+                m.scan_blocks, m.skipped, m.index_blocks, m.probed, m.partitions, m.recall
+            );
+            assert_eq!(m.recall, 1.0, "{metric:?} {layout}");
+            assert!(m.index_blocks <= m.scan_blocks, "{metric:?} {layout}");
+        }
+        assert!(
+            clustered_measured.index_blocks * 3.0 < time_measured.index_blocks,
+            "{metric:?} indexed"
+        );
+        assert!(
+            clustered_measured.scan_blocks * 2.0 < time_measured.scan_blocks,
+            "{metric:?} scan"
+        );
+
+        // The same queries answer with the same event ids on both layouts.
+        let query = vectors[17].clone();
+        let search = VectorSearch {
+            filter: SearchFilter::default(),
+            k: 10,
+            model: &model,
+            oversample: DEFAULT_OVERSAMPLE,
+            query: &query,
+        };
+        let ids = |segment: &SegmentReader<Vec<u8>>| {
+            search_segments(std::slice::from_ref(segment), &search)
+                .unwrap()
+                .into_iter()
+                .map(|hit| hit.event_id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&clustered), ids(&time));
+    }
+}
+
+/// Segments written before the sub-block ball footer tail still open and answer identically, only without skipping.
+#[test]
+fn segments_without_sub_block_balls_still_read_and_answer_the_same() {
+    let dimension = 64;
+    let vectors = clustered_in_order(50, 160, dimension, 0.5);
+    let model = model(dimension, VectorMetric::Cosine);
+    let bytes = write_segment(
+        &spec(model.clone(), vec![VectorElement::U1, VectorElement::F32]),
+        &vectors_input(&vectors),
+        &key(1),
+    )
+    .unwrap();
+    let stripped = super::super::segment::strip_subblock_balls(&bytes, &key(1)).unwrap();
+    assert!(stripped.len() < bytes.len());
+    let with = SegmentReader::open(bytes, &key(1)).unwrap();
+    let without = SegmentReader::open(stripped, &key(1)).unwrap();
+    assert!(with.has_subblock_balls() && !without.has_subblock_balls());
+    without.verify_content().unwrap();
+    for query_index in 0..10u64 {
+        let query = vectors[(query_index * 797 % 8000) as usize].clone();
+        let search = VectorSearch {
+            filter: SearchFilter::default(),
+            k: 10,
+            model: &model,
+            oversample: DEFAULT_OVERSAMPLE,
+            query: &query,
+        };
+        let (a, with_stats) = search_segments_with_stats(std::slice::from_ref(&with), &[], &search).unwrap();
+        let (b, without_stats) = search_segments_with_stats(std::slice::from_ref(&without), &[], &search).unwrap();
+        assert_eq!(a, b);
+        assert!(with_stats.subblocks_skipped > 0);
+        assert_eq!(without_stats.subblocks_skipped, 0);
     }
 }
