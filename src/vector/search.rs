@@ -4,7 +4,7 @@ use super::error::VectorError;
 use super::ivf::PartitionIndex;
 use super::kernel::TopK;
 use super::model::{EmbeddingModel, ScoredRow, SegmentManifest, VectorMetric};
-use super::segment::{ColumnStats, SegmentReader, SegmentSource};
+use super::segment::{ColumnStats, PartCache, SegmentReader, SegmentSource};
 use crate::indexes::bitmap::{RoaringRangeBitmap, RowRange};
 use std::collections::HashSet;
 
@@ -395,6 +395,7 @@ impl<S: SegmentSource> SegmentScan<'_, S> {
         let (Some(coarse), Some(fine)) = (representations.first(), representations.last()) else {
             return Ok(Vec::new());
         };
+        let cache = PartCache::default();
         let bounded = |filter: Option<&RoaringRangeBitmap>, threshold: f32, stats: &mut SearchStats| {
             self.segment.search_bounded(
                 coarse.column_id,
@@ -408,6 +409,7 @@ impl<S: SegmentSource> SegmentScan<'_, S> {
                     threshold,
                     ceiling: self.range.ceiling(),
                     ranged: self.range.is_bounded(),
+                    cache: Some(&cache),
                 },
                 stats,
             )

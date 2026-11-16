@@ -605,3 +605,109 @@ fn small_dimensions_default_to_int8_coarse_codes() {
         );
     }
 }
+
+fn shuffled(mut rows: Vec<Vec<f32>>, seed: u64) -> Vec<Vec<f32>> {
+    let mut state = seed | 1;
+    for index in (1..rows.len()).rev() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        rows.swap(index, (state % (index as u64 + 1)) as usize);
+    }
+    rows
+}
+
+/// Blocks opened, partitions probed and recall for scan and indexed search over one segment.
+struct Measured {
+    scan_blocks: f64,
+    index_blocks: f64,
+    probed: f64,
+    recall: f64,
+    partitions: usize,
+}
+
+fn measure(vectors: &[Vec<f32>], segment: &SegmentReader<Vec<u8>>, clusters: usize, metric: VectorMetric) -> Measured {
+    let dimension = segment.manifest().model.dimension;
+    let model = segment.manifest().model.clone();
+    let index = PartitionIndex::build(segment, &PartitionParams::default()).unwrap();
+    let all = segment.read_all().unwrap().vectors;
+    let segments = std::slice::from_ref(segment);
+    let queries = 30;
+    let (mut scan_blocks, mut index_blocks, mut probed, mut found) = (0u64, 0u64, 0u64, 0usize);
+    for query_index in 0..queries {
+        let centre = unit(5_000_000 + (query_index * 13 % clusters) as u64, dimension);
+        let direction = unit(777_000 + query_index as u64, dimension);
+        let mut query: Vec<f32> = centre.iter().zip(&direction).map(|(c, d)| c + 0.4 * d).collect();
+        let norm = query.iter().map(|v| v * v).sum::<f32>().sqrt();
+        query.iter_mut().for_each(|v| *v /= norm);
+        let search = VectorSearch {
+            filter: SearchFilter::default(),
+            k: 10,
+            model: &model,
+            oversample: 0,
+            query: &query,
+        };
+        let before = segment.blocks_opened();
+        let (scanned, _) = search_segments_with_stats(segments, &[], &search).unwrap();
+        let middle = segment.blocks_opened();
+        let (indexed, stats) =
+            search_segments_indexed(segments, &[], &[Some(&index)], &search, SearchOptions::default()).unwrap();
+        let after = segment.blocks_opened();
+        assert_eq!(
+            indexed.iter().map(|hit| hit.row).collect::<Vec<_>>(),
+            scanned.iter().map(|hit| hit.row).collect::<Vec<_>>(),
+            "query {query_index}: the index changes the answer"
+        );
+        scan_blocks += middle - before;
+        index_blocks += after - middle;
+        probed += stats.partitions_probed;
+        let truth: Vec<f32> = {
+            let mut scores: Vec<f32> = vectors.iter().map(|row| score(metric, row, &query)).collect();
+            scores.sort_by(|a, b| b.total_cmp(a));
+            scores.truncate(10);
+            scores
+        };
+        found += indexed
+            .iter()
+            .filter(|hit| score(metric, &all[hit.row as usize], &query) >= truth[9] - 1e-5)
+            .count();
+    }
+    let n = queries as f64;
+    Measured {
+        scan_blocks: scan_blocks as f64 / n,
+        index_blocks: index_blocks as f64 / n,
+        probed: probed as f64 / n,
+        recall: found as f64 / (n * 10.0),
+        partitions: index.partitions.len(),
+    }
+}
+
+/// 200 natural clusters with ⌈√8000⌉ = 90 partitions, rows in cluster order and shuffled (time-ordered): the
+/// indexed search never opens more blocks than the scan and gives the same answer.
+#[test]
+fn many_natural_clusters_probe_incrementally() {
+    let dimension = 64;
+    let ordered = clustered_in_order(200, 40, dimension, 0.5);
+    for metric in [VectorMetric::Cosine, VectorMetric::L2] {
+        let model = model(dimension, metric);
+        for (layout, vectors) in [("cluster order", ordered.clone()), ("time order", shuffled(ordered.clone(), 11))] {
+            let segment = SegmentReader::open(
+                write_segment(
+                    &spec(model.clone(), vec![VectorElement::U1, VectorElement::F32]),
+                    &vectors_input(&vectors),
+                    &key(1),
+                )
+                .unwrap(),
+                &key(1),
+            )
+            .unwrap();
+            let m = measure(&vectors, &segment, 200, metric);
+            println!(
+                "{metric:?} {layout}: blocks per query scan {:.1} indexed {:.1}; probed {:.1}/{}; recall {:.3}",
+                m.scan_blocks, m.index_blocks, m.probed, m.partitions, m.recall
+            );
+            assert_eq!(m.recall, 1.0);
+            assert!(m.index_blocks <= m.scan_blocks, "{metric:?} {layout}: indexed opens more blocks");
+        }
+    }
+}

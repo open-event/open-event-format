@@ -312,6 +312,10 @@ pub enum ColumnStats {
 
 /// A granule and the index of one sealed block within it.
 pub(super) type SubBlock = (usize, usize);
+/// Opened (decrypted) blocks by `(column id, granule, part)`, shared by the probe rounds of one segment search so
+/// no block is decrypted twice.
+pub(crate) type PartCache =
+    std::cell::RefCell<std::collections::HashMap<(u32, usize, usize), std::rc::Rc<Zeroizing<Vec<u8>>>>>;
 
 /// Sealed blocks covering `rows` rows of `part_rows` each: one for an empty granule, at least one otherwise.
 fn part_count(rows: usize, part_rows: usize) -> usize {
@@ -611,6 +615,8 @@ pub(crate) struct BoundedSearch<'a> {
     pub(crate) ceiling: f32,
     /// Whether the search has score bounds (forces an exact fine scan for codes without bounds).
     pub(crate) ranged: bool,
+    /// Blocks already opened by earlier calls for the same query (partition probe rounds).
+    pub(crate) cache: Option<&'a PartCache>,
 }
 
 fn check_query_width(meta: &VectorColumnMeta, query: &[f32]) -> Result<(), VectorError> {
@@ -1000,6 +1006,18 @@ impl<S: SegmentSource> SegmentReader<S> {
         &self,
         column_id: u32,
         filter: Option<&RoaringRangeBitmap>,
+        visit: impl FnMut(u64, &[u8]),
+    ) -> Result<(), VectorError> {
+        self.scan_parts_with(column_id, filter, None, |_, _| true, visit)
+    }
+
+    /// `scan_parts`, skipping blocks for which `keep(first_row, rows)` is false and reusing (and filling) `cache`.
+    pub(super) fn scan_parts_with(
+        &self,
+        column_id: u32,
+        filter: Option<&RoaringRangeBitmap>,
+        cache: Option<&PartCache>,
+        mut keep: impl FnMut(u64, u64) -> bool,
         mut visit: impl FnMut(u64, &[u8]),
     ) -> Result<(), VectorError> {
         let column = self.column_by_id(column_id)?;
@@ -1018,8 +1036,8 @@ impl<S: SegmentSource> SegmentReader<S> {
                         .get(ranges.partition_point(|range| range.end <= first_row))
                         .is_some_and(|range| range.start < first_row + rows)
                 });
-                if wanted {
-                    visit(first_row, &self.open_part(column, granule, part)?);
+                if wanted && keep(first_row, rows) {
+                    visit(first_row, &self.cached_part(column, granule, part, cache)?);
                 }
                 first_row += rows;
                 part += 1;
@@ -1027,6 +1045,26 @@ impl<S: SegmentSource> SegmentReader<S> {
             granule_first = granule_end;
         }
         Ok(())
+    }
+
+    /// `open_part` through an optional cache of opened blocks.
+    fn cached_part(
+        &self,
+        column: &StoredColumn,
+        granule: usize,
+        part: usize,
+        cache: Option<&PartCache>,
+    ) -> Result<std::rc::Rc<Zeroizing<Vec<u8>>>, VectorError> {
+        let Some(cache) = cache else {
+            return Ok(std::rc::Rc::new(self.open_part(column, granule, part)?));
+        };
+        let key = (column.column_id, granule, part);
+        if let Some(found) = cache.borrow().get(&key) {
+            return Ok(found.clone());
+        }
+        let opened = std::rc::Rc::new(self.open_part(column, granule, part)?);
+        cache.borrow_mut().insert(key, opened.clone());
+        Ok(opened)
     }
 
     /// Two-stage search of one segment: scan `coarse`, then score candidates exactly with `fine`.
@@ -1054,6 +1092,7 @@ impl<S: SegmentSource> SegmentReader<S> {
             threshold,
             ceiling,
             ranged,
+            cache,
         } = search;
         let in_range = |score: f32| score >= threshold && score <= ceiling;
         let coarse_meta = self.vector_meta(coarse, model)?;
@@ -1097,31 +1136,37 @@ impl<S: SegmentSource> SegmentReader<S> {
         let mut bar = threshold;
         let mut candidates: Vec<(u64, f32)> = Vec::new();
         let mut prune_at = k.saturating_mul(4).saturating_add(1024);
-        self.scan_parts(coarse, filter, |first_row, plaintext| {
-            for_each_row(width, plaintext, first_row, filter, |row, bytes| {
-                stats.rows_scanned += 1;
-                let estimate = coarse_query.estimate(bytes);
-                if estimate.upper < bar || estimate.lower > ceiling {
-                    return;
+        self.scan_parts_with(
+            coarse,
+            filter,
+            cache,
+            |_, _| true,
+            |first_row, plaintext| {
+                for_each_row(width, plaintext, first_row, filter, |row, bytes| {
+                    stats.rows_scanned += 1;
+                    let estimate = coarse_query.estimate(bytes);
+                    if estimate.upper < bar || estimate.lower > ceiling {
+                        return;
+                    }
+                    // A row whose exact score may exceed the ceiling may be dropped, so its lower bound does not
+                    // guarantee a result and cannot raise the bar.
+                    if estimate.upper <= ceiling {
+                        lowers.offer(ScoredRow {
+                            row,
+                            score: estimate.lower,
+                        });
+                    }
+                    candidates.push((row, estimate.upper));
+                });
+                if let Some(lower) = lowers.threshold() {
+                    bar = bar.max(lower);
                 }
-                // A row whose exact score may exceed the ceiling may be dropped, so its lower bound does not
-                // guarantee a result and cannot raise the bar.
-                if estimate.upper <= ceiling {
-                    lowers.offer(ScoredRow {
-                        row,
-                        score: estimate.lower,
-                    });
+                if candidates.len() > prune_at {
+                    candidates.retain(|(_, upper)| *upper >= bar);
+                    prune_at = candidates.len().saturating_mul(2).saturating_add(1024);
                 }
-                candidates.push((row, estimate.upper));
-            });
-            if let Some(lower) = lowers.threshold() {
-                bar = bar.max(lower);
-            }
-            if candidates.len() > prune_at {
-                candidates.retain(|(_, upper)| *upper >= bar);
-                prune_at = candidates.len().saturating_mul(2).saturating_add(1024);
-            }
-        })?;
+            },
+        )?;
         candidates.retain(|(_, upper)| *upper >= bar);
         candidates.sort_by(|left, right| right.1.total_cmp(&left.1).then(left.0.cmp(&right.0)));
         stats.rows_candidate += candidates.len() as u64;
@@ -1135,21 +1180,18 @@ impl<S: SegmentSource> SegmentReader<S> {
         let patience = cap.map_or(usize::MAX, |cap| k.saturating_mul(cap.max(1)));
         let mut since_improvement = 0usize;
         let mut exact = TopK::new(k);
-        let mut opened: std::collections::HashMap<SubBlock, Zeroizing<Vec<u8>>> = std::collections::HashMap::new();
+        let local_cache = PartCache::default();
+        let cache = cache.unwrap_or(&local_cache);
         for (row, upper) in candidates {
             let bar = exact.threshold().map_or(threshold, |kth| kth.max(threshold));
             if since_improvement >= patience || upper < bar {
                 break;
             }
             let (granule, local) = self.locate(row)?;
-            let at = (granule, local / fine_column.part_rows);
+            let plaintext = self.cached_part(fine_column, granule, local / fine_column.part_rows, Some(cache))?;
             let local = local % fine_column.part_rows;
-            if let std::collections::hash_map::Entry::Vacant(slot) = opened.entry(at) {
-                slot.insert(self.open_part(fine_column, at.0, at.1)?);
-            }
-            let bytes = opened
-                .get(&at)
-                .and_then(|plaintext| plaintext.get(local * fine_width..(local + 1) * fine_width))
+            let bytes = plaintext
+                .get(local * fine_width..(local + 1) * fine_width)
                 .ok_or_else(truncated)?;
             let score = fine_query.score(bytes);
             stats.rows_reranked += 1;
