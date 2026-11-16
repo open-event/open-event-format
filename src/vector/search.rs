@@ -202,12 +202,36 @@ pub fn search_segments_in_range<S: SegmentSource>(
     limit: Option<usize>,
     options: SearchOptions,
 ) -> Result<(Vec<SearchHit>, SearchStats), VectorError> {
+    search_in_range_capped(
+        segments,
+        deletes,
+        indexes,
+        search,
+        range,
+        limit,
+        options,
+        MAX_RANGE_RESULTS,
+    )
+}
+
+/// `search_segments_in_range` with the unlimited-result cap as a parameter (tests lower it).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn search_in_range_capped<S: SegmentSource>(
+    segments: &[SegmentReader<S>],
+    deletes: &[Option<&SegmentDeletes>],
+    indexes: &[Option<&PartitionIndex>],
+    search: &VectorSearch<'_>,
+    range: ScoreRange,
+    limit: Option<usize>,
+    options: SearchOptions,
+    max_results: usize,
+) -> Result<(Vec<SearchHit>, SearchStats), VectorError> {
     if range.min.zip(range.max).is_some_and(|(min, max)| min > max) || range.min.is_some_and(f32::is_nan) {
         return Err(VectorError::InvalidInput {
             rule: "range minimum above its maximum".to_owned(),
         });
     }
-    let cap = limit.unwrap_or(MAX_RANGE_RESULTS);
+    let cap = limit.unwrap_or(max_results);
     let wanted = if limit.is_none() { cap.saturating_add(1) } else { cap };
     let ranged = VectorSearch {
         k: wanted,

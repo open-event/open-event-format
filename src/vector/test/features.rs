@@ -471,3 +471,72 @@ fn rrf_fuses_ranks_with_weights_and_deterministic_ties() {
         ["$p", "$q", "$r"]
     );
 }
+
+/// A range search with no limit that matches more than the result cap returns the best `cap` hits and reports
+/// `range_truncated` (the cap is lowered through the internal hook instead of writing 100 000 rows).
+#[test]
+fn an_unlimited_range_search_over_the_cap_is_truncated_to_the_best_hits() {
+    let dimension = 32;
+    let model = model(dimension, VectorMetric::Dot);
+    let vectors = clustered(4, 50, dimension, 0.6, 3_000);
+    let segments = vec![
+        segment_of(&vectors[..100], "$a", &model, VectorElement::I8),
+        segment_of(&vectors[100..], "$b", &model, VectorElement::I8),
+    ];
+    let query = vectors[3].clone();
+    let search = VectorSearch {
+        filter: SearchFilter::default(),
+        k: 10,
+        model: &model,
+        oversample: DEFAULT_OVERSAMPLE,
+        query: &query,
+    };
+    let everything = ScoreRange {
+        min: Some(-2.0),
+        max: None,
+    };
+    let capped = |cap| {
+        super::super::search::search_in_range_capped(
+            &segments,
+            &[],
+            &[],
+            &search,
+            everything,
+            None,
+            SearchOptions::default(),
+            cap,
+        )
+        .unwrap()
+    };
+    let (all, stats) = capped(1_000);
+    assert_eq!(all.len(), 200);
+    assert!(!stats.range_truncated);
+    let (exactly, stats) = capped(200);
+    assert_eq!(exactly.len(), 200);
+    assert!(!stats.range_truncated, "exactly the cap is not truncated");
+    let (truncated, stats) = capped(25);
+    assert!(stats.range_truncated);
+    assert_eq!(truncated.len(), 25);
+    assert_eq!(
+        truncated
+            .iter()
+            .map(|hit| (&hit.event_id, hit.score))
+            .collect::<Vec<_>>(),
+        all.iter()
+            .take(25)
+            .map(|hit| (&hit.event_id, hit.score))
+            .collect::<Vec<_>>()
+    );
+    let (limited, stats) = search_segments_in_range(
+        &segments,
+        &[],
+        &[],
+        &search,
+        everything,
+        Some(25),
+        SearchOptions::default(),
+    )
+    .unwrap();
+    assert!(!stats.range_truncated, "an explicit limit is not a truncation");
+    assert_eq!(limited, truncated);
+}
