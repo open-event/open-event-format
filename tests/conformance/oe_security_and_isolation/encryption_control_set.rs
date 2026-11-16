@@ -54,11 +54,7 @@ fn payload_aead_uses_the_pinned_cipher() {
         match scheme {
             AeadScheme::AesGcm256 => {
                 assert_eq!(scheme.nonce_len(), 12, "AES-256-GCM nonce must be 96 bits (12 bytes)");
-                assert_eq!(
-                    scheme.crate_name(),
-                    "aws-lc-rs",
-                    "must name the aws-lc-rs crate"
-                );
+                assert_eq!(scheme.crate_name(), "aws-lc-rs", "must name the aws-lc-rs crate");
             }
             AeadScheme::XChaCha20Poly1305 => {
                 assert_eq!(
@@ -66,11 +62,7 @@ fn payload_aead_uses_the_pinned_cipher() {
                     24,
                     "XChaCha20-Poly1305 nonce must be 192 bits (24 bytes)"
                 );
-                assert_eq!(
-                    scheme.crate_name(),
-                    "aws-lc-rs",
-                    "must name the aws-lc-rs crate"
-                );
+                assert_eq!(scheme.crate_name(), "aws-lc-rs", "must name the aws-lc-rs crate");
             }
         }
     }
