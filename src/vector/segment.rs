@@ -88,11 +88,12 @@ pub(crate) fn write_segment_sealed_by(
             let slice = values.get(*start..*end).unwrap_or_default();
             let plaintext = Zeroizing::new(encode_strings(slice));
             let stats = string_stats(slice);
-            blocks.push((seal_block(&mut file, &plaintext)?, stats));
+            blocks.push((vec![seal_block(&mut file, &plaintext)?], stats));
         }
         columns.push(StoredColumn {
             blocks,
             column_id: position as u32,
+            part_rows: GRANULE_ROWS,
             kind: ColumnKind::String,
             name: (*name).to_owned(),
         });
@@ -106,11 +107,12 @@ pub(crate) fn write_segment_sealed_by(
                 (Some(min), Some(max)) => Some(ColumnStats::Integer { max: *max, min: *min }),
                 _ => None,
             };
-            blocks.push((seal_block(&mut file, &plaintext)?, stats));
+            blocks.push((vec![seal_block(&mut file, &plaintext)?], stats));
         }
         columns.push(StoredColumn {
             blocks,
             column_id: (string_columns.len() + offset) as u32,
+            part_rows: GRANULE_ROWS,
             kind: ColumnKind::I64,
             name: name.clone(),
         });
@@ -123,17 +125,29 @@ pub(crate) fn write_segment_sealed_by(
             model: spec.model.clone(),
             representation_of: EMBEDDING_COLUMN_ID,
         };
+        let part_rows = if keys.vector_subblocks() {
+            VECTOR_SUBBLOCK_ROWS
+        } else {
+            GRANULE_ROWS
+        };
         let mut blocks = Vec::with_capacity(granules.len());
         for (start, end) in &granules {
-            let mut plaintext = Zeroizing::new(Vec::with_capacity((end - start) * meta.row_width()));
-            for vector in input.vectors.get(*start..*end).unwrap_or_default() {
-                encode_row(*element, vector, &mut plaintext);
+            let mut parts = Vec::with_capacity(part_count(end - start, part_rows));
+            for part in 0..part_count(end - start, part_rows) {
+                let part_start = start + part * part_rows;
+                let part_end = (part_start + part_rows).min(*end);
+                let mut plaintext = Zeroizing::new(Vec::with_capacity((part_end - part_start) * meta.row_width()));
+                for vector in input.vectors.get(part_start..part_end).unwrap_or_default() {
+                    encode_row(*element, vector, &mut plaintext);
+                }
+                parts.push(seal_block(&mut file, &plaintext)?);
             }
-            blocks.push((seal_block(&mut file, &plaintext)?, None));
+            blocks.push((parts, None));
         }
         columns.push(StoredColumn {
             blocks,
             column_id: meta.column_id,
+            part_rows,
             kind: ColumnKind::Vector,
             name: format!("embedding_{:?}", element).to_lowercase(),
         });
@@ -161,7 +175,7 @@ pub(crate) fn write_segment_sealed_by(
         },
         vector_columns,
     };
-    let plaintext = Zeroizing::new(footer.encode());
+    let plaintext = Zeroizing::new(footer.encode(keys.vector_subblocks()));
     let sealed = keys.seal(FOOTER_BLOCK_INDEX, &plaintext)?;
     let footer_offset = file.len() as u64;
     file.extend_from_slice(&sealed);
@@ -245,10 +259,20 @@ pub enum ColumnStats {
     String { max: String, min: String },
 }
 
+/// A granule and the index of one sealed block within it.
+type SubBlock = (usize, usize);
+
+/// Sealed blocks covering `rows` rows of `part_rows` each: one for an empty granule, at least one otherwise.
+fn part_count(rows: usize, part_rows: usize) -> usize {
+    rows.div_ceil(part_rows.max(1)).max(1)
+}
+
 #[derive(Debug, Clone)]
 struct StoredColumn {
-    blocks: Vec<(BlockRef, Option<ColumnStats>)>,
+    /// Per granule: its sealed blocks in row order (one, except vector columns from version 3) and its stats.
+    blocks: Vec<(Vec<BlockRef>, Option<ColumnStats>)>,
     column_id: u32,
+    part_rows: usize,
     kind: ColumnKind,
     name: String,
 }
@@ -263,7 +287,7 @@ struct SegmentFooter {
 }
 
 impl SegmentFooter {
-    fn encode(&self) -> Vec<u8> {
+    fn encode(&self, vector_subblocks: bool) -> Vec<u8> {
         let mut out = Writer::new();
         self.manifest.encode_into(&mut out);
         out.put_u32(self.granule_rows.len() as u32);
@@ -273,10 +297,15 @@ impl SegmentFooter {
             out.put_u32(column.column_id);
             out.put_u8(column.kind as u8);
             put_str(&mut out, &column.name);
-            for (block, stats) in &column.blocks {
-                out.put_u64(block.index);
-                out.put_u64(block.offset);
-                out.put_u64(block.sealed_len);
+            for (parts, stats) in &column.blocks {
+                if vector_subblocks && column.kind == ColumnKind::Vector {
+                    out.put_u32(parts.len() as u32);
+                }
+                for block in parts {
+                    out.put_u64(block.index);
+                    out.put_u64(block.offset);
+                    out.put_u64(block.sealed_len);
+                }
                 match stats {
                     None => out.put_u8(0),
                     Some(ColumnStats::Integer { max, min }) => {
@@ -301,7 +330,7 @@ impl SegmentFooter {
         out.into_bytes()
     }
 
-    fn decode(bytes: &[u8]) -> Result<Self, VectorError> {
+    fn decode(bytes: &[u8], vector_subblocks: bool) -> Result<Self, VectorError> {
         let mut reader = Reader::new(bytes);
         let manifest = SegmentManifest::decode_from(&mut reader)?;
         let granule_count = reader.u32("granule count")? as usize;
@@ -312,13 +341,30 @@ impl SegmentFooter {
             let column_id = reader.u32("column id")?;
             let kind = ColumnKind::from_u8(reader.u8("column kind")?)?;
             let name = take_str(&mut reader, "column name")?;
+            let split = vector_subblocks && kind == ColumnKind::Vector;
+            let part_rows = if split { VECTOR_SUBBLOCK_ROWS } else { GRANULE_ROWS };
             let mut blocks = Vec::with_capacity(reader.capacity_hint(granule_count, 25));
-            for _ in 0..granule_count {
-                let block = BlockRef {
-                    index: reader.u64("block index")?,
-                    offset: reader.u64("block offset")?,
-                    sealed_len: reader.u64("block length")?,
+            for granule in 0..granule_count {
+                let count = if split {
+                    let count = reader.u32("sub-block count")? as usize;
+                    let rows = granule_rows.get(granule).map_or(0, |rows| *rows as usize);
+                    if count != part_count(rows, part_rows) {
+                        return Err(VectorError::Format(crate::error::FormatError::Structural {
+                            rule: "vector sub-blocks cover their granule's rows",
+                        }));
+                    }
+                    count
+                } else {
+                    1
                 };
+                let mut parts = Vec::with_capacity(reader.capacity_hint(count, 24));
+                for _ in 0..count {
+                    parts.push(BlockRef {
+                        index: reader.u64("block index")?,
+                        offset: reader.u64("block offset")?,
+                        sealed_len: reader.u64("block length")?,
+                    });
+                }
                 let stats = match reader.u8("stats tag")? {
                     0 => None,
                     1 => Some(ColumnStats::Integer {
@@ -335,11 +381,12 @@ impl SegmentFooter {
                         }));
                     }
                 };
-                blocks.push((block, stats));
+                blocks.push((parts, stats));
             }
             columns.push(StoredColumn {
                 blocks,
                 column_id,
+                part_rows,
                 kind,
                 name,
             });
@@ -445,7 +492,7 @@ impl<S: SegmentSource> SegmentReader<S> {
             return Err(truncated());
         }
         let sealed = source.read_range(footer_offset, usize::try_from(footer_len).map_err(|_| truncated())?)?;
-        let footer = SegmentFooter::decode(&keys.open(FOOTER_BLOCK_INDEX, &sealed)?)?;
+        let footer = SegmentFooter::decode(&keys.open(FOOTER_BLOCK_INDEX, &sealed)?, keys.vector_subblocks())?;
         Ok(SegmentReader {
             blocks_opened: AtomicU64::new(0),
             footer,
@@ -581,7 +628,9 @@ impl<S: SegmentSource> SegmentReader<S> {
         let meta = self.vector_meta(column_id, model)?;
         let width = meta.row_width();
         let (granule, local) = self.locate(row)?;
-        let plaintext = self.open_block(self.column_by_id(column_id)?, granule)?;
+        let column = self.column_by_id(column_id)?;
+        let plaintext = self.open_part(column, granule, local / column.part_rows)?;
+        let local = local % column.part_rows;
         plaintext
             .get(local * width..(local + 1) * width)
             .map(<[u8]>::to_vec)
@@ -612,8 +661,9 @@ impl<S: SegmentSource> SegmentReader<S> {
         };
         let width = meta.row_width();
         let (granule, local) = self.locate(row)?;
-        let plaintext = self.open_block(self.column_by_id(column_id)?, granule)?;
-        let start = local * width;
+        let column = self.column_by_id(column_id)?;
+        let plaintext = self.open_part(column, granule, local / column.part_rows)?;
+        let start = (local % column.part_rows) * width;
         let prefix = plaintext
             .get(start..start + dimensions as usize * element_bytes)
             .ok_or_else(truncated)?;
@@ -697,22 +747,31 @@ impl<S: SegmentSource> SegmentReader<S> {
         let prepared = PreparedQuery::new(query, meta.model.metric);
         let column = self.column_by_id(column_id)?;
         let mut best = TopK::new(k);
-        let mut first_row = 0u64;
+        let part_rows = column.part_rows as u64;
+        let mut granule_first = 0u64;
         for granule in 0..self.granule_count() {
-            let rows = self.granule_rows(granule) as u64;
-            let wanted = filter.is_none_or(|filter| {
-                let ranges = filter.ranges();
-                ranges
-                    .get(ranges.partition_point(|range| range.end <= first_row))
-                    .is_some_and(|range| range.start < first_row + rows)
-            });
-            if wanted && rows > 0 {
-                let plaintext = self.open_block(column, granule)?;
-                top_k(meta, &plaintext, first_row, &prepared, filter, k)
-                    .into_iter()
-                    .for_each(|row| best.offer(row));
+            let granule_rows = self.granule_rows(granule) as u64;
+            let granule_end = granule_first + granule_rows;
+            let mut first_row = granule_first;
+            let mut part = 0;
+            while first_row < granule_end {
+                let rows = part_rows.min(granule_end - first_row);
+                let wanted = filter.is_none_or(|filter| {
+                    let ranges = filter.ranges();
+                    ranges
+                        .get(ranges.partition_point(|range| range.end <= first_row))
+                        .is_some_and(|range| range.start < first_row + rows)
+                });
+                if wanted {
+                    let plaintext = self.open_part(column, granule, part)?;
+                    top_k(meta, &plaintext, first_row, &prepared, filter, k)
+                        .into_iter()
+                        .for_each(|row| best.offer(row));
+                }
+                first_row += rows;
+                part += 1;
             }
-            first_row += rows;
+            granule_first = granule_end;
         }
         Ok(best.into_sorted())
     }
@@ -732,11 +791,13 @@ impl<S: SegmentSource> SegmentReader<S> {
         sorted.sort_unstable();
         sorted.dedup();
         let mut scored = Vec::with_capacity(sorted.len());
-        let mut open: Option<(usize, Zeroizing<Vec<u8>>)> = None;
+        let mut open: Option<(SubBlock, Zeroizing<Vec<u8>>)> = None;
         for row in sorted {
             let (granule, local) = self.locate(row)?;
-            if open.as_ref().is_none_or(|(current, _)| *current != granule) {
-                open = Some((granule, self.open_block(column, granule)?));
+            let at = (granule, local / column.part_rows);
+            let local = local % column.part_rows;
+            if open.as_ref().is_none_or(|(current, _)| *current != at) {
+                open = Some((at, self.open_part(column, at.0, at.1)?));
             }
             let bytes = open
                 .as_ref()
@@ -771,7 +832,13 @@ impl<S: SegmentSource> SegmentReader<S> {
         self.footer
             .columns
             .iter()
-            .map(|column| column.blocks.iter().map(|(block, _)| block.offset).collect())
+            .map(|column| {
+                column
+                    .blocks
+                    .iter()
+                    .flat_map(|(parts, _)| parts.iter().map(|block| block.offset))
+                    .collect()
+            })
             .collect()
     }
 
@@ -830,10 +897,36 @@ impl<S: SegmentSource> SegmentReader<S> {
             })
     }
 
+    fn granule_parts<'a>(&self, column: &'a StoredColumn, granule: usize) -> Result<&'a [BlockRef], VectorError> {
+        column
+            .blocks
+            .get(granule)
+            .map(|(parts, _)| parts.as_slice())
+            .ok_or_else(|| VectorError::InvalidInput {
+                rule: format!("granule {granule} past the segment's last"),
+            })
+    }
+
+    /// Opens every sealed block of one granule, concatenated in row order.
     fn open_block(&self, column: &StoredColumn, granule: usize) -> Result<Zeroizing<Vec<u8>>, VectorError> {
-        let (block, _) = column.blocks.get(granule).ok_or_else(|| VectorError::InvalidInput {
-            rule: format!("granule {granule} past the segment's last"),
-        })?;
+        let parts = self.granule_parts(column, granule)?;
+        if let [only] = parts {
+            return self.open_sealed(only);
+        }
+        let mut plaintext = Zeroizing::new(Vec::new());
+        for part in parts {
+            plaintext.extend_from_slice(&self.open_sealed(part)?);
+        }
+        Ok(plaintext)
+    }
+
+    /// Opens the one sealed block holding a granule's rows `part × part_rows ..`.
+    fn open_part(&self, column: &StoredColumn, granule: usize, part: usize) -> Result<Zeroizing<Vec<u8>>, VectorError> {
+        let block = self.granule_parts(column, granule)?.get(part).ok_or_else(truncated)?;
+        self.open_sealed(block)
+    }
+
+    fn open_sealed(&self, block: &BlockRef) -> Result<Zeroizing<Vec<u8>>, VectorError> {
         let sealed_len = usize::try_from(block.sealed_len).map_err(|_| truncated())?;
         let sealed = match self.source.borrow_range(block.offset, sealed_len) {
             Some(sealed) => Cow::Borrowed(sealed),

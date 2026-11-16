@@ -15,7 +15,7 @@ pub use catalogue::{
 };
 pub use constant::{
     DEFAULT_OVERSAMPLE, EMBEDDING_COLUMN_ID, EVENT_ID_COLUMN, GRANULE_ROWS, ROOM_ID_COLUMN, SENDER_COLUMN,
-    TIMESTAMP_COLUMN,
+    TIMESTAMP_COLUMN, VECTOR_SUBBLOCK_ROWS,
 };
 pub use deletes::SegmentDeletes;
 pub use error::*;

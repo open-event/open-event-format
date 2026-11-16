@@ -49,6 +49,19 @@ impl FileKeys {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn random_granule_vectors() -> Result<Self, VectorError> {
+        Ok(FileKeys {
+            version: SEGMENT_VERSION_GRANULE_VECTORS,
+            ..Self::random()?
+        })
+    }
+
+    /// Whether vector columns are sealed in `VECTOR_SUBBLOCK_ROWS` sub-blocks rather than one block per granule.
+    pub(crate) fn vector_subblocks(&self) -> bool {
+        self.version >= SEGMENT_VERSION
+    }
+
     pub(crate) fn seal(&self, index: u64, plaintext: &[u8]) -> Result<Vec<u8>, VectorError> {
         AeadScheme::AesGcm256
             .seal(&self.data_key, &self.nonce(index), &self.aad(index), plaintext)
@@ -111,7 +124,10 @@ impl FileKeys {
             }));
         }
         let version = u16::from_le_bytes([header.get(4).copied().unwrap_or(0), header.get(5).copied().unwrap_or(0)]);
-        if version != SEGMENT_VERSION && version != SEGMENT_VERSION_SHARED_NONCE {
+        if !matches!(
+            version,
+            SEGMENT_VERSION | SEGMENT_VERSION_GRANULE_VECTORS | SEGMENT_VERSION_SHARED_NONCE
+        ) {
             return Err(VectorError::Format(crate::error::FormatError::UnsupportedVersion {
                 field: "vector segment version",
                 found: u32::from(version),

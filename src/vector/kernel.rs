@@ -26,47 +26,154 @@ impl PreparedQuery {
 
     pub fn score(&self, element: VectorElement, row: &[u8]) -> f32 {
         let dimension = self.values.len();
+        let l2 = self.metric == VectorMetric::L2;
         match element {
             VectorElement::U1 => {
                 let bits = row.get(..self.bits.len()).unwrap_or(row);
                 dimension as f32 - hamming(bits, &self.bits) as f32
             }
-            VectorElement::I8 if self.metric != VectorMetric::L2 => {
-                let (values, trailer) = row.split_at(dimension.min(row.len()));
-                let (scale, offset) = trailer_pair(trailer);
-                scale * dot_i8(values, &self.values) + offset * self.sum
-            }
-            VectorElement::F32 if self.metric != VectorMetric::L2 => row
-                .chunks_exact(4)
-                .zip(&self.values)
-                .map(|(bytes, value)| f32::from_le_bytes(bytes.try_into().unwrap_or([0; 4])) * value)
-                .sum(),
-            VectorElement::F32 => self.combine(row.chunks_exact(4).map(|bytes| f32::from_le_bytes(array(bytes)))),
-            VectorElement::F16 => self.combine(
-                row.chunks_exact(2)
-                    .map(|bytes| f16::from_le_bytes(array(bytes)).to_f32()),
-            ),
             VectorElement::I8 => {
                 let (values, trailer) = row.split_at(dimension.min(row.len()));
                 let (scale, offset) = trailer_pair(trailer);
-                self.combine(values.iter().map(|q| f32::from(*q as i8) * scale + offset))
+                if l2 {
+                    -l2_i8(values, scale, offset, &self.values)
+                } else {
+                    scale * dot_i8(values, &self.values) + offset * self.sum
+                }
             }
-        }
-    }
-
-    fn combine(&self, stored: impl Iterator<Item = f32>) -> f32 {
-        let pairs = stored.zip(&self.values);
-        match self.metric {
-            VectorMetric::L2 => -pairs
-                .map(|(stored, value)| (stored - value) * (stored - value))
-                .sum::<f32>(),
-            VectorMetric::Cosine | VectorMetric::Dot => pairs.map(|(stored, value)| stored * value).sum(),
+            VectorElement::F32 if l2 => -l2_f32(row, &self.values),
+            VectorElement::F32 => dot_f32(row, &self.values),
+            VectorElement::F16 if l2 => -l2_f16(row, &self.values),
+            VectorElement::F16 => dot_f16(row, &self.values),
         }
     }
 }
 
-fn array<const N: usize>(bytes: &[u8]) -> [u8; N] {
-    bytes.try_into().unwrap_or([0; N])
+const LANES: usize = 8;
+
+fn lanes_total(lanes: &[f32; LANES], tail: f32) -> f32 {
+    lanes.iter().sum::<f32>() + tail
+}
+
+#[multiversion(targets("x86_64+avx512f+avx512bw+avx512dq+avx512vl", "x86_64+avx2+fma", "aarch64+neon"))]
+fn dot_f32(stored: &[u8], query: &[f32]) -> f32 {
+    let (stored, _) = stored.as_chunks::<4>();
+    let mut lanes = [0f32; LANES];
+    let rows = stored.chunks_exact(LANES);
+    let queries = query.chunks_exact(LANES);
+    let tail = rows
+        .remainder()
+        .iter()
+        .zip(queries.remainder())
+        .map(|(bytes, value)| f32::from_le_bytes(*bytes) * value)
+        .sum();
+    for (row, query) in rows.zip(queries) {
+        for ((lane, bytes), value) in lanes.iter_mut().zip(row).zip(query) {
+            *lane += f32::from_le_bytes(*bytes) * value;
+        }
+    }
+    lanes_total(&lanes, tail)
+}
+
+#[multiversion(targets("x86_64+avx512f+avx512bw+avx512dq+avx512vl", "x86_64+avx2+fma", "aarch64+neon"))]
+fn l2_f32(stored: &[u8], query: &[f32]) -> f32 {
+    let (stored, _) = stored.as_chunks::<4>();
+    let mut lanes = [0f32; LANES];
+    let rows = stored.chunks_exact(LANES);
+    let queries = query.chunks_exact(LANES);
+    let tail = rows
+        .remainder()
+        .iter()
+        .zip(queries.remainder())
+        .map(|(bytes, value)| {
+            let delta = f32::from_le_bytes(*bytes) - value;
+            delta * delta
+        })
+        .sum();
+    for (row, query) in rows.zip(queries) {
+        for ((lane, bytes), value) in lanes.iter_mut().zip(row).zip(query) {
+            let delta = f32::from_le_bytes(*bytes) - value;
+            *lane += delta * delta;
+        }
+    }
+    lanes_total(&lanes, tail)
+}
+
+#[multiversion(targets("x86_64+avx512f+avx512bw+avx512dq+avx512vl", "x86_64+avx2+fma+f16c", "aarch64+neon"))]
+fn dot_f16(stored: &[u8], query: &[f32]) -> f32 {
+    let (stored, _) = stored.as_chunks::<2>();
+    let mut lanes = [0f32; LANES];
+    let rows = stored.chunks_exact(LANES);
+    let queries = query.chunks_exact(LANES);
+    let tail = rows
+        .remainder()
+        .iter()
+        .zip(queries.remainder())
+        .map(|(bytes, value)| f16::from_le_bytes(*bytes).to_f32() * value)
+        .sum();
+    for (row, query) in rows.zip(queries) {
+        let mut decoded = [0f32; LANES];
+        decoded
+            .iter_mut()
+            .zip(row)
+            .for_each(|(slot, bytes)| *slot = f16::from_le_bytes(*bytes).to_f32());
+        for ((lane, stored), value) in lanes.iter_mut().zip(decoded).zip(query) {
+            *lane += stored * value;
+        }
+    }
+    lanes_total(&lanes, tail)
+}
+
+#[multiversion(targets("x86_64+avx512f+avx512bw+avx512dq+avx512vl", "x86_64+avx2+fma+f16c", "aarch64+neon"))]
+fn l2_f16(stored: &[u8], query: &[f32]) -> f32 {
+    let (stored, _) = stored.as_chunks::<2>();
+    let mut lanes = [0f32; LANES];
+    let rows = stored.chunks_exact(LANES);
+    let queries = query.chunks_exact(LANES);
+    let tail = rows
+        .remainder()
+        .iter()
+        .zip(queries.remainder())
+        .map(|(bytes, value)| {
+            let delta = f16::from_le_bytes(*bytes).to_f32() - value;
+            delta * delta
+        })
+        .sum();
+    for (row, query) in rows.zip(queries) {
+        let mut decoded = [0f32; LANES];
+        decoded
+            .iter_mut()
+            .zip(row)
+            .for_each(|(slot, bytes)| *slot = f16::from_le_bytes(*bytes).to_f32());
+        for ((lane, stored), value) in lanes.iter_mut().zip(decoded).zip(query) {
+            let delta = stored - value;
+            *lane += delta * delta;
+        }
+    }
+    lanes_total(&lanes, tail)
+}
+
+#[multiversion(targets("x86_64+avx512f+avx512bw+avx512dq+avx512vl", "x86_64+avx2+fma", "aarch64+neon"))]
+fn l2_i8(stored: &[u8], scale: f32, offset: f32, query: &[f32]) -> f32 {
+    let mut lanes = [0f32; LANES];
+    let rows = stored.chunks_exact(LANES);
+    let queries = query.chunks_exact(LANES);
+    let tail = rows
+        .remainder()
+        .iter()
+        .zip(queries.remainder())
+        .map(|(q, value)| {
+            let delta = f32::from(*q as i8) * scale + offset - value;
+            delta * delta
+        })
+        .sum();
+    for (row, query) in rows.zip(queries) {
+        for ((lane, q), value) in lanes.iter_mut().zip(row).zip(query) {
+            let delta = f32::from(*q as i8) * scale + offset - value;
+            *lane += delta * delta;
+        }
+    }
+    lanes_total(&lanes, tail)
 }
 
 pub fn top_k(
@@ -135,13 +242,21 @@ fn hamming(left: &[u8], right: &[u8]) -> u32 {
 
 #[multiversion(targets("x86_64+avx512f+avx512bw+avx512dq+avx512vl", "x86_64+avx2+fma", "aarch64+neon"))]
 fn dot_i8(stored: &[u8], query: &[f32]) -> f32 {
-    let mut lanes = [0f32; 8];
-    for (stored, query) in stored.chunks(8).zip(query.chunks(8)) {
-        for ((lane, q), value) in lanes.iter_mut().zip(stored).zip(query) {
+    let mut lanes = [0f32; LANES];
+    let rows = stored.chunks_exact(LANES);
+    let queries = query.chunks_exact(LANES);
+    let tail = rows
+        .remainder()
+        .iter()
+        .zip(queries.remainder())
+        .map(|(q, value)| f32::from(*q as i8) * value)
+        .sum();
+    for (row, query) in rows.zip(queries) {
+        for ((lane, q), value) in lanes.iter_mut().zip(row).zip(query) {
             *lane += f32::from(*q as i8) * value;
         }
     }
-    lanes.iter().sum()
+    lanes_total(&lanes, tail)
 }
 
 #[derive(Debug)]

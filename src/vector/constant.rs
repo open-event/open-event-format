@@ -1,7 +1,10 @@
 pub const GRANULE_ROWS: usize = 4096;
+/// Rows per sealed vector sub-block from `SEGMENT_VERSION` 3: a rescore or row read opens only these.
+pub const VECTOR_SUBBLOCK_ROWS: usize = 128;
 pub const BLOCK_ALIGNMENT: usize = 64;
 pub const SEGMENT_MAGIC: &[u8; 4] = b"OEFV";
-pub const SEGMENT_VERSION: u16 = 2;
+pub const SEGMENT_VERSION: u16 = 3;
+pub const SEGMENT_VERSION_GRANULE_VECTORS: u16 = 2;
 pub const SEGMENT_VERSION_SHARED_NONCE: u16 = 1;
 pub const BLOCK_NONCE_LEN: usize = 12;
 pub const NONCE_RANDOM_LEN: usize = BLOCK_NONCE_LEN - 8;
