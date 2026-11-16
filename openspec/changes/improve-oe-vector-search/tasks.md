@@ -32,3 +32,22 @@
       `FixedSizeList` granule view and prefix reads). The norm is stored where it pays: the v4 I8 trailer.
 - [ ] Not done: sub-block-level skipping in the coarse scan (needs per-sub-block centres/radii in the footer);
       RaBitQ for very small dimensions is noisy (bound ∝ 1/√d), so tiny-dimension segments rerank many rows.
+- [x] Partition index (IVF) as an external, droppable artifact: `PartitionIndex::build` (seeded k-means,
+      `PartitionParams { partitions, iterations, seed }`), `encode`/`decode` (`OEVI` v1, optional seal under the
+      segment wrapping key), `publish_segment_index` / `load_segment_index` / `drop_segment_index`, and
+      `VectorSegmentEntry::index` (serde default). Loading checks the object BLAKE3, segment content hash, model
+      digest, row count and partition count.
+- [x] `search_segments_indexed` / `search_catalogued_segments_indexed`: probe `nprobes` (default 8) closest
+      partitions, then widen to every partition whose bound reaches the k-th score; probed rows ∩ filter ∖ deletes
+      is the row filter. A rejected index is counted (`SearchStats::indexes_rejected`) and the segment scanned.
+- [x] Tests: indexed answer equals the scan on clustered data (8 000 × 64, 64 clusters in row order; recall@10 = 1.0
+      cosine and L2, blocks opened per query 66 → 16–18, ~8.3 of 85 partitions probed); digest, model, content and
+      key mismatches rejected; a dropped or rejected index still answers identically; filters and deletes combine.
+- [x] Filters: byte hash sets over borrowed strings; absent granule stats mean "may match"; adaptive pre/post
+      filtering (`FilterStrategy`, `POST_FILTER_SELECTIVITY` = 0.75) with tests that post, pre and adaptive agree.
+- [ ] Not done: the partition index only cuts blocks opened when a partition's rows are clustered in row order
+      (rows are sealed in 128-row sub-blocks in write order); for time-ordered segments it cuts rows scored but not
+      decryption. Reordering rows by partition at compaction would fix this. The radius bound is loose when there
+      are fewer partitions than natural clusters (200 clusters, 90 partitions probed ~35). Filter selectivity is
+      estimated from min/max granule stats only, so most string filters look unselective and are post-filtered
+      first.

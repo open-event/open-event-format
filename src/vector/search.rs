@@ -1,9 +1,12 @@
 use super::constant::*;
 use super::deletes::SegmentDeletes;
 use super::error::VectorError;
-use super::model::{EmbeddingModel, SegmentManifest, VectorMetric};
+use super::ivf::PartitionIndex;
+use super::kernel::TopK;
+use super::model::{EmbeddingModel, ScoredRow, SegmentManifest, VectorMetric};
 use super::segment::{ColumnStats, SegmentReader, SegmentSource};
 use crate::indexes::bitmap::{RoaringRangeBitmap, RowRange};
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SearchFilter {
@@ -34,7 +37,7 @@ pub struct VectorSearch<'a> {
 pub struct SearchStats {
     /// Segments whose blocks were scanned.
     pub segments_searched: usize,
-    /// Segments skipped because their score bound could not beat the running k-th best score.
+    /// Segments skipped because their score bound (or every partition bound) could not beat the running k-th score.
     pub segments_skipped: usize,
     /// Coarse rows estimated.
     pub rows_scanned: u64,
@@ -42,6 +45,49 @@ pub struct SearchStats {
     pub rows_candidate: u64,
     /// Rows scored with the fine representation.
     pub rows_reranked: u64,
+    /// Partition-index partitions whose rows were scanned.
+    pub partitions_probed: u64,
+    /// Partition-index partitions never scanned because their bound could not beat the running k-th score.
+    pub partitions_pruned: u64,
+    /// Segments answered by scanning first and filtering the candidates (post-filter).
+    pub segments_post_filtered: usize,
+    /// Published partition indexes that failed to load or verify and were ignored.
+    pub indexes_rejected: usize,
+}
+
+/// How a metadata filter is applied to one segment.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FilterStrategy {
+    /// Post-filter when the granule statistics estimate that the filter keeps at least
+    /// `POST_FILTER_SELECTIVITY` of the rows, otherwise pre-filter.
+    #[default]
+    Adaptive,
+    /// Decode the filter columns of every granule that may match and scan only matching rows.
+    PreFilter,
+    /// Scan without the filter, then filter the candidates, widening (and finally pre-filtering) if fewer than
+    /// `k` survive.
+    PostFilter,
+}
+
+/// Estimated kept fraction at or above which `FilterStrategy::Adaptive` post-filters.
+pub const POST_FILTER_SELECTIVITY: f64 = 0.75;
+/// Partitions probed first (closest centroids) when a segment has a partition index; the probe then widens to
+/// every partition whose bound can still beat the k-th best score, so the result equals a full scan.
+pub const DEFAULT_NPROBES: usize = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchOptions {
+    pub filter_strategy: FilterStrategy,
+    pub nprobes: usize,
+}
+
+impl Default for SearchOptions {
+    fn default() -> Self {
+        Self {
+            filter_strategy: FilterStrategy::Adaptive,
+            nprobes: DEFAULT_NPROBES,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -76,51 +122,90 @@ pub fn search_segments_with_stats<S: SegmentSource>(
     deletes: &[Option<&SegmentDeletes>],
     search: &VectorSearch<'_>,
 ) -> Result<(Vec<SearchHit>, SearchStats), VectorError> {
+    search_segments_indexed(segments, deletes, &[], search, SearchOptions::default())
+}
+
+/// `search_segments_with_stats` with an optional partition index per segment (`indexes[i]` for `segments[i]`;
+/// missing entries mean none). A segment with an index probes its partitions best bound first and stops once no
+/// remaining partition can beat the k-th best score; one without is scanned. Both give the same result.
+pub fn search_segments_indexed<S: SegmentSource>(
+    segments: &[SegmentReader<S>],
+    deletes: &[Option<&SegmentDeletes>],
+    indexes: &[Option<&PartitionIndex>],
+    search: &VectorSearch<'_>,
+    options: SearchOptions,
+) -> Result<(Vec<SearchHit>, SearchStats), VectorError> {
     let mut stats = SearchStats::default();
-    let mut hits: Vec<(usize, super::model::ScoredRow)> = Vec::new();
-    for segment in segments {
+    let mut hits: Vec<(usize, ScoredRow)> = Vec::new();
+    for (index, segment) in segments.iter().enumerate() {
         segment.manifest().model.require_same(search.model)?;
+        if let Some(partitions) = indexes.get(index).copied().flatten() {
+            partitions.check(segment)?;
+        }
     }
+    let allowed = AllowedValues::new(&search.filter);
     let order = nearest_segments(segments, search.query, search.model, segments.len())?;
     for index in order {
         let Some(segment) = segments.get(index) else {
             continue;
         };
-        let Some(mut filter) = row_filter(segment, &search.filter)? else {
-            continue;
-        };
-        if let Some(deletes) = deletes.get(index).copied().flatten().filter(|d| d.deleted_count() > 0) {
-            filter = filter.difference(&deletes.bitmap());
-            if filter.is_empty() {
-                continue;
-            }
-        }
-        let representations = segment.representations(EMBEDDING_COLUMN_ID);
-        let (Some(coarse), Some(fine)) = (representations.first(), representations.last()) else {
-            continue;
-        };
-        let filter = (!search.filter.is_empty() || filter.count() < segment.row_count()).then_some(&filter);
+        let deleted = deletes
+            .get(index)
+            .copied()
+            .flatten()
+            .filter(|d| d.deleted_count() > 0)
+            .map(SegmentDeletes::bitmap);
         let threshold = if hits.len() >= search.k && search.k > 0 {
             hits.last().map_or(f32::NEG_INFINITY, |(_, row)| row.score)
         } else {
             f32::NEG_INFINITY
         };
-        let skipped = stats.segments_skipped;
-        let scored = segment.search_bounded(
-            coarse.column_id,
-            fine.column_id,
-            super::segment::BoundedSearch {
-                cap: (search.oversample > 0).then_some(search.oversample),
-                filter,
-                k: search.k,
-                model: search.model,
-                query: search.query,
-                threshold,
-            },
-            &mut stats,
-        )?;
-        if stats.segments_skipped == skipped {
+        let scan = SegmentScan {
+            options,
+            partitions: indexes.get(index).copied().flatten(),
+            search,
+            segment,
+        };
+        let before = stats;
+        let scored = if search.filter.is_empty() {
+            let live = deleted.map(|deleted| RoaringRangeBitmap::from_ranges(all_rows(segment)).difference(&deleted));
+            if live.as_ref().is_some_and(RoaringRangeBitmap::is_empty) {
+                continue;
+            }
+            scan.run(live.as_ref(), search.k, threshold, &mut stats)?
+        } else {
+            let post = match options.filter_strategy {
+                FilterStrategy::PreFilter => None,
+                FilterStrategy::PostFilter => Some(()),
+                FilterStrategy::Adaptive => {
+                    (estimated_selectivity(segment, &search.filter) >= POST_FILTER_SELECTIVITY).then_some(())
+                }
+            };
+            let post = match post {
+                Some(()) => scan.post_filter(deleted.as_ref(), &allowed, threshold, &mut stats)?,
+                None => None,
+            };
+            match post {
+                Some(rows) => rows,
+                None => {
+                    let Some(mut filter) = row_filter(segment, &search.filter, &allowed)? else {
+                        continue;
+                    };
+                    if let Some(deleted) = &deleted {
+                        filter = filter.difference(deleted);
+                    }
+                    if filter.is_empty() {
+                        continue;
+                    }
+                    scan.run(Some(&filter), search.k, threshold, &mut stats)?
+                }
+            }
+        };
+        stats.segments_skipped = before.segments_skipped;
+        if stats.rows_scanned > before.rows_scanned {
             stats.segments_searched += 1;
+        } else {
+            stats.segments_skipped += 1;
         }
         hits.extend(scored.into_iter().map(|row| (index, row)));
         sort_hits(&mut hits);
@@ -161,7 +246,129 @@ pub fn search_segments_with_stats<S: SegmentSource>(
     Ok((hits, stats))
 }
 
-fn sort_hits(hits: &mut [(usize, super::model::ScoredRow)]) {
+fn all_rows<S: SegmentSource>(segment: &SegmentReader<S>) -> [RowRange; 1] {
+    [RowRange {
+        start: 0,
+        end: segment.row_count(),
+    }]
+}
+
+/// One segment's search: an optional partition index over the bounded two-stage scan.
+struct SegmentScan<'a, S> {
+    options: SearchOptions,
+    partitions: Option<&'a PartitionIndex>,
+    search: &'a VectorSearch<'a>,
+    segment: &'a SegmentReader<S>,
+}
+
+impl<S: SegmentSource> SegmentScan<'_, S> {
+    /// The segment's best `k` rows among `filter` (all rows when `None`) scoring at least `threshold`.
+    fn run(
+        &self,
+        filter: Option<&RoaringRangeBitmap>,
+        k: usize,
+        threshold: f32,
+        stats: &mut SearchStats,
+    ) -> Result<Vec<ScoredRow>, VectorError> {
+        let representations = self.segment.representations(EMBEDDING_COLUMN_ID);
+        let (Some(coarse), Some(fine)) = (representations.first(), representations.last()) else {
+            return Ok(Vec::new());
+        };
+        let bounded = |filter: Option<&RoaringRangeBitmap>, threshold: f32, stats: &mut SearchStats| {
+            self.segment.search_bounded(
+                coarse.column_id,
+                fine.column_id,
+                super::segment::BoundedSearch {
+                    cap: (self.search.oversample > 0).then_some(self.search.oversample),
+                    filter,
+                    k,
+                    model: self.search.model,
+                    query: self.search.query,
+                    threshold,
+                },
+                stats,
+            )
+        };
+        let Some(partitions) = self.partitions else {
+            let filter = filter.filter(|filter| filter.count() < self.segment.row_count());
+            return bounded(filter, threshold, stats);
+        };
+        // Round one probes the `nprobes` partitions whose centroids score best; every later round probes, in one
+        // scan, every unprobed partition whose bound still reaches the k-th best score, until none does.
+        let ranked = partitions.ranked(self.search.query);
+        let mut probed = vec![false; ranked.len()];
+        let mut best = TopK::new(k);
+        let mut first_round = true;
+        loop {
+            let bar = best.threshold().map_or(threshold, |kth| kth.max(threshold));
+            let probe: Vec<usize> = if first_round {
+                partitions
+                    .closest(self.search.query)
+                    .into_iter()
+                    .filter(|partition| ranked.iter().any(|(p, upper)| p == partition && *upper >= bar))
+                    .take(self.options.nprobes.max(1))
+                    .collect()
+            } else {
+                ranked
+                    .iter()
+                    .filter(|(partition, upper)| *upper >= bar && !probed.get(*partition).copied().unwrap_or(true))
+                    .map(|(partition, _)| *partition)
+                    .collect()
+            };
+            first_round = false;
+            if probe.is_empty() {
+                break;
+            }
+            for partition in &probe {
+                if let Some(slot) = probed.get_mut(*partition) {
+                    *slot = true;
+                }
+            }
+            stats.partitions_probed += probe.len() as u64;
+            let mut rows = partitions.rows_of(&probe);
+            if let Some(filter) = filter {
+                rows = rows.intersect(filter);
+            }
+            if rows.is_empty() {
+                continue;
+            }
+            for row in bounded(Some(&rows), bar, stats)? {
+                best.offer(row);
+            }
+        }
+        stats.partitions_pruned += probed.iter().filter(|probed| !**probed).count() as u64;
+        Ok(best.into_sorted())
+    }
+
+    /// Scans for more than `k` rows without the metadata filter, then keeps those passing it. Widens once if
+    /// fewer than `k` survive; returns `None` (pre-filter instead) if they still do not.
+    fn post_filter(
+        &self,
+        deleted: Option<&RoaringRangeBitmap>,
+        allowed: &AllowedValues<'_>,
+        threshold: f32,
+        stats: &mut SearchStats,
+    ) -> Result<Option<Vec<ScoredRow>>, VectorError> {
+        let k = self.search.k;
+        let live = deleted.map(|deleted| RoaringRangeBitmap::from_ranges(all_rows(self.segment)).difference(deleted));
+        for wanted in [k.saturating_mul(4).max(64), k.saturating_mul(32).max(512)] {
+            let rows = self.run(live.as_ref(), wanted, threshold, stats)?;
+            let exhausted = rows.len() < wanted;
+            let mut sorted: Vec<u64> = rows.iter().map(|row| row.row).collect();
+            sorted.sort_unstable();
+            let keep = rows_matching(self.segment, &self.search.filter, allowed, &sorted)?;
+            let mut survivors: Vec<ScoredRow> = rows.into_iter().filter(|row| keep.contains(row.row)).collect();
+            if survivors.len() >= k || exhausted {
+                survivors.truncate(k);
+                stats.segments_post_filtered += 1;
+                return Ok(Some(survivors));
+            }
+        }
+        Ok(None)
+    }
+}
+
+fn sort_hits(hits: &mut [(usize, ScoredRow)]) {
     hits.sort_by(|left, right| {
         right
             .1
@@ -172,9 +379,72 @@ fn sort_hits(hits: &mut [(usize, super::model::ScoredRow)]) {
     });
 }
 
+/// The filter's allowed string values as byte sets, built once per search.
+struct AllowedValues<'a> {
+    rooms: Option<HashSet<&'a [u8]>>,
+    senders: Option<HashSet<&'a [u8]>>,
+}
+
+impl<'a> AllowedValues<'a> {
+    fn new(filter: &'a SearchFilter) -> Self {
+        let set = |values: &'a Option<Vec<String>>| {
+            values
+                .as_ref()
+                .map(|values| values.iter().map(|value| value.as_bytes()).collect())
+        };
+        Self {
+            rooms: set(&filter.room_ids),
+            senders: set(&filter.senders),
+        }
+    }
+}
+
+/// Which local rows of `granule` pass `filter`.
+fn granule_matches<S: SegmentSource>(
+    segment: &SegmentReader<S>,
+    granule: usize,
+    filter: &SearchFilter,
+    allowed: &AllowedValues<'_>,
+) -> Result<Vec<bool>, VectorError> {
+    let mut keep = vec![true; segment.granule_rows(granule)];
+    for (name, set) in [(ROOM_ID_COLUMN, &allowed.rooms), (SENDER_COLUMN, &allowed.senders)] {
+        let Some(set) = set else {
+            continue;
+        };
+        if !keep.contains(&true) {
+            break;
+        }
+        let mut seen = vec![false; keep.len()];
+        match segment.for_each_string(name, granule, |local, value| {
+            if set.contains(value)
+                && let Some(slot) = seen.get_mut(local)
+            {
+                *slot = true;
+            }
+        }) {
+            Ok(()) | Err(VectorError::MissingColumn { .. }) => {}
+            Err(error) => return Err(error),
+        }
+        keep.iter_mut().zip(seen).for_each(|(kept, seen)| *kept &= seen);
+    }
+    if let Some((from, to)) = filter.time_range
+        && keep.contains(&true)
+    {
+        let times = match segment.integers(TIMESTAMP_COLUMN, granule) {
+            Err(VectorError::MissingColumn { .. }) => Vec::new(),
+            other => other?,
+        };
+        keep.iter_mut()
+            .enumerate()
+            .for_each(|(local, kept)| *kept &= times.get(local).is_some_and(|time| (from..=to).contains(time)));
+    }
+    Ok(keep)
+}
+
 fn row_filter<S: SegmentSource>(
     segment: &SegmentReader<S>,
     filter: &SearchFilter,
+    allowed: &AllowedValues<'_>,
 ) -> Result<Option<RoaringRangeBitmap>, VectorError> {
     let mut ranges = Vec::new();
     let mut rows = Vec::new();
@@ -191,23 +461,13 @@ fn row_filter<S: SegmentSource>(
             });
             continue;
         }
-        let rooms = load_strings(segment, ROOM_ID_COLUMN, granule, filter.room_ids.is_some())?;
-        let senders = load_strings(segment, SENDER_COLUMN, granule, filter.senders.is_some())?;
-        let times = match filter.time_range {
-            Some(_) => Some(segment.integers(TIMESTAMP_COLUMN, granule)?),
-            None => None,
-        };
-        for local in 0..count {
-            let room_ok = matches(&rooms, filter.room_ids.as_deref(), local);
-            let sender_ok = matches(&senders, filter.senders.as_deref(), local);
-            let time_ok = match (filter.time_range, &times) {
-                (Some((from, to)), Some(times)) => times.get(local).is_some_and(|time| (from..=to).contains(time)),
-                _ => true,
-            };
-            if room_ok && sender_ok && time_ok {
-                rows.push(first + local as u64);
-            }
-        }
+        let keep = granule_matches(segment, granule, filter, allowed)?;
+        rows.extend(
+            keep.iter()
+                .enumerate()
+                .filter(|(_, kept)| **kept)
+                .map(|(local, _)| first + local as u64),
+        );
     }
     let bitmap = if filter.is_empty() {
         RoaringRangeBitmap::from_ranges(ranges)
@@ -217,42 +477,68 @@ fn row_filter<S: SegmentSource>(
     Ok((!bitmap.is_empty()).then_some(bitmap))
 }
 
-fn load_strings<S: SegmentSource>(
+/// The rows of `sorted` that pass `filter`, decoding filter columns only for the granules those rows fall in.
+fn rows_matching<S: SegmentSource>(
     segment: &SegmentReader<S>,
-    name: &str,
+    filter: &SearchFilter,
+    allowed: &AllowedValues<'_>,
+    sorted: &[u64],
+) -> Result<RoaringRangeBitmap, VectorError> {
+    let mut kept = Vec::new();
+    let mut remaining = sorted;
+    for granule in 0..segment.granule_count() {
+        if remaining.is_empty() {
+            break;
+        }
+        let first = segment.granule_first_row(granule);
+        let end = first + segment.granule_rows(granule) as u64;
+        let split = remaining.partition_point(|row| *row < end);
+        let (inside, rest) = remaining.split_at(split);
+        remaining = rest;
+        if inside.is_empty() || !granule_may_match(segment, granule, filter) {
+            continue;
+        }
+        let keep = granule_matches(segment, granule, filter, allowed)?;
+        kept.extend(
+            inside
+                .iter()
+                .filter(|row| keep.get((**row - first) as usize).copied().unwrap_or(false)),
+        );
+    }
+    Ok(RoaringRangeBitmap::from_rows(kept))
+}
+
+/// Fraction of the segment's rows in granules whose statistics say the filter may match.
+pub(super) fn estimated_selectivity<S: SegmentSource>(segment: &SegmentReader<S>, filter: &SearchFilter) -> f64 {
+    let total = segment.row_count();
+    if total == 0 {
+        return 0.0;
+    }
+    let may: u64 = (0..segment.granule_count())
+        .filter(|granule| granule_may_match(segment, *granule, filter))
+        .map(|granule| segment.granule_rows(granule) as u64)
+        .sum();
+    may as f64 / total as f64
+}
+
+/// Whether a granule may hold matching rows. Absent statistics mean "may match".
+pub(super) fn granule_may_match<S: SegmentSource>(
+    segment: &SegmentReader<S>,
     granule: usize,
-    wanted: bool,
-) -> Result<Option<Vec<String>>, VectorError> {
-    if !wanted {
-        return Ok(None);
-    }
-    match segment.strings(name, granule) {
-        Ok(values) => Ok(Some(values)),
-        Err(VectorError::MissingColumn { .. }) => Ok(Some(Vec::new())),
-        Err(error) => Err(error),
-    }
-}
-
-fn matches(values: &Option<Vec<String>>, allowed: Option<&[String]>, local: usize) -> bool {
-    match (values, allowed) {
-        (Some(values), Some(allowed)) => values.get(local).is_some_and(|value| allowed.contains(value)),
-        _ => true,
-    }
-}
-
-fn granule_may_match<S: SegmentSource>(segment: &SegmentReader<S>, granule: usize, filter: &SearchFilter) -> bool {
+    filter: &SearchFilter,
+) -> bool {
     let strings_may_match = |name: &str, allowed: &Option<Vec<String>>| match allowed {
         None => true,
         Some(allowed) => match segment.column_stats(name, granule) {
             Some(ColumnStats::String { max, min }) => allowed.iter().any(|value| value >= min && value <= max),
-            _ => false,
+            _ => true,
         },
     };
     let time_may_match = match filter.time_range {
         None => true,
         Some((from, to)) => match segment.column_stats(TIMESTAMP_COLUMN, granule) {
             Some(ColumnStats::Integer { max, min }) => *min <= to && *max >= from,
-            _ => false,
+            _ => true,
         },
     };
     strings_may_match(ROOM_ID_COLUMN, &filter.room_ids)

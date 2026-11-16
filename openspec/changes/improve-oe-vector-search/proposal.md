@@ -31,6 +31,21 @@ vectorise.
   bounds instead of a fixed `k × oversample` (which becomes a cap), visit segments nearest centroid first and
   pass the running k-th exact score into each segment. Versions 1–3 read unchanged (Hamming U1, per-row I8).
 
+- Partition index (issue #98 item 2): an external, droppable IVF artifact per segment, following the manifest-
+  referenced artifact rule (incorporate-lance-learnings design §2). Deterministic seeded Lloyd k-means (fixed
+  iterations, `⌈√rows⌉` partitions by default) over the segment's fine vectors; the object (`OEVI` v1) holds the
+  segment `content_hash`, model, per-partition centroid, radius and delta-varint sorted row ids, optionally sealed
+  with XChaCha20-Poly1305 under a key derived from the segment's wrapping key. `VectorSegmentEntry` gains
+  `index: Option<SegmentIndexRef>` (serde default) with the object's BLAKE3, the content hash and model digest it is
+  bound to. Search probes the `nprobes` closest partitions, then every partition whose bound (`centroid score +
+  |q|·radius`, or the L2 ball gap) still reaches the k-th score; the probed rows become the row filter, so the
+  scan opens only their sub-blocks. Without an index (or after it is dropped or rejected) the segment is scanned,
+  with the same result.
+- Filters (issue #98 item 5): allowed values are byte hash sets compared against borrowed string bytes (no per-row
+  `String`); granules with no statistics may match; an adaptive strategy post-filters (scan, then filter the
+  candidates, widen once, then fall back to pre-filtering) when granule statistics estimate the filter keeps at
+  least 75% of rows. Results equal the pre-filter path.
+
 ## Impact
 
 - `oe-vector-columns`: segment layout version 3; older segments remain readable.

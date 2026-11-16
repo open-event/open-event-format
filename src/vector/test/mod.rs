@@ -1213,3 +1213,6 @@ fn a_second_version_segment_keeps_one_vector_block_per_granule() {
 
 #[path = "rabitq.rs"]
 mod rabitq;
+
+#[path = "ivf.rs"]
+mod ivf;

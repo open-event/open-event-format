@@ -684,6 +684,24 @@ impl<S: SegmentSource> SegmentReader<S> {
         decode_strings(&self.open_block(column, granule)?)
     }
 
+    /// Calls `visit(local_row, value_bytes)` for each string of a granule without allocating per value.
+    pub(crate) fn for_each_string(
+        &self,
+        name: &str,
+        granule: usize,
+        mut visit: impl FnMut(usize, &[u8]),
+    ) -> Result<(), VectorError> {
+        let column = self.typed_column(name, ColumnKind::String)?;
+        let plaintext = self.open_block(column, granule)?;
+        let mut reader = Reader::new(&plaintext);
+        let count = reader.u32("string count")? as usize;
+        for local in 0..count {
+            let len = reader.u32("string value")? as usize;
+            visit(local, reader.take(len, "string value")?);
+        }
+        Ok(())
+    }
+
     pub fn integers(&self, name: &str, granule: usize) -> Result<Vec<i64>, VectorError> {
         let column = self.typed_column(name, ColumnKind::I64)?;
         let plaintext = self.open_block(column, granule)?;
