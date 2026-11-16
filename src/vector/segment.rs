@@ -1,8 +1,8 @@
+use super::codec::{CodecParams, SegmentCodec};
 use super::constant::*;
 use super::error::VectorError;
-use super::kernel::{PreparedQuery, TopK, top_k};
+use super::kernel::{TopK, for_each_row};
 use super::model::*;
-use super::quantize::{decode_row, encode_row};
 use super::seal::{FileKeys, WrappingKey};
 use crate::file::bytes::{Reader, Writer};
 use crate::indexes::bitmap::RoaringRangeBitmap;
@@ -59,6 +59,13 @@ pub(crate) fn write_segment_sealed_by(
             .collect()
     };
 
+    let params = keys
+        .segment_codec()
+        .then(|| CodecParams::build(&spec.model, &input.vectors, &spec.representations));
+    let codec = match &params {
+        Some(params) => SegmentCodec::v4(&spec.model, params.clone()),
+        None => SegmentCodec::legacy(&spec.model),
+    };
     let mut file = keys.header(wrapping)?;
     let mut columns = Vec::new();
     let mut block_index = 0u64;
@@ -138,7 +145,7 @@ pub(crate) fn write_segment_sealed_by(
                 let part_end = (part_start + part_rows).min(*end);
                 let mut plaintext = Zeroizing::new(Vec::with_capacity((part_end - part_start) * meta.row_width()));
                 for vector in input.vectors.get(part_start..part_end).unwrap_or_default() {
-                    encode_row(*element, vector, &mut plaintext);
+                    codec.encode_row(*element, vector, &mut plaintext);
                 }
                 parts.push(seal_block(&mut file, &plaintext)?);
             }
@@ -159,6 +166,7 @@ pub(crate) fn write_segment_sealed_by(
     let content_hash = *blake3::hash(file.get(HEADER_LEN..).unwrap_or_default()).as_bytes();
     let footer = SegmentFooter {
         centroid,
+        codec: params,
         columns,
         granule_rows: granules.iter().map(|(start, end)| (end - start) as u32).collect(),
         manifest: SegmentManifest {
@@ -176,6 +184,7 @@ pub(crate) fn write_segment_sealed_by(
         vector_columns,
     };
     let plaintext = Zeroizing::new(footer.encode(keys.vector_subblocks()));
+    debug_assert_eq!(footer.codec.is_some(), keys.segment_codec());
     let sealed = keys.seal(FOOTER_BLOCK_INDEX, &plaintext)?;
     let footer_offset = file.len() as u64;
     file.extend_from_slice(&sealed);
@@ -280,6 +289,8 @@ struct StoredColumn {
 #[derive(Debug, Clone)]
 struct SegmentFooter {
     centroid: Vec<f32>,
+    /// Version 4 only.
+    codec: Option<CodecParams>,
     columns: Vec<StoredColumn>,
     granule_rows: Vec<u32>,
     manifest: SegmentManifest,
@@ -327,10 +338,24 @@ impl SegmentFooter {
         self.centroid
             .iter()
             .for_each(|value| out.put_slice(&value.to_le_bytes()));
+        if let Some(codec) = &self.codec {
+            out.put_u64(codec.seed);
+            out.put_u32(codec.centre.len() as u32);
+            codec
+                .centre
+                .iter()
+                .for_each(|value| out.put_slice(&value.to_le_bytes()));
+            out.put_slice(&codec.radius.to_le_bytes());
+            out.put_u32(codec.i8_dimensions.len() as u32);
+            for (scale, offset) in &codec.i8_dimensions {
+                out.put_slice(&scale.to_le_bytes());
+                out.put_slice(&offset.to_le_bytes());
+            }
+        }
         out.into_bytes()
     }
 
-    fn decode(bytes: &[u8], vector_subblocks: bool) -> Result<Self, VectorError> {
+    fn decode(bytes: &[u8], vector_subblocks: bool, segment_codec: bool) -> Result<Self, VectorError> {
         let mut reader = Reader::new(bytes);
         let manifest = SegmentManifest::decode_from(&mut reader)?;
         let granule_count = reader.u32("granule count")? as usize;
@@ -397,7 +422,7 @@ impl SegmentFooter {
             vector_columns.push(VectorColumnMeta::decode_from(&mut reader)?);
         }
         let mut centroid = Vec::new();
-        if reader.remaining() != 0 {
+        if segment_codec || reader.remaining() != 0 {
             let len = reader.u32("centroid length")? as usize;
             centroid.reserve(reader.capacity_hint(len, 4));
             for _ in 0..len {
@@ -409,13 +434,53 @@ impl SegmentFooter {
                 }));
             }
         }
+        let codec = if segment_codec {
+            let dimension = manifest.model.dimension as usize;
+            let structural = |rule| VectorError::Format(crate::error::FormatError::Structural { rule });
+            let seed = reader.u64("rabitq seed")?;
+            let len = reader.u32("rabitq centre length")? as usize;
+            if len != 0 && len != dimension {
+                return Err(structural("rabitq centre has the model's dimension"));
+            }
+            let mut centre = Vec::with_capacity(reader.capacity_hint(len, 4));
+            for _ in 0..len {
+                centre.push(f32::from_le_bytes(array4(reader.take(4, "rabitq centre value")?)));
+            }
+            let radius = f32::from_le_bytes(array4(reader.take(4, "segment radius")?));
+            let len = reader.u32("int8 dimension count")? as usize;
+            if len != 0 && len != dimension {
+                return Err(structural("int8 dimension parameters have the model's dimension"));
+            }
+            let mut i8_dimensions = Vec::with_capacity(reader.capacity_hint(len, 8));
+            for _ in 0..len {
+                let scale = f32::from_le_bytes(array4(reader.take(4, "int8 scale")?));
+                let offset = f32::from_le_bytes(array4(reader.take(4, "int8 offset")?));
+                i8_dimensions.push((scale, offset));
+            }
+            Some(CodecParams {
+                centre,
+                i8_dimensions,
+                radius,
+                seed,
+            })
+        } else {
+            None
+        };
         if reader.remaining() != 0 {
             return Err(VectorError::Format(crate::error::FormatError::Structural {
                 rule: "vector segment footer has trailing bytes",
             }));
         }
+        if codec.as_ref().is_some_and(|codec| {
+            codec.i8_dimensions.is_empty() && vector_columns.iter().any(|meta| meta.element == VectorElement::I8)
+        }) {
+            return Err(VectorError::Format(crate::error::FormatError::Structural {
+                rule: "a version 4 int8 column has per-dimension parameters",
+            }));
+        }
         let footer = SegmentFooter {
             centroid,
+            codec,
             columns,
             granule_rows,
             manifest,
@@ -461,12 +526,34 @@ impl<T: AsRef<[u8]>> SegmentSource for T {
     }
 }
 
+/// The query side of `SegmentReader::search_bounded`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BoundedSearch<'a> {
+    pub(crate) cap: Option<usize>,
+    pub(crate) filter: Option<&'a RoaringRangeBitmap>,
+    pub(crate) k: usize,
+    pub(crate) model: &'a EmbeddingModel,
+    pub(crate) query: &'a [f32],
+    /// Rows scoring below this cannot enter the caller's result (`-∞` when nothing is known yet).
+    pub(crate) threshold: f32,
+}
+
+fn check_query_width(meta: &VectorColumnMeta, query: &[f32]) -> Result<(), VectorError> {
+    if query.len() != meta.model.dimension as usize {
+        return Err(VectorError::InvalidInput {
+            rule: format!("query width {} not {}", query.len(), meta.model.dimension),
+        });
+    }
+    Ok(())
+}
+
 fn truncated() -> VectorError {
     VectorError::Format(crate::error::FormatError::Truncated { what: "vector segment" })
 }
 
 pub struct SegmentReader<S> {
     blocks_opened: AtomicU64,
+    codec: SegmentCodec,
     footer: SegmentFooter,
     keys: FileKeys,
     source: S,
@@ -492,13 +579,37 @@ impl<S: SegmentSource> SegmentReader<S> {
             return Err(truncated());
         }
         let sealed = source.read_range(footer_offset, usize::try_from(footer_len).map_err(|_| truncated())?)?;
-        let footer = SegmentFooter::decode(&keys.open(FOOTER_BLOCK_INDEX, &sealed)?, keys.vector_subblocks())?;
+        let footer = SegmentFooter::decode(
+            &keys.open(FOOTER_BLOCK_INDEX, &sealed)?,
+            keys.vector_subblocks(),
+            keys.segment_codec(),
+        )?;
+        let codec = match &footer.codec {
+            Some(params) => SegmentCodec::v4(&footer.manifest.model, params.clone()),
+            None => SegmentCodec::legacy(&footer.manifest.model),
+        };
         Ok(SegmentReader {
             blocks_opened: AtomicU64::new(0),
+            codec,
             footer,
             keys,
             source,
         })
+    }
+
+    /// The segment layout version from the header.
+    pub fn version(&self) -> u16 {
+        self.keys.version
+    }
+
+    #[cfg(test)]
+    pub(crate) fn codec(&self) -> &SegmentCodec {
+        &self.codec
+    }
+
+    /// Decodes one stored row of `element` as this segment encodes it (for U1, the RaBitQ reconstruction).
+    pub fn decode_vector_row(&self, element: VectorElement, row: &[u8]) -> Vec<f32> {
+        self.codec.decode_row(element, row)
     }
 
     pub fn manifest(&self) -> &SegmentManifest {
@@ -667,7 +778,7 @@ impl<S: SegmentSource> SegmentReader<S> {
         let prefix = plaintext
             .get(start..start + dimensions as usize * element_bytes)
             .ok_or_else(truncated)?;
-        Ok(decode_row(meta.element, dimensions, prefix))
+        Ok(super::quantize::decode_row(meta.element, dimensions, prefix))
     }
 
     pub fn read_all(&self) -> Result<SegmentInput, VectorError> {
@@ -720,7 +831,7 @@ impl<S: SegmentSource> SegmentReader<S> {
                 if !live(local) {
                     continue;
                 }
-                let mut vector = decode_row(fine.element, fine.model.dimension, row);
+                let mut vector = self.codec.decode_row(fine.element, row);
                 if fine.model.metric == VectorMetric::Cosine {
                     normalize(&mut vector);
                 }
@@ -739,14 +850,29 @@ impl<S: SegmentSource> SegmentReader<S> {
         k: usize,
     ) -> Result<Vec<ScoredRow>, VectorError> {
         let meta = self.vector_meta(column_id, model)?;
-        if query.len() != meta.model.dimension as usize {
-            return Err(VectorError::InvalidInput {
-                rule: format!("query width {} not {}", query.len(), meta.model.dimension),
-            });
-        }
-        let prepared = PreparedQuery::new(query, meta.model.metric);
-        let column = self.column_by_id(column_id)?;
+        check_query_width(meta, query)?;
+        let prepared = self.codec.query(meta.element, query);
+        let width = meta.row_width();
         let mut best = TopK::new(k);
+        self.scan_parts(column_id, filter, |first_row, plaintext| {
+            for_each_row(width, plaintext, first_row, filter, |row, bytes| {
+                best.offer(ScoredRow {
+                    row,
+                    score: prepared.score(bytes),
+                });
+            });
+        })?;
+        Ok(best.into_sorted())
+    }
+
+    /// Calls `visit(first_row, plaintext)` for each sealed block of a column that `filter` touches, in row order.
+    fn scan_parts(
+        &self,
+        column_id: u32,
+        filter: Option<&RoaringRangeBitmap>,
+        mut visit: impl FnMut(u64, &[u8]),
+    ) -> Result<(), VectorError> {
+        let column = self.column_by_id(column_id)?;
         let part_rows = column.part_rows as u64;
         let mut granule_first = 0u64;
         for granule in 0..self.granule_count() {
@@ -763,17 +889,118 @@ impl<S: SegmentSource> SegmentReader<S> {
                         .is_some_and(|range| range.start < first_row + rows)
                 });
                 if wanted {
-                    let plaintext = self.open_part(column, granule, part)?;
-                    top_k(meta, &plaintext, first_row, &prepared, filter, k)
-                        .into_iter()
-                        .for_each(|row| best.offer(row));
+                    visit(first_row, &self.open_part(column, granule, part)?);
                 }
                 first_row += rows;
                 part += 1;
             }
             granule_first = granule_end;
         }
-        Ok(best.into_sorted())
+        Ok(())
+    }
+
+    /// Two-stage search of one segment: scan `coarse`, then score candidates exactly with `fine`.
+    ///
+    /// With a bounded coarse code (version 4 U1 or I8) a row is a candidate only while its upper bound reaches
+    /// both `threshold` (the caller's running k-th best exact score from other segments) and the k-th best lower
+    /// bound seen so far. Candidates are reranked in decreasing upper bound until the next upper bound falls below
+    /// the k-th best exact score, so the rerank set follows the bounds rather than a fixed `k × oversample`.
+    /// `cap`, when set, limits the rerank set to `k × cap` rows. A whole segment whose score bound is below
+    /// `threshold` is skipped without opening a block. Older (unbounded) codes keep the fixed oversample rerank.
+    pub(crate) fn search_bounded(
+        &self,
+        coarse: u32,
+        fine: u32,
+        search: BoundedSearch<'_>,
+        stats: &mut super::search::SearchStats,
+    ) -> Result<Vec<ScoredRow>, VectorError> {
+        let BoundedSearch {
+            cap,
+            filter,
+            k,
+            model,
+            query,
+            threshold,
+        } = search;
+        let coarse_meta = self.vector_meta(coarse, model)?;
+        let fine_meta = self.vector_meta(fine, model)?;
+        check_query_width(coarse_meta, query)?;
+        let coarse_query = self.codec.query(coarse_meta.element, query);
+        if coarse == fine {
+            stats.rows_scanned += filter.map_or(self.row_count(), RoaringRangeBitmap::count);
+            return self.top_k(fine, query, model, filter, k);
+        }
+        if !coarse_query.bounded() {
+            let wanted = k.saturating_mul(cap.unwrap_or(DEFAULT_OVERSAMPLE).max(1));
+            stats.rows_scanned += filter.map_or(self.row_count(), RoaringRangeBitmap::count);
+            let candidates = self.top_k(coarse, query, model, filter, wanted)?;
+            stats.rows_reranked += candidates.len() as u64;
+            let rows: Vec<u64> = candidates.iter().map(|row| row.row).collect();
+            return self.rescore(fine, query, model, &rows);
+        }
+        if self.codec.segment_upper(query) < threshold {
+            stats.segments_skipped += 1;
+            return Ok(Vec::new());
+        }
+
+        let width = coarse_meta.row_width();
+        let mut lowers = TopK::new(k);
+        let mut bar = threshold;
+        let mut candidates: Vec<(u64, f32)> = Vec::new();
+        let mut prune_at = k.saturating_mul(4).saturating_add(1024);
+        self.scan_parts(coarse, filter, |first_row, plaintext| {
+            for_each_row(width, plaintext, first_row, filter, |row, bytes| {
+                stats.rows_scanned += 1;
+                let estimate = coarse_query.estimate(bytes);
+                if estimate.upper < bar {
+                    return;
+                }
+                lowers.offer(ScoredRow {
+                    row,
+                    score: estimate.lower,
+                });
+                candidates.push((row, estimate.upper));
+            });
+            if let Some(lower) = lowers.threshold() {
+                bar = bar.max(lower);
+            }
+            if candidates.len() > prune_at {
+                candidates.retain(|(_, upper)| *upper >= bar);
+                prune_at = candidates.len().saturating_mul(2).saturating_add(1024);
+            }
+        })?;
+        candidates.retain(|(_, upper)| *upper >= bar);
+        candidates.sort_by(|left, right| right.1.total_cmp(&left.1).then(left.0.cmp(&right.0)));
+        stats.rows_candidate += candidates.len() as u64;
+
+        let fine_query = self.codec.query(fine_meta.element, query);
+        let fine_width = fine_meta.row_width();
+        let fine_column = self.column_by_id(fine)?;
+        let limit = cap.map_or(usize::MAX, |cap| k.saturating_mul(cap.max(1)));
+        let mut exact = TopK::new(k);
+        let mut opened: std::collections::HashMap<SubBlock, Zeroizing<Vec<u8>>> = std::collections::HashMap::new();
+        for (reranked, (row, upper)) in candidates.into_iter().enumerate() {
+            let bar = exact.threshold().map_or(threshold, |kth| kth.max(threshold));
+            if reranked >= limit || upper < bar {
+                break;
+            }
+            let (granule, local) = self.locate(row)?;
+            let at = (granule, local / fine_column.part_rows);
+            let local = local % fine_column.part_rows;
+            if let std::collections::hash_map::Entry::Vacant(slot) = opened.entry(at) {
+                slot.insert(self.open_part(fine_column, at.0, at.1)?);
+            }
+            let bytes = opened
+                .get(&at)
+                .and_then(|plaintext| plaintext.get(local * fine_width..(local + 1) * fine_width))
+                .ok_or_else(truncated)?;
+            exact.offer(ScoredRow {
+                row,
+                score: fine_query.score(bytes),
+            });
+            stats.rows_reranked += 1;
+        }
+        Ok(exact.into_sorted())
     }
 
     pub fn rescore(
@@ -784,7 +1011,7 @@ impl<S: SegmentSource> SegmentReader<S> {
         rows: &[u64],
     ) -> Result<Vec<ScoredRow>, VectorError> {
         let meta = self.vector_meta(column_id, model)?;
-        let prepared = PreparedQuery::new(query, meta.model.metric);
+        let prepared = self.codec.query(meta.element, query);
         let column = self.column_by_id(column_id)?;
         let width = meta.row_width();
         let mut sorted = rows.to_vec();
@@ -805,7 +1032,7 @@ impl<S: SegmentSource> SegmentReader<S> {
                 .ok_or_else(truncated)?;
             scored.push(ScoredRow {
                 row,
-                score: prepared.score(meta.element, bytes),
+                score: prepared.score(bytes),
             });
         }
         Ok(scored)

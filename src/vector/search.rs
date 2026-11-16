@@ -23,8 +23,25 @@ pub struct VectorSearch<'a> {
     pub filter: SearchFilter,
     pub k: usize,
     pub model: &'a EmbeddingModel,
+    /// Version 1–3 segments rerank `k × oversample` coarse candidates. Version 4 segments rerank by error bounds
+    /// and use `oversample` only as a cap of `k × oversample` reranked rows per segment; 0 means no cap.
     pub oversample: usize,
     pub query: &'a [f32],
+}
+
+/// Work done by one search, summed over segments.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SearchStats {
+    /// Segments whose blocks were scanned.
+    pub segments_searched: usize,
+    /// Segments skipped because their score bound could not beat the running k-th best score.
+    pub segments_skipped: usize,
+    /// Coarse rows estimated.
+    pub rows_scanned: u64,
+    /// Rows whose coarse upper bound survived the scan (bound-driven segments only).
+    pub rows_candidate: u64,
+    /// Rows scored with the fine representation.
+    pub rows_reranked: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -47,9 +64,28 @@ pub fn search_segments_with_deletes<S: SegmentSource>(
     deletes: &[Option<&SegmentDeletes>],
     search: &VectorSearch<'_>,
 ) -> Result<Vec<SearchHit>, VectorError> {
+    search_segments_with_stats(segments, deletes, search).map(|(hits, _)| hits)
+}
+
+/// `search_segments_with_deletes`, also reporting how much work the search did.
+///
+/// Segments are visited nearest centroid first. The running k-th best exact score is handed to each later segment,
+/// which skips itself, or rows, whose score bound cannot reach it.
+pub fn search_segments_with_stats<S: SegmentSource>(
+    segments: &[SegmentReader<S>],
+    deletes: &[Option<&SegmentDeletes>],
+    search: &VectorSearch<'_>,
+) -> Result<(Vec<SearchHit>, SearchStats), VectorError> {
+    let mut stats = SearchStats::default();
     let mut hits: Vec<(usize, super::model::ScoredRow)> = Vec::new();
-    for (index, segment) in segments.iter().enumerate() {
+    for segment in segments {
         segment.manifest().model.require_same(search.model)?;
+    }
+    let order = nearest_segments(segments, search.query, search.model, segments.len())?;
+    for index in order {
+        let Some(segment) = segments.get(index) else {
+            continue;
+        };
         let Some(mut filter) = row_filter(segment, &search.filter)? else {
             continue;
         };
@@ -64,25 +100,32 @@ pub fn search_segments_with_deletes<S: SegmentSource>(
             continue;
         };
         let filter = (!search.filter.is_empty() || filter.count() < segment.row_count()).then_some(&filter);
-        let scored = if coarse.column_id == fine.column_id {
-            segment.top_k(fine.column_id, search.query, search.model, filter, search.k)?
+        let threshold = if hits.len() >= search.k && search.k > 0 {
+            hits.last().map_or(f32::NEG_INFINITY, |(_, row)| row.score)
         } else {
-            let wanted = search.k.saturating_mul(search.oversample.max(1));
-            let candidates = segment.top_k(coarse.column_id, search.query, search.model, filter, wanted)?;
-            let rows: Vec<u64> = candidates.iter().map(|row| row.row).collect();
-            segment.rescore(fine.column_id, search.query, search.model, &rows)?
+            f32::NEG_INFINITY
         };
+        let skipped = stats.segments_skipped;
+        let scored = segment.search_bounded(
+            coarse.column_id,
+            fine.column_id,
+            super::segment::BoundedSearch {
+                cap: (search.oversample > 0).then_some(search.oversample),
+                filter,
+                k: search.k,
+                model: search.model,
+                query: search.query,
+                threshold,
+            },
+            &mut stats,
+        )?;
+        if stats.segments_skipped == skipped {
+            stats.segments_searched += 1;
+        }
         hits.extend(scored.into_iter().map(|row| (index, row)));
+        sort_hits(&mut hits);
+        hits.truncate(search.k);
     }
-    hits.sort_by(|left, right| {
-        right
-            .1
-            .score
-            .total_cmp(&left.1.score)
-            .then(left.0.cmp(&right.0))
-            .then(left.1.row.cmp(&right.1.row))
-    });
-    hits.truncate(search.k);
     let mut by_segment: Vec<usize> = (0..hits.len()).collect();
     by_segment.sort_by_key(|position| hits.get(*position).map(|(index, row)| (*index, row.row)));
     let segment_of = |position: &usize| hits.get(*position).map(|(index, _)| *index);
@@ -105,7 +148,7 @@ pub fn search_segments_with_deletes<S: SegmentSource>(
             }
         }
     }
-    Ok(hits
+    let hits = hits
         .into_iter()
         .zip(event_ids)
         .map(|((index, row), event_id)| SearchHit {
@@ -114,7 +157,19 @@ pub fn search_segments_with_deletes<S: SegmentSource>(
             score: row.score,
             segment: index,
         })
-        .collect())
+        .collect();
+    Ok((hits, stats))
+}
+
+fn sort_hits(hits: &mut [(usize, super::model::ScoredRow)]) {
+    hits.sort_by(|left, right| {
+        right
+            .1
+            .score
+            .total_cmp(&left.1.score)
+            .then(left.0.cmp(&right.0))
+            .then(left.1.row.cmp(&right.1.row))
+    });
 }
 
 fn row_filter<S: SegmentSource>(

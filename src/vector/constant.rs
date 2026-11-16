@@ -3,7 +3,9 @@ pub const GRANULE_ROWS: usize = 4096;
 pub const VECTOR_SUBBLOCK_ROWS: usize = 128;
 pub const BLOCK_ALIGNMENT: usize = 64;
 pub const SEGMENT_MAGIC: &[u8; 4] = b"OEFV";
-pub const SEGMENT_VERSION: u16 = 3;
+/// Version 4: U1 columns hold RaBitQ codes and I8 columns per-dimension segment-level int8 (see `codec`).
+pub const SEGMENT_VERSION: u16 = 4;
+pub const SEGMENT_VERSION_SUBBLOCKS: u16 = 3;
 pub const SEGMENT_VERSION_GRANULE_VECTORS: u16 = 2;
 pub const SEGMENT_VERSION_SHARED_NONCE: u16 = 1;
 pub const BLOCK_NONCE_LEN: usize = 12;
@@ -25,3 +27,8 @@ pub const EVENT_ID_COLUMN: &str = "event_id";
 pub const ROOM_ID_COLUMN: &str = "room_id";
 pub const SENDER_COLUMN: &str = "sender";
 pub const TIMESTAMP_COLUMN: &str = "timestamp";
+/// RaBitQ confidence multiplier ε₀ for the per-row error bound (the paper uses 1.9; 2.5 keeps upper-bound misses well under 1%).
+pub const RABITQ_EPSILON: f32 = 2.5;
+/// Sign-flip + Hadamard rounds in the RaBitQ rotation.
+pub const RABITQ_ROTATION_ROUNDS: usize = 3;
+pub(crate) const RABITQ_SEED_CONTEXT: &str = "oe 2026 vector rabitq rotation seed v1";

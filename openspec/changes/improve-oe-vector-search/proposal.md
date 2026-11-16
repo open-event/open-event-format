@@ -24,6 +24,13 @@ vectorise.
   segments SHALL hold unit-normalised vectors: the writer refuses any row whose L2 norm differs from 1 by more than
   `NORMALIZATION_TOLERANCE` (1e-3), and cosine scores are computed as dot products on that basis.
 
+- Vector segment version 4 (issue #98 items 3, 4, 7): U1 columns become RaBitQ codes (deterministic rotation seeded
+  from the model, centred on the segment mean, per-row norm and alignment, derived error bound); I8 columns become
+  segment-level per-dimension int8 whose trailer stores `|x̂|²` and the reconstruction error. The footer appends the
+  rotation seed, the RaBitQ centre, the segment radius and the per-dimension int8 parameters. Searches rerank by
+  bounds instead of a fixed `k × oversample` (which becomes a cap), visit segments nearest centroid first and
+  pass the running k-th exact score into each segment. Versions 1–3 read unchanged (Hamming U1, per-row I8).
+
 ## Impact
 
 - `oe-vector-columns`: segment layout version 3; older segments remain readable.

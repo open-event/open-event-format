@@ -185,9 +185,25 @@ pub fn top_k(
     k: usize,
 ) -> Vec<ScoredRow> {
     let mut best = TopK::new(k);
-    let width = meta.row_width();
+    for_each_row(meta.row_width(), rows, first_row, filter, |row, bytes| {
+        best.offer(ScoredRow {
+            row,
+            score: query.score(meta.element, bytes),
+        });
+    });
+    best.into_sorted()
+}
+
+/// Calls `visit(row, bytes)` for every `width`-byte row of a block starting at `first_row` that `filter` admits.
+pub(crate) fn for_each_row(
+    width: usize,
+    rows: &[u8],
+    first_row: u64,
+    filter: Option<&RoaringRangeBitmap>,
+    mut visit: impl FnMut(u64, &[u8]),
+) {
     if width == 0 {
-        return Vec::new();
+        return;
     }
     let block_rows = (rows.len() / width) as u64;
     let mut score_range = |start: u64, end: u64| {
@@ -195,10 +211,7 @@ pub fn top_k(
             .get(start as usize * width..end as usize * width)
             .unwrap_or_default();
         for (index, row) in bytes.chunks_exact(width).enumerate() {
-            best.offer(ScoredRow {
-                row: first_row + start + index as u64,
-                score: query.score(meta.element, row),
-            });
+            visit(first_row + start + index as u64, row);
         }
     };
     match filter {
@@ -219,7 +232,28 @@ pub fn top_k(
             }
         }
     }
-    best.into_sorted()
+}
+
+/// For RaBitQ: the number of set bits in `bits`, and `Σ 2^j · popcount(bits & plane_j)` over the four query planes.
+#[multiversion(targets(
+    "x86_64+avx512f+avx512bw+avx512dq+avx512vl+avx512vpopcntdq",
+    "x86_64+avx2+popcnt",
+    "aarch64+neon"
+))]
+pub(crate) fn plane_counts(bits: &[u8], planes: &[[u64; 4]]) -> (u32, u32) {
+    let mut ones = 0u32;
+    let mut weighted = [0u32; 4];
+    for (chunk, plane) in bits.chunks(8).zip(planes) {
+        let mut word = [0u8; 8];
+        word.iter_mut().zip(chunk).for_each(|(slot, byte)| *slot = *byte);
+        let word = u64::from_le_bytes(word);
+        ones += word.count_ones();
+        for (count, plane) in weighted.iter_mut().zip(plane) {
+            *count += (word & plane).count_ones();
+        }
+    }
+    let [w0, w1, w2, w3] = weighted;
+    (ones, w0 + 2 * w1 + 4 * w2 + 8 * w3)
 }
 
 #[multiversion(targets(
@@ -241,7 +275,7 @@ fn hamming(left: &[u8], right: &[u8]) -> u32 {
 }
 
 #[multiversion(targets("x86_64+avx512f+avx512bw+avx512dq+avx512vl", "x86_64+avx2+fma", "aarch64+neon"))]
-fn dot_i8(stored: &[u8], query: &[f32]) -> f32 {
+pub(crate) fn dot_i8(stored: &[u8], query: &[f32]) -> f32 {
     let mut lanes = [0f32; LANES];
     let rows = stored.chunks_exact(LANES);
     let queries = query.chunks_exact(LANES);
@@ -284,6 +318,13 @@ impl TopK {
             self.heap.pop();
             self.heap.push(ranked);
         }
+    }
+
+    /// The k-th best score once `k` rows have been offered.
+    pub fn threshold(&self) -> Option<f32> {
+        (self.k > 0 && self.heap.len() >= self.k)
+            .then(|| self.heap.peek().map(|worst| worst.0.score))
+            .flatten()
     }
 
     pub fn into_sorted(self) -> Vec<ScoredRow> {

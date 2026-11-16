@@ -57,8 +57,21 @@ impl FileKeys {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn random_subblock_vectors() -> Result<Self, VectorError> {
+        Ok(FileKeys {
+            version: SEGMENT_VERSION_SUBBLOCKS,
+            ..Self::random()?
+        })
+    }
+
     /// Whether vector columns are sealed in `VECTOR_SUBBLOCK_ROWS` sub-blocks rather than one block per granule.
     pub(crate) fn vector_subblocks(&self) -> bool {
+        self.version >= SEGMENT_VERSION_SUBBLOCKS
+    }
+
+    /// Whether U1 and I8 columns use the version 4 encodings (RaBitQ, per-dimension int8) and footer parameters.
+    pub(crate) fn segment_codec(&self) -> bool {
         self.version >= SEGMENT_VERSION
     }
 
@@ -126,7 +139,10 @@ impl FileKeys {
         let version = u16::from_le_bytes([header.get(4).copied().unwrap_or(0), header.get(5).copied().unwrap_or(0)]);
         if !matches!(
             version,
-            SEGMENT_VERSION | SEGMENT_VERSION_GRANULE_VECTORS | SEGMENT_VERSION_SHARED_NONCE
+            SEGMENT_VERSION
+                | SEGMENT_VERSION_SUBBLOCKS
+                | SEGMENT_VERSION_GRANULE_VECTORS
+                | SEGMENT_VERSION_SHARED_NONCE
         ) {
             return Err(VectorError::Format(crate::error::FormatError::UnsupportedVersion {
                 field: "vector segment version",

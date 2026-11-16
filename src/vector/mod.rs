@@ -1,10 +1,12 @@
 mod catalogue;
+mod codec;
 mod constant;
 mod deletes;
 mod error;
 mod kernel;
 mod model;
 mod quantize;
+mod rabitq;
 mod seal;
 mod search;
 mod segment;
@@ -14,8 +16,8 @@ pub use catalogue::{
     segment_deletes_object_key,
 };
 pub use constant::{
-    DEFAULT_OVERSAMPLE, EMBEDDING_COLUMN_ID, EVENT_ID_COLUMN, GRANULE_ROWS, ROOM_ID_COLUMN, SENDER_COLUMN,
-    TIMESTAMP_COLUMN, VECTOR_SUBBLOCK_ROWS,
+    DEFAULT_OVERSAMPLE, EMBEDDING_COLUMN_ID, EVENT_ID_COLUMN, GRANULE_ROWS, RABITQ_EPSILON, ROOM_ID_COLUMN,
+    SEGMENT_VERSION, SENDER_COLUMN, TIMESTAMP_COLUMN, VECTOR_SUBBLOCK_ROWS,
 };
 pub use deletes::SegmentDeletes;
 pub use error::*;

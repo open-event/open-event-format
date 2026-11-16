@@ -154,7 +154,7 @@ fn granules_and_single_rows_match_what_was_written_for_every_element_type() {
         let column = representation_column_id(element);
         let mut expected = Vec::new();
         for vector in &rows.vectors {
-            encode_row(element, vector, &mut expected);
+            reader.codec().encode_row(element, vector, &mut expected);
         }
         let width = element.row_width(dimension);
         for row in [
@@ -223,24 +223,25 @@ fn reading_or_scanning_with_a_different_model_or_metric_fails() {
     }
 }
 
-fn brute_force(
+fn brute_force<S: SegmentSource>(
+    reader: &SegmentReader<S>,
     meta: &VectorColumnMeta,
     rows: &[Vec<f32>],
     query: &[f32],
     allowed: impl Fn(u64) -> bool,
     k: usize,
 ) -> Vec<ScoredRow> {
-    let prepared = PreparedQuery::new(query, meta.model.metric);
+    let prepared = reader.codec().query(meta.element, query);
     let mut scored: Vec<ScoredRow> = rows
         .iter()
         .enumerate()
         .filter(|(row, _)| allowed(*row as u64))
         .map(|(row, vector)| {
             let mut bytes = Vec::new();
-            encode_row(meta.element, vector, &mut bytes);
+            reader.codec().encode_row(meta.element, vector, &mut bytes);
             ScoredRow {
                 row: row as u64,
-                score: prepared.score(meta.element, &bytes),
+                score: prepared.score(&bytes),
             }
         })
         .collect();
@@ -269,11 +270,11 @@ fn top_k_equals_a_brute_force_reference_with_and_without_a_filter() {
         let query = unit(99_999, dimension);
         for meta in reader.vector_columns().to_vec() {
             let all = reader.top_k(meta.column_id, &query, &model, None, 20).unwrap();
-            assert_eq!(all, brute_force(&meta, &rows.vectors, &query, |_| true, 20));
+            assert_eq!(all, brute_force(&reader, &meta, &rows.vectors, &query, |_| true, 20));
             let filtered = reader.top_k(meta.column_id, &query, &model, Some(&filter), 20).unwrap();
             assert_eq!(
                 filtered,
-                brute_force(&meta, &rows.vectors, &query, |row| filter.contains(row), 20)
+                brute_force(&reader, &meta, &rows.vectors, &query, |row| filter.contains(row), 20)
             );
             assert!(filtered.iter().all(|row| row.row % 7 == 3));
         }
@@ -692,7 +693,7 @@ fn merging_small_segments_keeps_every_row_in_order_and_searches_the_same() {
         filter: SearchFilter::default(),
         k: 3,
         model: &model,
-        oversample: DEFAULT_OVERSAMPLE,
+        oversample: 0,
         query: &query,
     };
     let before: Vec<String> = search_segments(&readers, &search)
@@ -917,7 +918,7 @@ fn a_first_version_segment_still_reads_and_is_never_written_again() {
     let rows = input(GRANULE_ROWS + 5, 8);
     let version = |bytes: &[u8]| u16::from_le_bytes([bytes[4], bytes[5]]);
     let current = write_segment(&spec, &rows, &key(1)).unwrap();
-    assert_eq!(version(&current), 3);
+    assert_eq!(version(&current), SEGMENT_VERSION);
 
     let legacy_keys = super::seal::FileKeys::random_shared_nonce().unwrap();
     assert_eq!(legacy_keys.nonce(0), legacy_keys.nonce(1));
@@ -940,7 +941,7 @@ fn a_first_version_segment_still_reads_and_is_never_written_again() {
         ));
     }
     let mut unknown = legacy.clone();
-    unknown[4] = 4;
+    unknown[4] = 5;
     assert!(matches!(
         SegmentReader::open(unknown, &key(1)),
         Err(VectorError::Format(_))
@@ -951,7 +952,7 @@ fn a_first_version_segment_still_reads_and_is_never_written_again() {
     let rewrapped = SegmentReader::open(rewrapped, &key(2)).unwrap();
     assert_eq!(rewrapped.read_all().unwrap().event_ids, rows.event_ids);
     let merged = merge_segments(std::slice::from_ref(&reader), &spec, &key(1)).unwrap();
-    assert_eq!(version(&merged), 3);
+    assert_eq!(version(&merged), SEGMENT_VERSION);
     let merged = SegmentReader::open(merged, &key(1)).unwrap();
     assert_eq!(merged.read_all().unwrap().event_ids, rows.event_ids);
 }
@@ -1027,7 +1028,7 @@ fn a_filter_of_many_scattered_runs_scans_exactly_its_rows_in_every_granule() {
         assert_eq!(found.len(), (0..total).filter(|row| filter.contains(*row)).count());
         assert_eq!(
             found,
-            brute_force(&meta, &rows.vectors, &query, |row| filter.contains(row), k)
+            brute_force(&reader, &meta, &rows.vectors, &query, |row| filter.contains(row), k)
         );
     }
     for (filter, opened) in [(&filters[2], 1), (&filters[3], 1), (&filters[4], 0)] {
@@ -1163,7 +1164,14 @@ fn rescore_and_row_reads_open_only_the_sub_blocks_holding_candidates() {
         .unwrap()
         .clone();
     for row in &scored {
-        let expected = brute_force(&meta, &rows.vectors, &query, |candidate| candidate == row.row, 1);
+        let expected = brute_force(
+            &reader,
+            &meta,
+            &rows.vectors,
+            &query,
+            |candidate| candidate == row.row,
+            1,
+        );
         assert_eq!(expected[0].score.to_bits(), row.score.to_bits());
     }
     let before = reader.blocks_opened();
@@ -1202,3 +1210,6 @@ fn a_second_version_segment_keeps_one_vector_block_per_granule() {
     );
     assert_eq!(reader.read_all().unwrap().vectors, current.read_all().unwrap().vectors);
 }
+
+#[path = "rabitq.rs"]
+mod rabitq;
