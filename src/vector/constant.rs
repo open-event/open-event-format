@@ -40,3 +40,7 @@ pub(crate) const RABITQ_SEED_CONTEXT: &str = "oe 2026 vector rabitq rotation see
 pub const MAX_RANGE_RESULTS: usize = 100_000;
 /// Per-query-token coarse candidates gathered by a multivector search.
 pub const DEFAULT_TOKEN_CANDIDATES: usize = 256;
+/// Below this dimension `default_representations` picks I8 rather than U1 (RaBitQ) as the coarse code: the RaBitQ
+/// error bound shrinks only as `1/√d`, so tiny dimensions rerank many rows, while the per-dimension int8 bound is
+/// tight at any dimension and costs only `d + 8` bytes per row, which at small `d` is a few bytes more than U1.
+pub const RABITQ_MIN_DIMENSION: u32 = 64;

@@ -536,3 +536,72 @@ fn default_settings_keep_recall_on_tight_clusters() {
         }
     }
 }
+
+/// Small dimensions: the writer default picks I8 coarse codes (RaBitQ's bound is too loose there), which keep
+/// recall and a small rerank set; an explicit U1 coarse code still works, reranking more.
+#[test]
+fn small_dimensions_default_to_int8_coarse_codes() {
+    let k = 10;
+    let dimension = 16;
+    assert_eq!(
+        default_representations(&model(dimension, VectorMetric::Cosine)),
+        vec![VectorElement::I8, VectorElement::F32]
+    );
+    assert_eq!(
+        default_representations(&model(RABITQ_MIN_DIMENSION, VectorMetric::Cosine)),
+        vec![VectorElement::U1, VectorElement::F32]
+    );
+    let vectors = clustered_in_order(64, 125, dimension, 0.3);
+    for metric in [VectorMetric::Cosine, VectorMetric::L2] {
+        let model = model(dimension, metric);
+        let mut measured = Vec::new();
+        for segment_spec in [
+            SegmentSpec::new(model.clone(), "DEVICE", None),
+            spec(model.clone(), vec![VectorElement::U1, VectorElement::F32]),
+        ] {
+            let segments = vec![
+                SegmentReader::open(
+                    write_segment(&segment_spec, &vectors_input(&vectors), &key(1)).unwrap(),
+                    &key(1),
+                )
+                .unwrap(),
+            ];
+            let queries = 30;
+            let (mut found, mut reranked) = (0usize, 0u64);
+            for query_index in 0..queries {
+                let centre = unit(5_000_000 + (query_index * 13 % 64) as u64, dimension);
+                let direction = unit(777_000 + query_index as u64, dimension);
+                let mut query: Vec<f32> = centre.iter().zip(&direction).map(|(c, d)| c + 0.3 * d).collect();
+                let norm = query.iter().map(|v| v * v).sum::<f32>().sqrt();
+                query.iter_mut().for_each(|v| *v /= norm);
+                let search = VectorSearch {
+                    filter: SearchFilter::default(),
+                    k,
+                    model: &model,
+                    oversample: DEFAULT_OVERSAMPLE,
+                    query: &query,
+                };
+                let truth = exact_top(&vectors, &query, metric, k);
+                let (hits, stats) = search_segments_with_stats(&segments, &[], &search).unwrap();
+                found += hits.iter().filter(|hit| truth.contains(&hit.row)).count();
+                reranked += stats.rows_reranked;
+            }
+            let recall = found as f64 / (queries * k) as f64;
+            let mean = reranked as f64 / queries as f64;
+            println!(
+                "d{dimension} {metric:?} {:?}: recall@{k} {recall:.3}, reranked {mean:.1}",
+                segment_spec.representations[0]
+            );
+            measured.push((recall, mean));
+        }
+        let (default, rabitq) = (measured[0], measured[1]);
+        assert_eq!(default.0, 1.0, "{metric:?} default recall");
+        assert!(rabitq.0 >= 0.95, "{metric:?} U1 recall {}", rabitq.0);
+        assert!(
+            default.1 * 5.0 < rabitq.1,
+            "{metric:?}: I8 reranks {} vs U1 {}",
+            default.1,
+            rabitq.1
+        );
+    }
+}

@@ -32,6 +32,30 @@ pub struct SegmentInput {
     pub vectors: Vec<Vec<f32>>,
 }
 
+impl SegmentSpec {
+    /// A spec with `default_representations` for `model`.
+    pub fn new(model: EmbeddingModel, producer_device: impl Into<String>, room_id: Option<String>) -> Self {
+        Self {
+            representations: default_representations(&model),
+            model,
+            producer_device: producer_device.into(),
+            room_id,
+        }
+    }
+}
+
+/// The writer's default representations: a coarse code plus `F32` for exact rerank. The coarse code is U1 (RaBitQ,
+/// `d/8 + 8` bytes per row) from `RABITQ_MIN_DIMENSION` up and per-dimension I8 below it, where RaBitQ's bound is
+/// too loose to prune and int8 is barely larger.
+pub fn default_representations(model: &EmbeddingModel) -> Vec<VectorElement> {
+    let coarse = if model.dimension >= RABITQ_MIN_DIMENSION {
+        VectorElement::U1
+    } else {
+        VectorElement::I8
+    };
+    vec![coarse, VectorElement::F32]
+}
+
 pub fn representation_column_id(element: VectorElement) -> u32 {
     EMBEDDING_COLUMN_ID + 1 + u32::from(element.code())
 }
