@@ -30,8 +30,20 @@
       subtract + FMA per element as a dot product and both are bound by decrypting the sub-block, so storing `|x|²`
       would not speed scoring measurably, while it would change the F32/F16 row width (breaking the Arrow
       `FixedSizeList` granule view and prefix reads). The norm is stored where it pays: the v4 I8 trailer.
-- [ ] Not done: sub-block-level skipping in the coarse scan (needs per-sub-block centres/radii in the footer);
-      RaBitQ for very small dimensions is noisy (bound ∝ 1/√d), so tiny-dimension segments rerank many rows.
+- [x] Sub-block balls: version 4+ footers end with an optional tail (tag 1) holding, per 128-row vector sub-block,
+      the centre and radius of its finest-representation rows; segments without the tail still read, unknown tags
+      are rejected. The bounded coarse scan visits sub-blocks best ball bound first and skips those whose ball cannot
+      reach the bar (`SearchStats::subblocks_skipped`); when the balls separate, the best sub-blocks seed the bar
+      with exact scores. Tests: stripped-tail segments answer identically without skipping.
+- [x] Small dimensions: `default_representations` / `SegmentSpec::new` pick per-dimension I8 + F32 below
+      `RABITQ_MIN_DIMENSION` (64) and U1 + F32 from there. Extended multi-bit RaBitQ is deliberately not added: I8
+      already has tight per-row bounds at any dimension and at small `d` costs only a few bytes more per row than
+      U1 (d = 16: recall@10 1.0 with 12–16 rows reranked vs U1 0.98–0.99 with ~217), so a second multi-bit code
+      would add a format element without a measurable win where it matters.
+- [x] Default recall: `oversample` is a rerank patience for version 4 segments (stop after `k × oversample`
+      consecutive reranked rows that did not enter the top k) instead of a hard cap. Defaults now give
+      recall@10 ≥ 0.98 on tight clusters written in row order (1.0 at d ≥ 32; was 0.61–0.89 with the cap) with ~125
+      rows reranked of 8 000 (the query's cluster), test `default_settings_keep_recall_on_tight_clusters`.
 - [x] Partition index (IVF) as an external, droppable artifact: `PartitionIndex::build` (seeded k-means,
       `PartitionParams { partitions, iterations, seed }`), `encode`/`decode` (`OEVI` v1, optional seal under the
       segment wrapping key), `publish_segment_index` / `load_segment_index` / `drop_segment_index`, and
@@ -45,12 +57,22 @@
       key mismatches rejected; a dropped or rejected index still answers identically; filters and deletes combine.
 - [x] Filters: byte hash sets over borrowed strings; absent granule stats mean "may match"; adaptive pre/post
       filtering (`FilterStrategy`, `POST_FILTER_SELECTIVITY` = 0.75) with tests that post, pre and adaptive agree.
-- [ ] Not done: the partition index only cuts blocks opened when a partition's rows are clustered in row order
-      (rows are sealed in 128-row sub-blocks in write order); for time-ordered segments it cuts rows scored but not
-      decryption. Reordering rows by partition at compaction would fix this. The radius bound is loose when there
-      are fewer partitions than natural clusters (200 clusters, 90 partitions probed ~35). Filter selectivity is
-      estimated from min/max granule stats only, so most string filters look unselective and are post-filtered
-      first.
+- [x] Clustered compaction: `merge_segments_clustered` writes live rows grouped by k-means partition (partitions
+      chained nearest centroid), event ids and every column moving with their rows. Time-ordered 50 clusters × 160
+      rows (d = 64), blocks opened per query: scan 123.5 → 36.1 (Cosine, 30 sub-blocks skipped) / 49.1 (L2);
+      indexed 123.4 → 12.4 / 13.4; same answers by event id. Granule timestamp stats get less selective in exchange.
+- [x] Probe rounds of one segment share a cache of opened blocks (`PartCache`), so an indexed search never decrypts a
+      block twice. 200 natural clusters / 90 partitions (~35 probed Cosine, ~63 L2): indexed opens 62.3 vs scan 66.1
+      blocks in cluster order (was 76.9) and the same 94.9 in time order; answers equal.
+- [ ] Still open by nature: with far more natural clusters than partitions the partition radii stay loose, so many
+      partitions are probed; and when natural clusters are smaller than a 128-row sub-block, no row order makes
+      sub-blocks homogeneous, so ball skipping does not apply. Filter selectivity is still estimated from min/max
+      granule stats only.
+- [x] Index GC: `vector_object_keys` / `dropped_vector_object_keys`; `sweep_dropped_objects` notes dropped or
+      replaced partition indexes, superseded segment deletes and both for segments removed from the catalogue, and
+      deletes them after the safety window unless a live generation names them.
+- [x] `range_truncated` tested through the internal result-cap hook (`search_in_range_capped`).
+- [x] `RoaringRangeBitmap::union` back to private (only `BitmapIndex::insert` uses it).
 - [x] Range search (`search_segments_in_range`, `ScoreRange`, `MAX_RANGE_RESULTS`, `SearchStats::range_truncated`):
       segment lower/upper bounds (`SegmentCodec::segment_bounds`), partition lower bounds and row bounds skip work
       outside the range. Tests: band ranges for Dot and L2 with I8 and U1 coarse codes equal brute force (recall 1.0;
@@ -63,7 +85,14 @@
       Version 5 header, plain segments stay version 4, filters, deletes, `max_rerank`, invalid input.
 - [x] RRF (`reciprocal_rank_fusion`, `hybrid_rrf`, `RrfParams`, `DEFAULT_RRF_K`) with tests for weights, ties,
       duplicates, limit and determinism.
-- [ ] Not done: multivector segments cannot be merged or partition-indexed for MaxSim search (`merge_segments`
-      refuses them); MaxSim search visits segments in order without a centroid ordering; RaBitQ (U1) bounds at these
-      sizes are loose, so U1 range and MaxSim searches rerank a large share of rows (still exact). Range search
-      over version 1–3 segments scans the fine column. No ranked text search exists in OE to wire into `hybrid_rrf`.
+- [x] Multivector merge: `merge_segments(_with_deletes)` merges version 5 segments (documents keep their tokens, a
+      document with no live token is dropped, metadata travels with it; mixing with plain segments is refused);
+      `merge_segments_clustered` groups documents by their mean token's partition. `read_live_documents`.
+- [x] MaxSim with partition indexes (`search_multivector_segments_indexed`): per query token the `nprobes` best
+      partitions (more while under 2 × `token_candidates` rows), unprobed partitions' bounds imputed, widening ×4
+      until unseen documents cannot reach the k-th score. Segments are visited by MaxSim bound then centroid
+      closeness with the cross-segment threshold. 600 documents over 64 topics: token rows scanned 2 400 → ~1 050
+      per query, same answers; a far segment is skipped.
+- [ ] Not done: RaBitQ (U1) bounds at small sizes are loose, so U1 range searches rerank a large share of rows
+      (still exact); range search over version 1–3 segments scans the fine column. No ranked text search exists in
+      OE to wire into `hybrid_rrf`.

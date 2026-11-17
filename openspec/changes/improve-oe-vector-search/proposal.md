@@ -28,7 +28,7 @@ vectorise.
   from the model, centred on the segment mean, per-row norm and alignment, derived error bound); I8 columns become
   segment-level per-dimension int8 whose trailer stores `|x̂|²` and the reconstruction error. The footer appends the
   rotation seed, the RaBitQ centre, the segment radius and the per-dimension int8 parameters. Searches rerank by
-  bounds instead of a fixed `k × oversample` (which becomes a cap), visit segments nearest centroid first and
+  bounds instead of a fixed `k × oversample` (which becomes a rerank patience), visit segments nearest centroid first and
   pass the running k-th exact score into each segment. Versions 1–3 read unchanged (Hamming U1, per-row I8).
 
 - Partition index (issue #98 item 2): an external, droppable IVF artifact per segment, following the manifest-
