@@ -1,7 +1,7 @@
 //! Hybrid text + vector ranking by Reciprocal Rank Fusion.
 //!
-//! OE's text-token index (`indexes::text_token`) is a membership filter for pruning, not a ranked text search, so
-//! the text side is any ranked list of event ids the caller produced (e.g. a full-text engine's results).
+//! The text side is any ranked list of event ids: OE's own BM25 ranking (`text::search_bm25`, see [`hybrid_search`])
+//! or an external full-text engine's results. (`indexes::text_token` is only a pruning filter.)
 //! `score(e) = Σ_lists weight / (k + rank)` with 1-based ranks; an id absent from a list contributes nothing, and
 //! only its first occurrence in a list counts. Ties break by best (smallest) rank in any list, then by the list
 //! order (an id ranked by an earlier list first), then by event id, so the output is deterministic.
@@ -94,4 +94,19 @@ pub fn hybrid_rrf<T: AsRef<str>>(vector: &[SearchHit], text: &[T], params: RrfPa
         params.k,
         params.limit,
     )
+}
+
+/// Hybrid search with OE's own text ranking: runs BM25 (`text::search_bm25`, top `text_limit`, corpus statistics
+/// summed over `text_segments`) for `query` and fuses the result with the vector hits by [`hybrid_rrf`].
+pub fn hybrid_search(
+    vector: &[SearchHit],
+    text_segments: &[crate::text::TextSegment<'_>],
+    query: &str,
+    text_limit: usize,
+    bm25: crate::text::Bm25Params,
+    params: RrfParams,
+) -> Vec<FusedHit> {
+    let text = crate::text::search_bm25(text_segments, query, text_limit, bm25);
+    let text_ids: Vec<&str> = text.iter().map(|hit| hit.event_id.as_str()).collect();
+    hybrid_rrf(vector, &text_ids, params)
 }

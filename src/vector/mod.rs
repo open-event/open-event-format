@@ -27,7 +27,7 @@ pub use constant::{
 };
 pub use deletes::SegmentDeletes;
 pub use error::*;
-pub use fusion::{DEFAULT_RRF_K, FusedHit, RrfParams, hybrid_rrf, reciprocal_rank_fusion};
+pub use fusion::{DEFAULT_RRF_K, FusedHit, RrfParams, hybrid_rrf, hybrid_search, reciprocal_rank_fusion};
 pub use ivf::{PARTITION_INDEX_MAGIC, PARTITION_INDEX_VERSION, Partition, PartitionIndex, PartitionParams};
 pub use kernel::{PreparedQuery, TopK, top_k};
 pub use model::*;
