@@ -20,6 +20,11 @@ path = "compare/main.rs"
 bench = false
 
 [[bin]]
+name = "oe-vector-bench"
+path = "vector/main.rs"
+bench = false
+
+[[bin]]
 name = "oe-vs-parquet"
 path = "operations/main.rs"
 bench = false

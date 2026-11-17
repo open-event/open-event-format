@@ -96,3 +96,12 @@
 - [ ] Not done: RaBitQ (U1) bounds at small sizes are loose, so U1 range searches rerank a large share of rows
       (still exact); range search over version 1–3 segments scans the fine column. No ranked text search exists in
       OE to wire into `hybrid_rrf`.
+- [x] Recall and latency benchmark (`benchmark/vector`, `oe-vector-bench`, `just bench-vector`): seeded clustered
+      datasets (10k/100k, d = 128/768, time and cluster order; 1M behind `--large`), top-10, 1% and 50% room filters,
+      range and MaxSim workloads; exact, scan, indexed and clustered-merge configurations; recall@10, p50/p99, blocks
+      opened, rows reranked, bytes per vector, build time to `benchmark/results/vector.{json,md}`. Gate test in
+      `cargo test --release` (10k × 128, 5k × 768, MaxSim): recall@10 ≥ 0.95 and indexed opens fewer blocks than scan
+      on clustered data; spec delta `specs/oe-benchmarks-and-acceptance-gates`.
+- [ ] Default recall at 100k rows: top-10 recall@10 is 0.87–0.90 with `DEFAULT_OVERSAMPLE` (8) on topics of ~630 rows
+      (patience 32 or 0 gives 1.000 at the same latency); the 100k gate test is ignored until the default changes.
+      A 1% room filter opens 700–3,200 blocks and reranks far more rows than the room holds.
