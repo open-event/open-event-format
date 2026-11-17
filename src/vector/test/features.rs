@@ -633,3 +633,83 @@ fn multivector_segments_merge_with_deletes() {
         }
     }
 }
+
+/// MaxSim with partition indexes over token rows answers like the scan while scanning fewer token rows; segments
+/// are visited nearest first, so a far segment listed first is skipped by the threshold.
+#[test]
+fn multivector_search_uses_partition_indexes_and_visits_the_nearest_segment_first() {
+    let dimension = 64;
+    for metric in [VectorMetric::Dot, VectorMetric::L2] {
+        let model = model(dimension, metric);
+        // Documents over 64 tight topics (each token near one topic), so token partitions are tight.
+        let topics = clustered(64, 1, dimension, 0.0, 41);
+        let near: Vec<Vec<Vec<f32>>> = (0..600usize)
+            .map(|doc| {
+                (0..2 + doc % 5)
+                    .map(|token| {
+                        let topic = &topics[(doc * 7 + token * 13) % 64];
+                        let noise = unit(50_000 + (doc * 8 + token) as u64, dimension);
+                        let mut row: Vec<f32> = topic.iter().zip(&noise).map(|(t, n)| t + 0.25 * n).collect();
+                        let norm = row.iter().map(|v| v * v).sum::<f32>().sqrt();
+                        row.iter_mut().for_each(|v| *v /= norm);
+                        row
+                    })
+                    .collect()
+            })
+            .collect();
+        // A tight bundle of tokens around one direction: its segment bound is far below the near documents' scores.
+        let direction = unit(31_337, dimension);
+        let far: Vec<Vec<Vec<f32>>> = (0..200u64)
+            .map(|doc| {
+                (0..3u64)
+                    .map(|token| {
+                        let noise = unit(70_000 + doc * 3 + token, dimension);
+                        let mut row: Vec<f32> = direction.iter().zip(&noise).map(|(d, n)| d + 0.05 * n).collect();
+                        let norm = row.iter().map(|v| v * v).sum::<f32>().sqrt();
+                        row.iter_mut().for_each(|v| *v /= norm);
+                        row
+                    })
+                    .collect()
+            })
+            .collect();
+        let segments = vec![
+            multivector_segment(&far, "$m0d", &model, VectorElement::I8),
+            multivector_segment(&near, "$m1d", &model, VectorElement::I8),
+        ];
+        let indexes: Vec<PartitionIndex> = segments
+            .iter()
+            .map(|segment| PartitionIndex::build(segment, &PartitionParams::default()).unwrap())
+            .collect();
+        let indexed: Vec<Option<&PartitionIndex>> = indexes.iter().map(Some).collect();
+        let parts = [far.clone(), near.clone()];
+        let (mut scanned_plain, mut scanned_indexed, mut probed) = (0u64, 0u64, 0u64);
+        for query_index in 0..8usize {
+            let source = &near[query_index * 71 % 600];
+            let query: Vec<Vec<f32>> = source.iter().take(3).cloned().collect();
+            let search = MultivectorSearch::new(&model, &query, 10);
+            let (plain, plain_stats) = search_multivector_segments(&segments, &[], &search).unwrap();
+            let (with_index, stats) =
+                search_multivector_segments_indexed(&segments, &[], &indexed, &search, SearchOptions::default())
+                    .unwrap();
+            assert_eq!(plain, with_index, "{metric:?} query {query_index}");
+            let truth = brute_max_sim(&parts, &query, metric, |_, _| true);
+            for (hit, (id, score)) in plain.iter().zip(&truth) {
+                assert_eq!(&hit.event_id, id);
+                assert!((hit.score - score).abs() < 1e-3);
+            }
+            assert_eq!((plain_stats.segments_searched, plain_stats.segments_skipped), (1, 1));
+            assert_eq!(stats.segments_skipped, 1);
+            scanned_plain += plain_stats.rows_scanned;
+            scanned_indexed += stats.rows_scanned;
+            probed += stats.partitions_probed;
+        }
+        println!(
+            "{metric:?}: token rows scanned per query plain {:.0} indexed {:.0}; partitions probed {:.1}/{}",
+            scanned_plain as f64 / 8.0,
+            scanned_indexed as f64 / 8.0,
+            probed as f64 / 8.0,
+            indexes[1].partitions.len()
+        );
+        assert!(scanned_indexed < scanned_plain, "{metric:?}");
+    }
+}

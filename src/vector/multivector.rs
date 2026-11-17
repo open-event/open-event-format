@@ -17,10 +17,11 @@ use super::codec::CodedQuery;
 use super::constant::*;
 use super::deletes::SegmentDeletes;
 use super::error::VectorError;
+use super::ivf::PartitionIndex;
 use super::kernel::{TopK, for_each_row};
 use super::model::{EmbeddingModel, ScoredRow, VectorMetric};
 use super::seal::{FileKeys, WrappingKey};
-use super::search::{AllowedValues, SearchFilter, SearchStats, row_filter};
+use super::search::{AllowedValues, SearchFilter, SearchOptions, SearchStats, row_filter};
 use super::segment::{SegmentInput, SegmentReader, SegmentSource, SegmentSpec, SubBlock, write_segment_inner};
 use crate::indexes::bitmap::RoaringRangeBitmap;
 use std::collections::{BTreeMap, HashMap};
@@ -293,12 +294,30 @@ pub struct MultivectorHit {
 }
 
 /// MaxSim top-k over multivector segments (`deletes[i]` marks deleted token rows of `segments[i]`; a document
-/// with no live token is gone). Segments are visited in order and the running k-th score skips any segment whose
-/// bound (sum over query tokens of the segment score bound) cannot reach it. Stats count token rows.
+/// with no live token is gone). Stats count token rows. See `search_multivector_segments_indexed`.
 pub fn search_multivector_segments<S: SegmentSource>(
     segments: &[SegmentReader<S>],
     deletes: &[Option<&SegmentDeletes>],
     search: &MultivectorSearch<'_>,
+) -> Result<(Vec<MultivectorHit>, SearchStats), VectorError> {
+    search_multivector_segments_indexed(segments, deletes, &[], search, SearchOptions::default())
+}
+
+/// `search_multivector_segments` with an optional partition index (built over the token rows) per segment.
+///
+/// Segments are visited best first: largest MaxSim bound (sum over query tokens of the segment score bound), then
+/// nearest centroid (sum over query tokens of the centroid score; a segment's centroid alone is a poor guide for a
+/// sum of per-token maxima). The running k-th score skips any later segment whose bound cannot reach it.
+/// With an index, each query token's candidates come from its `nprobes` best partitions (more while they hold
+/// fewer than twice `token_candidates` rows), and a token row in an unprobed partition is imputed that partition's
+/// bound. If documents never seen could still reach the k-th score, the probe widens (×4 per round, finally the
+/// whole segment), so the answer equals the unindexed search.
+pub fn search_multivector_segments_indexed<S: SegmentSource>(
+    segments: &[SegmentReader<S>],
+    deletes: &[Option<&SegmentDeletes>],
+    indexes: &[Option<&PartitionIndex>],
+    search: &MultivectorSearch<'_>,
+    options: SearchOptions,
 ) -> Result<(Vec<MultivectorHit>, SearchStats), VectorError> {
     let dimension = search.model.dimension as usize;
     if search.query.is_empty() || search.query.iter().any(|token| token.len() != dimension) {
@@ -306,17 +325,45 @@ pub fn search_multivector_segments<S: SegmentSource>(
             rule: format!("a multivector query holds at least one token of width {dimension}"),
         });
     }
-    for segment in segments {
+    for (index, segment) in segments.iter().enumerate() {
         segment.manifest().model.require_same(search.model)?;
         if segment.document_offsets().is_none() {
             return Err(VectorError::InvalidInput {
                 rule: "multivector search needs version 5 (multivector) segments".to_owned(),
             });
         }
+        if let Some(partitions) = indexes.get(index).copied().flatten() {
+            partitions.check(segment)?;
+        }
     }
+    let mut order: Vec<(usize, (f32, f32))> = segments
+        .iter()
+        .enumerate()
+        .map(|(index, segment)| {
+            let bound: f32 = search.query.iter().map(|token| segment.segment_bounds(token).1).sum();
+            let closeness = segment.centroid().map_or(f32::INFINITY, |centroid| {
+                search
+                    .query
+                    .iter()
+                    .map(|token| centroid_score(search.model.metric, centroid, token))
+                    .sum()
+            });
+            (index, (bound, closeness))
+        })
+        .collect();
+    order.sort_by(|left, right| {
+        (right.1)
+            .0
+            .total_cmp(&(left.1).0)
+            .then((right.1).1.total_cmp(&(left.1).1))
+            .then(left.0.cmp(&right.0))
+    });
     let mut stats = SearchStats::default();
     let mut hits: Vec<(usize, ScoredRow)> = Vec::new();
-    for (index, segment) in segments.iter().enumerate() {
+    for (index, _) in order {
+        let Some(segment) = segments.get(index) else {
+            continue;
+        };
         let threshold = if search.k > 0 && hits.len() >= search.k {
             hits.last().map_or(f32::NEG_INFINITY, |(_, row)| row.score)
         } else {
@@ -328,7 +375,13 @@ pub fn search_multivector_segments<S: SegmentSource>(
             .flatten()
             .filter(|deletes| deletes.deleted_count() > 0)
             .map(SegmentDeletes::bitmap);
-        let found = SegmentMaxSim { search, segment }.run(deleted.as_ref(), threshold, &mut stats)?;
+        let found = SegmentMaxSim {
+            nprobes: options.nprobes.max(1),
+            partitions: indexes.get(index).copied().flatten(),
+            search,
+            segment,
+        }
+        .run(deleted.as_ref(), threshold, &mut stats)?;
         hits.extend(found.into_iter().map(|row| (index, row)));
         hits.sort_by(|left, right| {
             right
@@ -360,7 +413,17 @@ pub fn search_multivector_segments<S: SegmentSource>(
     Ok((out, stats))
 }
 
+fn centroid_score(metric: VectorMetric, centroid: &[f32], query: &[f32]) -> f32 {
+    let pairs = centroid.iter().zip(query);
+    match metric {
+        VectorMetric::Cosine | VectorMetric::Dot => pairs.map(|(a, b)| a * b).sum(),
+        VectorMetric::L2 => -pairs.map(|(a, b)| (a - b) * (a - b)).sum::<f32>(),
+    }
+}
+
 struct SegmentMaxSim<'a, S> {
+    nprobes: usize,
+    partitions: Option<&'a PartitionIndex>,
     search: &'a MultivectorSearch<'a>,
     segment: &'a SegmentReader<S>,
 }
@@ -375,12 +438,7 @@ impl<S: SegmentSource> SegmentMaxSim<'_, S> {
     ) -> Result<Vec<ScoredRow>, VectorError> {
         let segment = self.segment;
         let search = self.search;
-        let k = search.k;
-        let representations = segment.representations(EMBEDDING_COLUMN_ID);
-        let (Some(coarse), Some(fine)) = (representations.first(), representations.last()) else {
-            return Ok(Vec::new());
-        };
-        if k == 0 || segment.row_count() == 0 {
+        if search.k == 0 || segment.row_count() == 0 || segment.representations(EMBEDDING_COLUMN_ID).is_empty() {
             return Ok(Vec::new());
         }
         let mut live = if search.filter.is_empty() {
@@ -404,7 +462,88 @@ impl<S: SegmentSource> SegmentMaxSim<'_, S> {
             return Ok(Vec::new());
         }
         stats.segments_searched += 1;
+        let Some(partitions) = self.partitions else {
+            return self
+                .round(live.as_ref(), live.as_ref(), None, threshold, stats)
+                .map(|(rows, _)| rows);
+        };
+        let mut nprobes = self.nprobes;
+        loop {
+            let everything = nprobes >= partitions.partitions.len();
+            let probe = (!everything).then(|| self.probe(partitions, nprobes, live.as_ref()));
+            let (scan, floors) = match &probe {
+                Some((rows, floors, probed)) => {
+                    stats.partitions_probed += *probed as u64;
+                    (Some(rows), Some(floors.as_slice()))
+                }
+                None => {
+                    stats.partitions_probed += partitions.partitions.len() as u64;
+                    (live.as_ref(), None)
+                }
+            };
+            let (rows, complete) = self.round(live.as_ref(), scan, floors, threshold, stats)?;
+            if complete || everything {
+                return Ok(rows);
+            }
+            nprobes = nprobes.saturating_mul(4);
+        }
+    }
 
+    /// The token rows to scan (live rows of each query token's best partitions) and, per query token, the bound on
+    /// any token row outside its probed partitions.
+    fn probe(
+        &self,
+        partitions: &PartitionIndex,
+        nprobes: usize,
+        live: Option<&RoaringRangeBitmap>,
+    ) -> (RoaringRangeBitmap, Vec<f32>, usize) {
+        let wanted = self.search.token_candidates.max(1).saturating_mul(2);
+        let mut probed = vec![false; partitions.partitions.len()];
+        let mut floors = Vec::with_capacity(self.search.query.len());
+        for token in self.search.query {
+            let mut floor = f32::NEG_INFINITY;
+            let (mut taken, mut rows) = (0usize, 0usize);
+            for (partition, upper) in partitions.ranked(token) {
+                if taken >= nprobes && rows >= wanted {
+                    floor = upper;
+                    break;
+                }
+                if let Some(slot) = probed.get_mut(partition) {
+                    *slot = true;
+                }
+                taken += 1;
+                rows += partitions.partitions.get(partition).map_or(0, |p| p.rows.len());
+            }
+            floors.push(floor);
+        }
+        let chosen: Vec<usize> = (0..probed.len())
+            .filter(|index| probed.get(*index) == Some(&true))
+            .collect();
+        let mut rows = partitions.rows_of(&chosen);
+        if let Some(live) = live {
+            rows = rows.intersect(live);
+        }
+        (rows, floors, chosen.len())
+    }
+
+    /// One candidate-and-rerank pass over the token rows `scan`; `floors[i]` bounds query token `i`'s score on any
+    /// row outside `scan`. Returns the documents and whether the answer is complete (no unseen document can reach
+    /// the k-th score). Without floors the pass scans every live row and scores unseen documents when needed.
+    fn round(
+        &self,
+        live: Option<&RoaringRangeBitmap>,
+        scan: Option<&RoaringRangeBitmap>,
+        floors: Option<&[f32]>,
+        threshold: f32,
+        stats: &mut SearchStats,
+    ) -> Result<(Vec<ScoredRow>, bool), VectorError> {
+        let segment = self.segment;
+        let search = self.search;
+        let k = search.k;
+        let representations = segment.representations(EMBEDDING_COLUMN_ID);
+        let (Some(coarse), Some(fine)) = (representations.first(), representations.last()) else {
+            return Ok((Vec::new(), true));
+        };
         // Candidate generation: the best `token_candidates` token rows per query token by coarse upper bound.
         let coarse_meta = segment.vector_meta(coarse.column_id, search.model)?;
         let coarse_queries: Vec<CodedQuery> = search
@@ -414,10 +553,10 @@ impl<S: SegmentSource> SegmentMaxSim<'_, S> {
             .collect();
         let keep = search.token_candidates.max(1);
         let mut candidates: Vec<Vec<(f32, u64)>> = vec![Vec::new(); search.query.len()];
-        let mut missing = vec![f32::NEG_INFINITY; search.query.len()];
+        let mut missing = floors.map_or_else(|| vec![f32::NEG_INFINITY; search.query.len()], <[f32]>::to_vec);
         let width = coarse_meta.row_width();
-        segment.scan_parts(coarse.column_id, live.as_ref(), |first_row, plaintext| {
-            for_each_row(width, plaintext, first_row, live.as_ref(), |row, bytes| {
+        segment.scan_parts(coarse.column_id, scan, |first_row, plaintext| {
+            for_each_row(width, plaintext, first_row, scan, |row, bytes| {
                 stats.rows_scanned += 1;
                 for ((query, kept), missing) in coarse_queries.iter().zip(&mut candidates).zip(&mut missing) {
                     let upper = query.estimate(bytes).upper;
@@ -463,7 +602,7 @@ impl<S: SegmentSource> SegmentMaxSim<'_, S> {
         ranked.sort_by(|left, right| right.1.total_cmp(&left.1).then(left.0.cmp(&right.0)));
 
         // Exact MaxSim on the fine representation, best bound first.
-        let mut exact = Exact::new(segment, fine.column_id, search, live.as_ref())?;
+        let mut exact = Exact::new(segment, fine.column_id, search, live)?;
         let mut best = TopK::new(k);
         let bar = |best: &TopK| best.threshold().map_or(threshold, |kth| kth.max(threshold));
         let limit = search.max_rerank.unwrap_or(usize::MAX);
@@ -476,6 +615,9 @@ impl<S: SegmentSource> SegmentMaxSim<'_, S> {
             }
         }
         if search.max_rerank.is_none() && unseen >= bar(&best) {
+            if floors.is_some() {
+                return Ok((Vec::new(), false));
+            }
             for document in 0..segment.document_count() {
                 if documents.contains_key(&document) {
                     continue;
@@ -485,11 +627,13 @@ impl<S: SegmentSource> SegmentMaxSim<'_, S> {
                 }
             }
         }
-        Ok(best
-            .into_sorted()
-            .into_iter()
-            .filter(|row| row.score >= threshold)
-            .collect())
+        Ok((
+            best.into_sorted()
+                .into_iter()
+                .filter(|row| row.score >= threshold)
+                .collect(),
+            true,
+        ))
     }
 }
 

@@ -32,7 +32,7 @@ pub use kernel::{PreparedQuery, TopK, top_k};
 pub use model::*;
 pub use multivector::{
     MultivectorHit, MultivectorInput, MultivectorSearch, max_sim, merge_multivector_segments, read_live_documents,
-    search_multivector_segments, write_multivector_segment,
+    search_multivector_segments, search_multivector_segments_indexed, write_multivector_segment,
 };
 pub use quantize::{decode_row, encode_row, u1_estimated_dot};
 pub use seal::WrappingKey;
