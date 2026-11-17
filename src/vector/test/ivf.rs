@@ -747,6 +747,13 @@ fn a_clustered_merge_cuts_blocks_opened_on_time_ordered_segments() {
         )
         .unwrap();
         assert_eq!(clustered.row_count(), 8000);
+        let compacted =
+            SegmentReader::open(compact_segments(&halves, &[], &segment_spec, &key(1)).unwrap(), &key(1)).unwrap();
+        assert_eq!(
+            compacted.read_all().unwrap().event_ids,
+            clustered.read_all().unwrap().event_ids,
+            "compaction defaults to the clustered order"
+        );
         let (before, after) = (time.read_all().unwrap(), clustered.read_all().unwrap());
         let by_id: std::collections::HashMap<&String, &Vec<f32>> =
             before.event_ids.iter().zip(&before.vectors).collect();

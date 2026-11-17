@@ -71,8 +71,25 @@ fn splitmix(state: &mut u64) -> u64 {
     z ^ (z >> 31)
 }
 
+#[multiversion::multiversion(targets("x86_64+avx512f+avx512bw+avx512dq+avx512vl", "x86_64+avx2+fma", "aarch64+neon"))]
 fn squared_distance(left: &[f32], right: &[f32]) -> f32 {
-    left.iter().zip(right).map(|(a, b)| (a - b) * (a - b)).sum()
+    const LANES: usize = 8;
+    let mut lanes = [0f32; LANES];
+    let lefts = left.chunks_exact(LANES);
+    let rights = right.chunks_exact(LANES);
+    let tail: f32 = lefts
+        .remainder()
+        .iter()
+        .zip(rights.remainder())
+        .map(|(a, b)| (a - b) * (a - b))
+        .sum();
+    for (l, r) in lefts.zip(rights) {
+        for ((lane, a), b) in lanes.iter_mut().zip(l).zip(r) {
+            let delta = a - b;
+            *lane += delta * delta;
+        }
+    }
+    lanes.iter().sum::<f32>() + tail
 }
 
 fn nearest(centroids: &[Vec<f32>], row: &[f32]) -> usize {
@@ -86,7 +103,21 @@ fn nearest(centroids: &[Vec<f32>], row: &[f32]) -> usize {
     best.0
 }
 
-/// Deterministic Lloyd k-means: seeded distinct initial rows, a fixed number of iterations, L2 assignment.
+/// Training rows per partition: Lloyd iterations run on a seeded sample of at most this many rows per partition,
+/// then every row is assigned once to its nearest trained centroid.
+pub const KMEANS_SAMPLE_PER_PARTITION: usize = 64;
+
+fn assign(centroids: &[Vec<f32>], rows: &[&[f32]]) -> Vec<usize> {
+    use rayon::prelude::*;
+    rows.par_iter()
+        .with_min_len(256)
+        .map(|row| nearest(centroids, row))
+        .collect()
+}
+
+/// Deterministic k-means: seeded distinct initial rows, Lloyd iterations on a seeded sample of at most
+/// `KMEANS_SAMPLE_PER_PARTITION × partitions` rows, then one L2 assignment pass over every row. Assignment runs in
+/// parallel; sums are accumulated in a fixed order, so equal input and parameters give equal output.
 pub(super) fn kmeans(
     vectors: &[Vec<f32>],
     dimension: usize,
@@ -94,9 +125,10 @@ pub(super) fn kmeans(
     params: &PartitionParams,
 ) -> Vec<usize> {
     let n = vectors.len();
+    let sample_len = n.min(partitions.saturating_mul(KMEANS_SAMPLE_PER_PARTITION).max(partitions));
     let mut order: Vec<usize> = (0..n).collect();
     let mut state = params.seed;
-    for slot in 0..partitions.min(n) {
+    for slot in 0..sample_len {
         let pick = slot + (splitmix(&mut state) % (n - slot) as u64) as usize;
         order.swap(slot, pick);
     }
@@ -105,20 +137,20 @@ pub(super) fn kmeans(
         .take(partitions)
         .filter_map(|row| vectors.get(*row).cloned())
         .collect();
-    let mut assignment = vec![0usize; n];
-    for iteration in 0..=params.iterations {
-        for (slot, row) in assignment.iter_mut().zip(vectors) {
-            *slot = nearest(&centroids, row);
-        }
-        if iteration == params.iterations {
-            break;
-        }
+    let mut sample: Vec<usize> = order.into_iter().take(sample_len).collect();
+    sample.sort_unstable();
+    let sample: Vec<&[f32]> = sample
+        .iter()
+        .filter_map(|row| vectors.get(*row).map(Vec::as_slice))
+        .collect();
+    for _ in 0..params.iterations {
+        let assignment = assign(&centroids, &sample);
         let mut sums = vec![vec![0f64; dimension]; centroids.len()];
         let mut counts = vec![0usize; centroids.len()];
-        for (slot, row) in assignment.iter().zip(vectors) {
+        for (slot, row) in assignment.iter().zip(&sample) {
             if let (Some(sum), Some(count)) = (sums.get_mut(*slot), counts.get_mut(*slot)) {
                 sum.iter_mut()
-                    .zip(row)
+                    .zip(row.iter())
                     .for_each(|(total, value)| *total += f64::from(*value));
                 *count += 1;
             }
@@ -132,7 +164,8 @@ pub(super) fn kmeans(
             }
         }
     }
-    assignment
+    let all: Vec<&[f32]> = vectors.iter().map(Vec::as_slice).collect();
+    assign(&centroids, &all)
 }
 
 impl PartitionIndex {

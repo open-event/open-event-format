@@ -1145,6 +1145,33 @@ impl<S: SegmentSource> SegmentReader<S> {
         Ok(())
     }
 
+    /// `scan_parts` through a cache of opened blocks, so repeated passes decrypt each block once.
+    pub(super) fn scan_parts_cached(
+        &self,
+        column_id: u32,
+        filter: Option<&RoaringRangeBitmap>,
+        cache: &PartCache,
+        mut visit: impl FnMut(u64, &[u8]),
+    ) -> Result<(), VectorError> {
+        let column = self.column_by_id(column_id)?;
+        for part in self.parts_touched(column, filter) {
+            visit(
+                part.first_row,
+                &self.cached_part(column, part.granule, part.part, Some(cache))?,
+            );
+        }
+        Ok(())
+    }
+
+    /// How many sealed blocks of a column `filter` touches.
+    pub(super) fn parts_touched_count(
+        &self,
+        column_id: u32,
+        filter: &RoaringRangeBitmap,
+    ) -> Result<usize, VectorError> {
+        Ok(self.parts_touched(self.column_by_id(column_id)?, Some(filter)).len())
+    }
+
     /// The blocks of `column` that `filter` touches, in row order, with unbounded scores.
     fn parts_touched(&self, column: &StoredColumn, filter: Option<&RoaringRangeBitmap>) -> Vec<PartRef> {
         let part_rows = column.part_rows as u64;
@@ -1205,7 +1232,8 @@ impl<S: SegmentSource> SegmentReader<S> {
     /// both `threshold` (the caller's running k-th best exact score from other segments) and the k-th best lower
     /// bound seen so far. Candidates are reranked in decreasing upper bound until the next upper bound falls below
     /// the k-th best exact score, so the rerank set follows the bounds rather than a fixed `k × oversample`.
-    /// `cap`, when set, stops the rerank after `k × cap` consecutive rows that did not enter the top k. A whole
+    /// `cap`, when set, stops the rerank after a run of rows that did not enter the top k (`k × cap` rows, or
+    /// `RERANK_PATIENCE_GROWTH` × the rows reranked up to the last improvement, whichever is longer). A whole
     /// segment whose score bound is below
     /// `threshold` is skipped without opening a block. Older (unbounded) codes keep the fixed oversample rerank.
     pub(crate) fn search_bounded(
@@ -1360,15 +1388,25 @@ impl<S: SegmentSource> SegmentReader<S> {
         candidates.sort_by(|left, right| right.1.total_cmp(&left.1).then(left.0.cmp(&right.0)));
         stats.rows_candidate += candidates.len() as u64;
 
-        // `cap` is a patience: stop once `k × cap` consecutive reranks failed to enter the top k. Rows are reranked
-        // in decreasing upper bound, so a long run without improvement means the remaining rows are unlikely to
-        // matter, while a tight cluster whose members keep improving the result is reranked in full.
-        let patience = cap.map_or(usize::MAX, |cap| k.saturating_mul(cap.max(1)));
+        // Rows are reranked in decreasing upper bound until the next upper bound falls below the k-th exact score,
+        // which is exact. `cap` adds a patience: stop after a run of reranks that all failed to enter the top k,
+        // the run being `k × cap` rows or as many rows as had been reranked when the top k last improved,
+        // whichever is longer. Within a tight cluster (hundreds of rows whose upper bounds all reach the k-th
+        // score) the coarse code cannot order the rows, so improvements keep arriving at random positions with
+        // gaps that grow with the position; a fixed run stops before the last of them (recall@10 0.87–0.90 on
+        // 630-row topics at 100k rows), a run scaled with the position does not. Where the bounds do order the
+        // rows, improvements stop early and the fixed run ends the rerank as before.
+        let patience = cap.map(|cap| k.saturating_mul(cap.max(1)));
+        let mut last_improvement = 0usize;
         let mut since_improvement = 0usize;
         let mut exact = TopK::new(k);
-        for (row, upper) in candidates {
+        for (position, (row, upper)) in candidates.into_iter().enumerate() {
             let bar = exact.threshold().map_or(threshold, |kth| kth.max(threshold));
-            if since_improvement >= patience || upper < bar {
+            if upper < bar
+                || patience.is_some_and(|patience| {
+                    since_improvement >= patience.max(last_improvement.saturating_mul(RERANK_PATIENCE_GROWTH))
+                })
+            {
                 break;
             }
             let score = match seeded.get(&row) {
@@ -1387,6 +1425,7 @@ impl<S: SegmentSource> SegmentReader<S> {
             };
             if in_range(score) && score >= bar {
                 since_improvement = 0;
+                last_improvement = position + 1;
                 exact.offer(ScoredRow { row, score });
             } else {
                 since_improvement += 1;
@@ -1569,6 +1608,7 @@ impl<S> std::fmt::Debug for SegmentReader<S> {
     }
 }
 
+/// Merges segments keeping their rows in order. For compaction prefer `compact_segments` (clustered order).
 pub fn merge_segments<S: SegmentSource>(
     segments: &[SegmentReader<S>],
     spec: &SegmentSpec,
@@ -1623,6 +1663,26 @@ pub fn merge_segments_clustered<S: SegmentSource>(
     let merged = merged_input(segments, deletes, spec)?;
     let order = clustered_order(&merged.vectors, spec.model.dimension as usize, params);
     write_segment(spec, &permuted(merged, &order), wrapping)
+}
+
+/// The compaction entry point: merges `segments` (minus `deletes`) into one segment in clustered row order with
+/// default `PartitionParams`, the order partition indexes and sub-block balls need. Compacting time-ordered
+/// segments with `merge_segments` keeps every topic spread over every sub-block, so an index then saves almost
+/// nothing (100k × 768 benchmark: 1,007 of 1,023 blocks opened per query, against 21 after a clustered merge).
+/// Use `merge_segments_with_deletes` only when row order must be preserved.
+pub fn compact_segments<S: SegmentSource>(
+    segments: &[SegmentReader<S>],
+    deletes: &[Option<&super::deletes::SegmentDeletes>],
+    spec: &SegmentSpec,
+    wrapping: &WrappingKey,
+) -> Result<Vec<u8>, VectorError> {
+    merge_segments_clustered(
+        segments,
+        deletes,
+        spec,
+        wrapping,
+        &super::ivf::PartitionParams::default(),
+    )
 }
 
 /// Row order grouping rows by k-means partition, partitions chained nearest centroid next, rows within a partition

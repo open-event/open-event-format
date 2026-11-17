@@ -253,7 +253,8 @@ fn rabitq_search_matches_brute_force_recall_with_a_small_rerank_set() {
         );
         assert!(recall >= 0.95, "{metric:?} recall {recall}");
         assert!(
-            mean_reranked / (readers.len() as f64) < (k * DEFAULT_OVERSAMPLE) as f64 / 4.0,
+            // The position-scaled patience reranks a little past the last improvement (~22 rows per segment).
+            mean_reranked / (readers.len() as f64) < (k * DEFAULT_OVERSAMPLE) as f64 / 3.0,
             "{metric:?} reranked {mean_reranked} per query over {} segments",
             readers.len()
         );

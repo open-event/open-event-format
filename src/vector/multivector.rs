@@ -22,7 +22,9 @@ use super::kernel::{TopK, for_each_row};
 use super::model::{EmbeddingModel, ScoredRow, VectorMetric};
 use super::seal::{FileKeys, WrappingKey};
 use super::search::{AllowedValues, SearchFilter, SearchOptions, SearchStats, row_filter};
-use super::segment::{SegmentInput, SegmentReader, SegmentSource, SegmentSpec, SubBlock, write_segment_inner};
+use super::segment::{
+    PartCache, SegmentInput, SegmentReader, SegmentSource, SegmentSpec, SubBlock, write_segment_inner,
+};
 use crate::indexes::bitmap::RoaringRangeBitmap;
 use std::collections::{BTreeMap, HashMap};
 use zeroize::Zeroizing;
@@ -462,15 +464,32 @@ impl<S: SegmentSource> SegmentMaxSim<'_, S> {
             return Ok(Vec::new());
         }
         stats.segments_searched += 1;
+        let representations = segment.representations(EMBEDDING_COLUMN_ID);
+        let Some(fine) = representations.last() else {
+            return Ok(Vec::new());
+        };
+        // Every round shares the opened coarse blocks and the exact scorer's fine blocks, so widening never
+        // decrypts a block twice.
+        let coarse_cache = PartCache::default();
+        let mut exact = Exact::new(segment, fine.column_id, search, live.as_ref())?;
         let Some(partitions) = self.partitions else {
             return self
-                .round(live.as_ref(), live.as_ref(), None, threshold, stats)
+                .round(live.as_ref(), None, threshold, &coarse_cache, &mut exact, stats)
                 .map(|(rows, _)| rows);
         };
+        let live_rows = live.as_ref().map_or(segment.row_count(), RoaringRangeBitmap::count);
         let mut nprobes = self.nprobes;
         loop {
-            let everything = nprobes >= partitions.partitions.len();
-            let probe = (!everything).then(|| self.probe(partitions, nprobes, live.as_ref()));
+            let mut everything = nprobes >= partitions.partitions.len();
+            let mut probe = (!everything).then(|| self.probe(partitions, nprobes, live.as_ref()));
+            // A probe covering most of the segment saves little over a scan and may need another round: scan.
+            if probe.as_ref().is_some_and(|(rows, _, _)| {
+                rows.count().saturating_mul(MAXSIM_SCAN_FRACTION_DEN)
+                    >= live_rows.saturating_mul(MAXSIM_SCAN_FRACTION_NUM)
+            }) {
+                probe = None;
+                everything = true;
+            }
             let (scan, floors) = match &probe {
                 Some((rows, floors, probed)) => {
                     stats.partitions_probed += *probed as u64;
@@ -481,7 +500,7 @@ impl<S: SegmentSource> SegmentMaxSim<'_, S> {
                     (live.as_ref(), None)
                 }
             };
-            let (rows, complete) = self.round(live.as_ref(), scan, floors, threshold, stats)?;
+            let (rows, complete) = self.round(scan, floors, threshold, &coarse_cache, &mut exact, stats)?;
             if complete || everything {
                 return Ok(rows);
             }
@@ -531,17 +550,18 @@ impl<S: SegmentSource> SegmentMaxSim<'_, S> {
     /// the k-th score). Without floors the pass scans every live row and scores unseen documents when needed.
     fn round(
         &self,
-        live: Option<&RoaringRangeBitmap>,
         scan: Option<&RoaringRangeBitmap>,
         floors: Option<&[f32]>,
         threshold: f32,
+        coarse_cache: &PartCache,
+        exact: &mut Exact<'_, S>,
         stats: &mut SearchStats,
     ) -> Result<(Vec<ScoredRow>, bool), VectorError> {
         let segment = self.segment;
         let search = self.search;
         let k = search.k;
         let representations = segment.representations(EMBEDDING_COLUMN_ID);
-        let (Some(coarse), Some(fine)) = (representations.first(), representations.last()) else {
+        let Some(coarse) = representations.first() else {
             return Ok((Vec::new(), true));
         };
         // Candidate generation: the best `token_candidates` token rows per query token by coarse upper bound.
@@ -555,7 +575,7 @@ impl<S: SegmentSource> SegmentMaxSim<'_, S> {
         let mut candidates: Vec<Vec<(f32, u64)>> = vec![Vec::new(); search.query.len()];
         let mut missing = floors.map_or_else(|| vec![f32::NEG_INFINITY; search.query.len()], <[f32]>::to_vec);
         let width = coarse_meta.row_width();
-        segment.scan_parts(coarse.column_id, scan, |first_row, plaintext| {
+        segment.scan_parts_cached(coarse.column_id, scan, coarse_cache, |first_row, plaintext| {
             for_each_row(width, plaintext, first_row, scan, |row, bytes| {
                 stats.rows_scanned += 1;
                 for ((query, kept), missing) in coarse_queries.iter().zip(&mut candidates).zip(&mut missing) {
@@ -602,7 +622,6 @@ impl<S: SegmentSource> SegmentMaxSim<'_, S> {
         ranked.sort_by(|left, right| right.1.total_cmp(&left.1).then(left.0.cmp(&right.0)));
 
         // Exact MaxSim on the fine representation, best bound first.
-        let mut exact = Exact::new(segment, fine.column_id, search, live)?;
         let mut best = TopK::new(k);
         let bar = |best: &TopK| best.threshold().map_or(threshold, |kth| kth.max(threshold));
         let limit = search.max_rerank.unwrap_or(usize::MAX);

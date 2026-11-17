@@ -28,8 +28,9 @@ pub struct VectorSearch<'a> {
     pub model: &'a EmbeddingModel,
     /// Version 1–3 segments rerank `k × oversample` coarse candidates. Version 4 segments rerank by error bounds
     /// (decreasing upper bound until it falls below the k-th exact score) and use `oversample` as a patience: a
-    /// segment stops reranking after `k × oversample` consecutive rows that did not enter its top k; 0 means no
-    /// limit. Range searches ignore it.
+    /// segment stops reranking after a run of rows that did not enter its top k, the run being `k × oversample`
+    /// rows or `RERANK_PATIENCE_GROWTH` × the rows reranked when its top k last improved, whichever is longer; 0
+    /// means no limit. Range searches ignore it.
     pub oversample: usize,
     pub query: &'a [f32],
 }
@@ -120,7 +121,7 @@ pub enum FilterStrategy {
 }
 
 /// Estimated kept fraction at or above which `FilterStrategy::Adaptive` post-filters.
-pub const POST_FILTER_SELECTIVITY: f64 = 0.75;
+pub const POST_FILTER_SELECTIVITY: f64 = 0.25;
 /// Partitions probed first (closest centroids) when a segment has a partition index; the probe then widens to
 /// every partition whose bound can still beat the k-th best score, so the result equals a full scan.
 pub const DEFAULT_NPROBES: usize = 8;
@@ -300,7 +301,7 @@ fn search_ranged<S: SegmentSource>(
                 FilterStrategy::PreFilter => None,
                 FilterStrategy::PostFilter => Some(()),
                 FilterStrategy::Adaptive => {
-                    (estimated_selectivity(segment, &search.filter) >= POST_FILTER_SELECTIVITY).then_some(())
+                    (sampled_selectivity(segment, &search.filter, &allowed)? >= POST_FILTER_SELECTIVITY).then_some(())
                 }
             };
             let post = match post {
@@ -397,6 +398,13 @@ impl<S: SegmentSource> SegmentScan<'_, S> {
         let (Some(coarse), Some(fine)) = (representations.first(), representations.last()) else {
             return Ok(Vec::new());
         };
+        if let Some(filter) = filter
+            && filter.count() <= SMALL_FILTER_EXACT_ROWS
+            && self.segment.parts_touched_count(fine.column_id, filter)?
+                <= k.max(1).saturating_mul(SMALL_FILTER_PARTS_PER_K)
+        {
+            return self.exact_rows(fine.column_id, filter, k, threshold, stats);
+        }
         let cache = PartCache::default();
         let bounded = |filter: Option<&RoaringRangeBitmap>, threshold: f32, stats: &mut SearchStats| {
             self.segment.search_bounded(
@@ -477,6 +485,36 @@ impl<S: SegmentSource> SegmentScan<'_, S> {
             }
         }
         stats.partitions_pruned += probed.iter().filter(|probed| !**probed).count() as u64;
+        Ok(best.into_sorted())
+    }
+
+    /// The best `k` rows of a small `filter` scored exactly on the fine column (`fine`), within the range and at
+    /// least `threshold`.
+    fn exact_rows(
+        &self,
+        fine: u32,
+        filter: &RoaringRangeBitmap,
+        k: usize,
+        threshold: f32,
+        stats: &mut SearchStats,
+    ) -> Result<Vec<ScoredRow>, VectorError> {
+        let rows: Vec<u64> = filter
+            .ranges()
+            .iter()
+            .flat_map(|range| range.start..range.end)
+            .collect();
+        stats.rows_scanned += rows.len() as u64;
+        stats.rows_reranked += rows.len() as u64;
+        let ceiling = self.range.ceiling();
+        let mut best = TopK::new(k);
+        for row in self
+            .segment
+            .rescore(fine, self.search.query, self.search.model, &rows)?
+        {
+            if row.score >= threshold && row.score <= ceiling {
+                best.offer(row);
+            }
+        }
         Ok(best.into_sorted())
     }
 
@@ -649,6 +687,7 @@ fn rows_matching<S: SegmentSource>(
 }
 
 /// Fraction of the segment's rows in granules whose statistics say the filter may match.
+#[cfg(test)]
 pub(super) fn estimated_selectivity<S: SegmentSource>(segment: &SegmentReader<S>, filter: &SearchFilter) -> f64 {
     let total = segment.row_count();
     if total == 0 {
@@ -659,6 +698,40 @@ pub(super) fn estimated_selectivity<S: SegmentSource>(segment: &SegmentReader<S>
         .map(|granule| segment.granule_rows(granule) as u64)
         .sum();
     may as f64 / total as f64
+}
+
+/// Granules whose filter columns `sampled_selectivity` decodes at most.
+pub const SELECTIVITY_SAMPLE_GRANULES: usize = 4;
+
+/// Estimated fraction of the segment's rows passing `filter`: the share of rows in granules whose statistics may
+/// match, times the matching fraction measured by decoding the filter columns of up to
+/// `SELECTIVITY_SAMPLE_GRANULES` of those granules (evenly spaced). Min/max string statistics say little about a
+/// room or sender spread over every granule; the sample does.
+pub(super) fn sampled_selectivity<S: SegmentSource>(
+    segment: &SegmentReader<S>,
+    filter: &SearchFilter,
+    allowed: &AllowedValues<'_>,
+) -> Result<f64, VectorError> {
+    let total = segment.row_count();
+    let may: Vec<usize> = (0..segment.granule_count())
+        .filter(|granule| segment.granule_rows(*granule) > 0 && granule_may_match(segment, *granule, filter))
+        .collect();
+    if total == 0 || may.is_empty() {
+        return Ok(0.0);
+    }
+    let may_rows: u64 = may.iter().map(|granule| segment.granule_rows(*granule) as u64).sum();
+    let picks = SELECTIVITY_SAMPLE_GRANULES.clamp(1, may.len());
+    let (mut seen, mut kept) = (0usize, 0usize);
+    for pick in 0..picks {
+        let Some(granule) = may.get(pick * may.len() / picks) else {
+            continue;
+        };
+        let keep = granule_matches(segment, *granule, filter, allowed)?;
+        seen += keep.len();
+        kept += keep.iter().filter(|kept| **kept).count();
+    }
+    let matching = if seen == 0 { 1.0 } else { kept as f64 / seen as f64 };
+    Ok(may_rows as f64 / total as f64 * matching)
 }
 
 /// Whether a granule may hold matching rows. Absent statistics mean "may match".

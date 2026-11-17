@@ -26,6 +26,14 @@ pub const I8_TRAILER_BYTES: usize = 8;
 pub const U1_TRAILER_BYTES: usize = 8;
 pub const NORMALIZATION_TOLERANCE: f32 = 1e-3;
 pub const DEFAULT_OVERSAMPLE: usize = 8;
+/// The rerank patience is at least this many times the rows reranked when the top k last improved (see
+/// `VectorSearch::oversample`).
+pub const RERANK_PATIENCE_GROWTH: usize = 2;
+/// A segment whose filtered rows number at most `SMALL_FILTER_EXACT_ROWS` and fall in at most
+/// `k × SMALL_FILTER_PARTS_PER_K` fine blocks is scored exactly on the fine representation, without a coarse pass,
+/// rerank or partition index. Rows scattered over many blocks keep the coarse pass, which reranks fewer blocks.
+pub const SMALL_FILTER_EXACT_ROWS: u64 = 4096;
+pub const SMALL_FILTER_PARTS_PER_K: usize = 4;
 pub const EMBEDDING_COLUMN_ID: u32 = crate::columns::column_ids::EMBEDDING_BASE;
 pub const EVENT_ID_COLUMN: &str = "event_id";
 pub const ROOM_ID_COLUMN: &str = "room_id";
@@ -44,3 +52,7 @@ pub const DEFAULT_TOKEN_CANDIDATES: usize = 256;
 /// error bound shrinks only as `1/√d`, so tiny dimensions rerank many rows, while the per-dimension int8 bound is
 /// tight at any dimension and costs only `d + 8` bytes per row, which at small `d` is a few bytes more than U1.
 pub const RABITQ_MIN_DIMENSION: u32 = 64;
+/// MaxSim with a partition index scans the segment instead of probing once the probed token rows reach
+/// `MAXSIM_SCAN_FRACTION_NUM / MAXSIM_SCAN_FRACTION_DEN` of its live rows.
+pub const MAXSIM_SCAN_FRACTION_NUM: u64 = 1;
+pub const MAXSIM_SCAN_FRACTION_DEN: u64 = 2;
