@@ -24,6 +24,9 @@ pub struct VectorSegmentEntry {
     #[serde(default)]
     pub index: Option<SegmentIndexRef>,
     pub segment_id: u128,
+    /// Optional, droppable BM25 text index for the segment; absent means no text ranking for it.
+    #[serde(default)]
+    pub text_index: Option<crate::text::TextIndexRef>,
 }
 
 /// A published partition index, bound to the segment content it was built from.
@@ -99,6 +102,29 @@ pub fn publish_segment_index(
 
 /// Removes the segment's index reference; search falls back to scanning. The object is deleted by the object
 /// sweeper (`dropped_vector_object_keys`) once no live generation names it.
+/// Records a published BM25 text index for the segment, replacing any earlier one (the old object is left for
+/// the sweeper).
+pub fn register_text_index(manifest: &mut ManifestGeneration, reference: crate::text::TextIndexRef) {
+    let segment_id = reference.segment_id;
+    manifest.register_vector_segment(segment_id);
+    if let Some(entry) = manifest
+        .vector_segments
+        .iter_mut()
+        .find(|entry| entry.segment_id == segment_id)
+    {
+        entry.text_index = Some(reference);
+    }
+}
+
+/// Removes the segment's BM25 text index reference; the object stays until the sweeper deletes it.
+pub fn drop_text_index(manifest: &mut ManifestGeneration, segment_id: u128) -> Option<crate::text::TextIndexRef> {
+    manifest
+        .vector_segments
+        .iter_mut()
+        .find(|entry| entry.segment_id == segment_id)
+        .and_then(|entry| entry.text_index.take())
+}
+
 pub fn drop_segment_index(manifest: &mut ManifestGeneration, segment_id: u128) -> Option<SegmentIndexRef> {
     manifest
         .vector_segments
@@ -186,6 +212,7 @@ impl ManifestGeneration {
                 deletes: None,
                 index: None,
                 segment_id,
+                text_index: None,
             });
         }
     }
@@ -346,6 +373,7 @@ pub fn vector_object_keys(generation: &ManifestGeneration) -> Vec<String> {
                 .map(|index| index.object_key.clone())
                 .into_iter()
                 .chain(entry.deletes.as_ref().map(|deletes| deletes.object_key.clone()))
+                .chain(entry.text_index.as_ref().map(|text| text.object_key.clone()))
         })
         .collect()
 }

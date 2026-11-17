@@ -90,7 +90,7 @@
       `hybrid_search`): scores match a naive reference, block-max WAND equals exhaustive (incl. deletes, multiple
       segments), global stats equal a single merged segment, deterministic plain and sealed bytes, tamper / wrong
       key / content mismatch rejected, hybrid end-to-end. Micro bench `benchmark/micro/bm25.rs`.
-- [ ] Not done: the `TextIndexRef` is not yet recorded on the manifest (`ManifestGeneration`); callers hold it.
+- [x] `TextIndexRef` is recorded on the manifest (`VectorSegmentEntry::text_index`, `register_text_index`, `drop_text_index`) and swept with the other vector objects when dropped.
 - [x] Multivector merge: `merge_segments(_with_deletes)` merges version 5 segments (documents keep their tokens, a
       document with no live token is dropped, metadata travels with it; mixing with plain segments is refused);
       `merge_segments_clustered` groups documents by their mean token's partition. `read_live_documents`.

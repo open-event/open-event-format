@@ -15,10 +15,10 @@ mod search;
 mod segment;
 
 pub use catalogue::{
-    SegmentDeletesRef, SegmentIndexRef, VectorSegmentEntry, drop_segment_index, dropped_vector_object_keys,
-    load_segment_deletes, load_segment_index, publish_segment_deletes, publish_segment_index,
-    search_catalogued_segments, search_catalogued_segments_indexed, segment_deletes_object_key,
-    segment_index_object_key, vector_object_keys,
+    SegmentDeletesRef, SegmentIndexRef, VectorSegmentEntry, drop_segment_index, drop_text_index,
+    dropped_vector_object_keys, load_segment_deletes, load_segment_index, publish_segment_deletes,
+    publish_segment_index, register_text_index, search_catalogued_segments, search_catalogued_segments_indexed,
+    segment_deletes_object_key, segment_index_object_key, vector_object_keys,
 };
 pub use constant::{
     DEFAULT_OVERSAMPLE, DEFAULT_TOKEN_CANDIDATES, EMBEDDING_COLUMN_ID, EVENT_ID_COLUMN, GRANULE_ROWS,
