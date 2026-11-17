@@ -1,7 +1,16 @@
 pub const GRANULE_ROWS: usize = 4096;
+/// Rows per sealed vector sub-block from `SEGMENT_VERSION` 3: a rescore or row read opens only these.
+pub const VECTOR_SUBBLOCK_ROWS: usize = 128;
 pub const BLOCK_ALIGNMENT: usize = 64;
 pub const SEGMENT_MAGIC: &[u8; 4] = b"OEFV";
-pub const SEGMENT_VERSION: u16 = 2;
+/// Version 4: U1 columns hold RaBitQ codes and I8 columns per-dimension segment-level int8 (see `codec`).
+pub const SEGMENT_VERSION: u16 = 4;
+/// Version 5: a version 4 segment whose rows are the token vectors of multivector documents; the footer ends
+/// with the document offsets (`u64` count, then `count + 1` first-row offsets). Written only for multivector input,
+/// so single-vector segments stay version 4.
+pub const SEGMENT_VERSION_MULTIVECTOR: u16 = 5;
+pub const SEGMENT_VERSION_SUBBLOCKS: u16 = 3;
+pub const SEGMENT_VERSION_GRANULE_VECTORS: u16 = 2;
 pub const SEGMENT_VERSION_SHARED_NONCE: u16 = 1;
 pub const BLOCK_NONCE_LEN: usize = 12;
 pub const NONCE_RANDOM_LEN: usize = BLOCK_NONCE_LEN - 8;
@@ -17,8 +26,33 @@ pub const I8_TRAILER_BYTES: usize = 8;
 pub const U1_TRAILER_BYTES: usize = 8;
 pub const NORMALIZATION_TOLERANCE: f32 = 1e-3;
 pub const DEFAULT_OVERSAMPLE: usize = 8;
+/// The rerank patience is at least this many times the rows reranked when the top k last improved (see
+/// `VectorSearch::oversample`).
+pub const RERANK_PATIENCE_GROWTH: usize = 2;
+/// A segment whose filtered rows number at most `SMALL_FILTER_EXACT_ROWS` and fall in at most
+/// `k × SMALL_FILTER_PARTS_PER_K` fine blocks is scored exactly on the fine representation, without a coarse pass,
+/// rerank or partition index. Rows scattered over many blocks keep the coarse pass, which reranks fewer blocks.
+pub const SMALL_FILTER_EXACT_ROWS: u64 = 4096;
+pub const SMALL_FILTER_PARTS_PER_K: usize = 4;
 pub const EMBEDDING_COLUMN_ID: u32 = crate::columns::column_ids::EMBEDDING_BASE;
 pub const EVENT_ID_COLUMN: &str = "event_id";
 pub const ROOM_ID_COLUMN: &str = "room_id";
 pub const SENDER_COLUMN: &str = "sender";
 pub const TIMESTAMP_COLUMN: &str = "timestamp";
+/// RaBitQ confidence multiplier ε₀ for the per-row error bound (the paper uses 1.9; 2.5 keeps upper-bound misses well under 1%).
+pub const RABITQ_EPSILON: f32 = 2.5;
+/// Sign-flip + Hadamard rounds in the RaBitQ rotation.
+pub const RABITQ_ROTATION_ROUNDS: usize = 3;
+pub(crate) const RABITQ_SEED_CONTEXT: &str = "oe 2026 vector rabitq rotation seed v1";
+/// Result cap for a range search with no `k` (`search_segments_in_range` with `limit: None`).
+pub const MAX_RANGE_RESULTS: usize = 100_000;
+/// Per-query-token coarse candidates gathered by a multivector search.
+pub const DEFAULT_TOKEN_CANDIDATES: usize = 256;
+/// Below this dimension `default_representations` picks I8 rather than U1 (RaBitQ) as the coarse code: the RaBitQ
+/// error bound shrinks only as `1/√d`, so tiny dimensions rerank many rows, while the per-dimension int8 bound is
+/// tight at any dimension and costs only `d + 8` bytes per row, which at small `d` is a few bytes more than U1.
+pub const RABITQ_MIN_DIMENSION: u32 = 64;
+/// MaxSim with a partition index scans the segment instead of probing once the probed token rows reach
+/// `MAXSIM_SCAN_FRACTION_NUM / MAXSIM_SCAN_FRACTION_DEN` of its live rows.
+pub const MAXSIM_SCAN_FRACTION_NUM: u64 = 1;
+pub const MAXSIM_SCAN_FRACTION_DEN: u64 = 2;

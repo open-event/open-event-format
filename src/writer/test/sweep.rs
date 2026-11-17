@@ -190,3 +190,98 @@ fn external_deletion_vector_objects_are_swept_without_a_sidecar_closure() {
     assert_eq!(report.deleted, vec![second_key.clone()]);
     assert!(objects.object(&first_key).is_none() && objects.object(&second_key).is_none());
 }
+
+/// Partition indexes that are dropped or replaced and segment deletes objects that are superseded (or whose
+/// segment leaves the catalogue) are noted and deleted like other dropped objects; live ones are kept.
+#[test]
+fn dropped_vector_indexes_and_superseded_segment_deletes_are_swept() {
+    use crate::vector::{
+        EmbeddingModel, PartitionIndex, PartitionParams, SegmentDeletes, SegmentInput, SegmentReader, SegmentSpec,
+        VectorMetric, WrappingKey, drop_segment_index, publish_segment_deletes, publish_segment_index, write_segment,
+    };
+    let model = EmbeddingModel {
+        dimension: 8,
+        digest: [3; 32],
+        id: "sweep-model".to_owned(),
+        metric: VectorMetric::Dot,
+    };
+    let input = SegmentInput {
+        event_ids: (0..40).map(|row| format!("$e{row}")).collect(),
+        vectors: (0..40u32)
+            .map(|row| (0..8u32).map(|dim| ((row * 7 + dim * 3) % 11) as f32 - 5.0).collect())
+            .collect(),
+        ..SegmentInput::default()
+    };
+    let key = WrappingKey::new([9; 32]);
+    let segment = SegmentReader::open(
+        write_segment(&SegmentSpec::new(model, "DEVICE", None), &input, &key).unwrap(),
+        &key,
+    )
+    .unwrap();
+    let index = |partitions| {
+        PartitionIndex::build(
+            &segment,
+            &PartitionParams {
+                partitions: Some(partitions),
+                ..PartitionParams::default()
+            },
+        )
+        .unwrap()
+    };
+    let objects = SimObjectStore::new();
+    let mut published = SimulatedPublishedSet::new();
+    let mut keys = Vec::new();
+    push(&mut published, |next| {
+        keys.push(
+            publish_segment_index(&objects, next, 9, &index(2), None)
+                .unwrap()
+                .object_key,
+        );
+        let deletes = SegmentDeletes::new().with_deleted([1]);
+        keys.push(publish_segment_deletes(&objects, next, 9, &deletes).unwrap().object_key);
+    });
+    let second = push(&mut published, |next| {
+        keys.push(
+            publish_segment_index(&objects, next, 9, &index(4), None)
+                .unwrap()
+                .object_key,
+        );
+        let deletes = SegmentDeletes::new().with_deleted([1]).with_deleted([2]);
+        keys.push(publish_segment_deletes(&objects, next, 9, &deletes).unwrap().object_key);
+    });
+    let third = push(&mut published, |next| {
+        drop_segment_index(next, 9).unwrap();
+    });
+    let fourth = push(&mut published, |next| next.vector_segments.clear());
+    assert_eq!(keys.len(), 4);
+    assert!(keys.iter().all(|key| objects.object(key).is_some()));
+    let [first_index, first_deletes, second_index, second_deletes] = [&keys[0], &keys[1], &keys[2], &keys[3]];
+    assert_ne!(first_index, second_index);
+    assert_ne!(first_deletes, second_deletes);
+
+    let clock = FixedClock::at(START_NANOS);
+    let policy = SweepPolicy {
+        in_flight_query_horizon_nanos: 0,
+        safety_window_nanos: 0,
+    };
+    let mut ledger = SimDroppedObjectLedger::default();
+    let mut deleted = |horizon| {
+        let mut report = sweep_dropped_objects(&published, &objects, &mut ledger, &policy, horizon, None, &clock)
+            .unwrap()
+            .deleted;
+        report.sort();
+        report
+    };
+    let mut expected = vec![first_index.clone(), first_deletes.clone()];
+    expected.sort();
+    assert_eq!(deleted(second), expected, "replaced index and superseded deletes");
+    assert!(objects.object(second_index).is_some() && objects.object(second_deletes).is_some());
+    assert_eq!(deleted(third), vec![second_index.clone()], "dropped index");
+    assert!(objects.object(second_deletes).is_some(), "still named");
+    assert_eq!(
+        deleted(fourth),
+        vec![second_deletes.clone()],
+        "segment left the catalogue"
+    );
+    assert!(keys.iter().all(|key| objects.object(key).is_none()));
+}

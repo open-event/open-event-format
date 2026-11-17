@@ -1,5 +1,8 @@
 use super::deletes::SegmentDeletes;
 use super::error::VectorError;
+use super::ivf::PartitionIndex;
+use super::model::EmbeddingModel;
+use super::seal::WrappingKey;
 use crate::lifecycle::ManifestGeneration;
 use crate::object_store::{ObjectStore, PutOutcome};
 
@@ -17,7 +20,169 @@ pub struct SegmentDeletesRef {
 pub struct VectorSegmentEntry {
     #[serde(default)]
     pub deletes: Option<SegmentDeletesRef>,
+    /// Optional, droppable partition index (IVF) for the segment; absent means search scans the segment.
+    #[serde(default)]
+    pub index: Option<SegmentIndexRef>,
     pub segment_id: u128,
+    /// Optional, droppable BM25 text index for the segment; absent means no text ranking for it.
+    #[serde(default)]
+    pub text_index: Option<crate::text::TextIndexRef>,
+}
+
+/// A published partition index, bound to the segment content it was built from.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SegmentIndexRef {
+    pub blake3: [u8; 32],
+    pub content_hash: [u8; 32],
+    pub model_digest: [u8; 32],
+    pub object_key: String,
+    pub partitions: u32,
+    pub sealed: bool,
+}
+
+const SEGMENT_INDEX_CONTEXT: &str = "oe 2026 vector partition index object v1";
+
+pub fn segment_index_object_key(segment_id: u128, digest: &[u8; 32]) -> String {
+    let hex: String = digest.iter().take(16).map(|byte| format!("{byte:02x}")).collect();
+    format!("vector-index/{segment_id:032x}/{hex}.ivf")
+}
+
+fn index_digest(bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(SEGMENT_INDEX_CONTEXT);
+    hasher.update(bytes);
+    *hasher.finalize().as_bytes()
+}
+
+/// Stores `index` (sealed with `key` when given) and records it on the segment's manifest entry, replacing any
+/// earlier index reference.
+pub fn publish_segment_index(
+    store: &dyn ObjectStore,
+    manifest: &mut ManifestGeneration,
+    segment_id: u128,
+    index: &PartitionIndex,
+    key: Option<&WrappingKey>,
+) -> Result<SegmentIndexRef, VectorError> {
+    let bytes = index.encode(key)?;
+    let blake3 = index_digest(&bytes);
+    let reference = SegmentIndexRef {
+        blake3,
+        content_hash: index.content_hash,
+        model_digest: model_digest(&index.model),
+        object_key: segment_index_object_key(segment_id, &blake3),
+        partitions: index.partitions.len() as u32,
+        sealed: key.is_some(),
+    };
+    match store
+        .put_if_absent(&reference.object_key, &bytes)
+        .map_err(unavailable)?
+    {
+        PutOutcome::Written { .. } => {}
+        PutOutcome::PreconditionFailed => {
+            let existing = store.get(&reference.object_key).map_err(unavailable)?;
+            if existing.is_none_or(|object| index_digest(&object.bytes) != reference.blake3) {
+                return Err(VectorError::InvalidInput {
+                    rule: format!(
+                        "a different partition index is already stored at {}",
+                        reference.object_key
+                    ),
+                });
+            }
+        }
+    }
+    manifest.register_vector_segment(segment_id);
+    if let Some(entry) = manifest
+        .vector_segments
+        .iter_mut()
+        .find(|entry| entry.segment_id == segment_id)
+    {
+        entry.index = Some(reference.clone());
+    }
+    Ok(reference)
+}
+
+/// Removes the segment's index reference; search falls back to scanning. The object is deleted by the object
+/// sweeper (`dropped_vector_object_keys`) once no live generation names it.
+/// Records a published BM25 text index for the segment, replacing any earlier one (the old object is left for
+/// the sweeper).
+pub fn register_text_index(manifest: &mut ManifestGeneration, reference: crate::text::TextIndexRef) {
+    let segment_id = reference.segment_id;
+    manifest.register_vector_segment(segment_id);
+    if let Some(entry) = manifest
+        .vector_segments
+        .iter_mut()
+        .find(|entry| entry.segment_id == segment_id)
+    {
+        entry.text_index = Some(reference);
+    }
+}
+
+/// Removes the segment's BM25 text index reference; the object stays until the sweeper deletes it.
+pub fn drop_text_index(manifest: &mut ManifestGeneration, segment_id: u128) -> Option<crate::text::TextIndexRef> {
+    manifest
+        .vector_segments
+        .iter_mut()
+        .find(|entry| entry.segment_id == segment_id)
+        .and_then(|entry| entry.text_index.take())
+}
+
+pub fn drop_segment_index(manifest: &mut ManifestGeneration, segment_id: u128) -> Option<SegmentIndexRef> {
+    manifest
+        .vector_segments
+        .iter_mut()
+        .find(|entry| entry.segment_id == segment_id)
+        .and_then(|entry| entry.index.take())
+}
+
+fn model_digest(model: &EmbeddingModel) -> [u8; 32] {
+    let mut out = crate::file::bytes::Writer::new();
+    model.encode_into(&mut out);
+    *blake3::hash(out.bytes()).as_bytes()
+}
+
+/// Loads the segment's published index, if any, and checks it against the reference and `segment`: object
+/// digest, segment content hash, model and row count. Any mismatch is an error.
+pub fn load_segment_index<S: super::segment::SegmentSource>(
+    store: &dyn ObjectStore,
+    manifest: &ManifestGeneration,
+    segment_id: u128,
+    segment: &super::segment::SegmentReader<S>,
+    key: Option<&WrappingKey>,
+) -> Result<Option<PartitionIndex>, VectorError> {
+    let Some(reference) = manifest
+        .vector_segment(segment_id)
+        .and_then(|entry| entry.index.as_ref())
+    else {
+        return Ok(None);
+    };
+    if reference.content_hash != segment.manifest().content_hash {
+        return Err(VectorError::Authentication {
+            what: "partition index reference names other segment content",
+        });
+    }
+    if reference.model_digest != model_digest(&segment.manifest().model) {
+        return Err(VectorError::ModelMismatch {
+            detail: "partition index was built for another embedding model".to_owned(),
+        });
+    }
+    let object = store
+        .get(&reference.object_key)
+        .map_err(unavailable)?
+        .ok_or_else(|| VectorError::Unavailable {
+            detail: format!("partition index object {} is missing", reference.object_key),
+        })?;
+    if index_digest(&object.bytes) != reference.blake3 {
+        return Err(VectorError::Authentication {
+            what: "partition index BLAKE3 mismatch",
+        });
+    }
+    let index = PartitionIndex::decode(&object.bytes, key)?;
+    index.check(segment)?;
+    if index.partitions.len() as u32 != reference.partitions {
+        return Err(VectorError::Authentication {
+            what: "partition index disagrees with its manifest reference",
+        });
+    }
+    Ok(Some(index))
 }
 
 pub fn segment_deletes_object_key(segment_id: u128, generation: u64) -> String {
@@ -45,7 +210,9 @@ impl ManifestGeneration {
         if self.vector_segment(segment_id).is_none() {
             self.vector_segments.push(VectorSegmentEntry {
                 deletes: None,
+                index: None,
                 segment_id,
+                text_index: None,
             });
         }
     }
@@ -153,6 +320,73 @@ pub fn search_catalogued_segments<S: super::segment::SegmentSource>(
         .collect::<Result<Vec<_>, _>>()?;
     let refs: Vec<Option<&SegmentDeletes>> = deletes.iter().map(Some).collect();
     super::search::search_segments_with_deletes(segments, &refs, search)
+}
+
+/// `search_catalogued_segments` using each segment's published partition index where one loads and checks out.
+/// An index that is missing, tampered with or bound to other content is ignored (counted in
+/// `SearchStats::indexes_rejected`) and that segment is scanned, so the answer never depends on the index.
+pub fn search_catalogued_segments_indexed<S: super::segment::SegmentSource>(
+    store: &dyn ObjectStore,
+    manifest: &ManifestGeneration,
+    segments: &[super::segment::SegmentReader<S>],
+    segment_ids: &[u128],
+    search: &super::search::VectorSearch<'_>,
+    key: Option<&WrappingKey>,
+    options: super::search::SearchOptions,
+) -> Result<(Vec<super::search::SearchHit>, super::search::SearchStats), VectorError> {
+    if segments.len() != segment_ids.len() {
+        return Err(VectorError::Unavailable {
+            detail: "each searched segment needs exactly one catalogue id".to_owned(),
+        });
+    }
+    let deletes = segment_ids
+        .iter()
+        .map(|&id| load_segment_deletes(store, manifest, id))
+        .collect::<Result<Vec<_>, _>>()?;
+    let refs: Vec<Option<&SegmentDeletes>> = deletes.iter().map(Some).collect();
+    let mut rejected = 0;
+    let indexes: Vec<Option<PartitionIndex>> = segments
+        .iter()
+        .zip(segment_ids)
+        .map(|(segment, &id)| {
+            load_segment_index(store, manifest, id, segment, key).unwrap_or_else(|_| {
+                rejected += 1;
+                None
+            })
+        })
+        .collect();
+    let index_refs: Vec<Option<&PartitionIndex>> = indexes.iter().map(Option::as_ref).collect();
+    let (hits, mut stats) = super::search::search_segments_indexed(segments, &refs, &index_refs, search, options)?;
+    stats.indexes_rejected += rejected;
+    Ok((hits, stats))
+}
+
+/// Every vector object a generation names: each segment's partition index and deletes objects.
+pub fn vector_object_keys(generation: &ManifestGeneration) -> Vec<String> {
+    generation
+        .vector_segments
+        .iter()
+        .flat_map(|entry| {
+            entry
+                .index
+                .as_ref()
+                .map(|index| index.object_key.clone())
+                .into_iter()
+                .chain(entry.deletes.as_ref().map(|deletes| deletes.object_key.clone()))
+                .chain(entry.text_index.as_ref().map(|text| text.object_key.clone()))
+        })
+        .collect()
+}
+
+/// Vector objects `previous` names and `next` does not: dropped or replaced partition indexes, superseded segment
+/// deletes, and both for segments removed from the catalogue. The object sweeper notes them and deletes them once
+/// the safety window has passed and no live generation names them.
+pub fn dropped_vector_object_keys(previous: &ManifestGeneration, next: &ManifestGeneration) -> Vec<String> {
+    let kept: std::collections::HashSet<String> = vector_object_keys(next).into_iter().collect();
+    vector_object_keys(previous)
+        .into_iter()
+        .filter(|key| !kept.contains(key))
+        .collect()
 }
 
 #[cfg(test)]

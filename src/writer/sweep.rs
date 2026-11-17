@@ -94,6 +94,7 @@ pub fn sweep_dropped_objects(
             let next = published.generation(from + 1).map_err(PublishFailure::Publish)?;
             let mut dropped = retired_artifact_keys(&previous, &next);
             dropped.extend(dropped_deletion_vector_object_keys(&previous, &next));
+            dropped.extend(crate::vector::dropped_vector_object_keys(&previous, &next));
             if let Some(mirror) = &previous.footer_mirror
                 && next.footer_mirror.as_ref().is_none_or(|kept| kept.path != mirror.path)
             {
@@ -134,6 +135,7 @@ pub fn sweep_dropped_objects(
         let generation = published.generation(generation).map_err(PublishFailure::Publish)?;
         named_objects(&generation, &mut still_named);
         still_named.extend(deletion_vector_object_keys(&generation));
+        still_named.extend(crate::vector::vector_object_keys(&generation));
         if let Some(sidecars) = sidecars {
             for entry in &generation.files {
                 still_named.extend(sidecars(entry));

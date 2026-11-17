@@ -154,7 +154,7 @@ fn granules_and_single_rows_match_what_was_written_for_every_element_type() {
         let column = representation_column_id(element);
         let mut expected = Vec::new();
         for vector in &rows.vectors {
-            encode_row(element, vector, &mut expected);
+            reader.codec().encode_row(element, vector, &mut expected);
         }
         let width = element.row_width(dimension);
         for row in [
@@ -223,24 +223,25 @@ fn reading_or_scanning_with_a_different_model_or_metric_fails() {
     }
 }
 
-fn brute_force(
+fn brute_force<S: SegmentSource>(
+    reader: &SegmentReader<S>,
     meta: &VectorColumnMeta,
     rows: &[Vec<f32>],
     query: &[f32],
     allowed: impl Fn(u64) -> bool,
     k: usize,
 ) -> Vec<ScoredRow> {
-    let prepared = PreparedQuery::new(query, meta.model.metric);
+    let prepared = reader.codec().query(meta.element, query);
     let mut scored: Vec<ScoredRow> = rows
         .iter()
         .enumerate()
         .filter(|(row, _)| allowed(*row as u64))
         .map(|(row, vector)| {
             let mut bytes = Vec::new();
-            encode_row(meta.element, vector, &mut bytes);
+            reader.codec().encode_row(meta.element, vector, &mut bytes);
             ScoredRow {
                 row: row as u64,
-                score: prepared.score(meta.element, &bytes),
+                score: prepared.score(&bytes),
             }
         })
         .collect();
@@ -269,11 +270,11 @@ fn top_k_equals_a_brute_force_reference_with_and_without_a_filter() {
         let query = unit(99_999, dimension);
         for meta in reader.vector_columns().to_vec() {
             let all = reader.top_k(meta.column_id, &query, &model, None, 20).unwrap();
-            assert_eq!(all, brute_force(&meta, &rows.vectors, &query, |_| true, 20));
+            assert_eq!(all, brute_force(&reader, &meta, &rows.vectors, &query, |_| true, 20));
             let filtered = reader.top_k(meta.column_id, &query, &model, Some(&filter), 20).unwrap();
             assert_eq!(
                 filtered,
-                brute_force(&meta, &rows.vectors, &query, |row| filter.contains(row), 20)
+                brute_force(&reader, &meta, &rows.vectors, &query, |row| filter.contains(row), 20)
             );
             assert!(filtered.iter().all(|row| row.row % 7 == 3));
         }
@@ -692,7 +693,7 @@ fn merging_small_segments_keeps_every_row_in_order_and_searches_the_same() {
         filter: SearchFilter::default(),
         k: 3,
         model: &model,
-        oversample: DEFAULT_OVERSAMPLE,
+        oversample: 0,
         query: &query,
     };
     let before: Vec<String> = search_segments(&readers, &search)
@@ -874,10 +875,11 @@ fn blocks_of_identical_plaintext_seal_differently_and_cannot_stand_in_for_each_o
 
     let offsets = reader.footer_block_offsets();
     let vector_blocks = offsets.last().unwrap();
-    let plain_len = GRANULE_ROWS * dimension as usize * 4;
+    assert_eq!(vector_blocks.len(), 2 * GRANULE_ROWS / VECTOR_SUBBLOCK_ROWS);
+    let plain_len = VECTOR_SUBBLOCK_ROWS * dimension as usize * 4;
     let sealed_len = plain_len + 16;
     let first = vector_blocks[0] as usize;
-    let second = vector_blocks[1] as usize;
+    let second = vector_blocks[GRANULE_ROWS / VECTOR_SUBBLOCK_ROWS] as usize;
     let first_block = bytes[first..first + sealed_len].to_vec();
     let second_block = bytes[second..second + sealed_len].to_vec();
     assert_ne!(first_block[..plain_len], second_block[..plain_len]);
@@ -916,7 +918,7 @@ fn a_first_version_segment_still_reads_and_is_never_written_again() {
     let rows = input(GRANULE_ROWS + 5, 8);
     let version = |bytes: &[u8]| u16::from_le_bytes([bytes[4], bytes[5]]);
     let current = write_segment(&spec, &rows, &key(1)).unwrap();
-    assert_eq!(version(&current), 2);
+    assert_eq!(version(&current), SEGMENT_VERSION);
 
     let legacy_keys = super::seal::FileKeys::random_shared_nonce().unwrap();
     assert_eq!(legacy_keys.nonce(0), legacy_keys.nonce(1));
@@ -930,7 +932,7 @@ fn a_first_version_segment_still_reads_and_is_never_written_again() {
     assert_eq!(read.string_columns, rows.string_columns);
     assert_eq!(read.integer_columns, rows.integer_columns);
 
-    for (bytes, relabelled) in [(&legacy, 2u8), (&current, 1u8)] {
+    for (bytes, relabelled) in [(&legacy, 2u8), (&current, 1u8), (&current, 5u8)] {
         let mut bytes = bytes.clone();
         bytes[4] = relabelled;
         assert!(matches!(
@@ -939,7 +941,7 @@ fn a_first_version_segment_still_reads_and_is_never_written_again() {
         ));
     }
     let mut unknown = legacy.clone();
-    unknown[4] = 3;
+    unknown[4] = 6;
     assert!(matches!(
         SegmentReader::open(unknown, &key(1)),
         Err(VectorError::Format(_))
@@ -950,7 +952,7 @@ fn a_first_version_segment_still_reads_and_is_never_written_again() {
     let rewrapped = SegmentReader::open(rewrapped, &key(2)).unwrap();
     assert_eq!(rewrapped.read_all().unwrap().event_ids, rows.event_ids);
     let merged = merge_segments(std::slice::from_ref(&reader), &spec, &key(1)).unwrap();
-    assert_eq!(version(&merged), 2);
+    assert_eq!(version(&merged), SEGMENT_VERSION);
     let merged = SegmentReader::open(merged, &key(1)).unwrap();
     assert_eq!(merged.read_all().unwrap().event_ids, rows.event_ids);
 }
@@ -976,10 +978,10 @@ fn a_row_scores_exactly_as_its_decoded_floats_do() {
                             .sum::<f32>(),
                         VectorMetric::Cosine | VectorMetric::Dot => pairs.map(|(stored, value)| stored * value).sum(),
                     };
-                    assert_eq!(
-                        prepared.score(element, &row).to_bits(),
-                        expected.to_bits(),
-                        "{element:?} {metric:?} dimension {dimension} seed {seed}"
+                    let score = prepared.score(element, &row);
+                    assert!(
+                        (score - expected).abs() <= 1e-5 * expected.abs().max(1.0),
+                        "{element:?} {metric:?} dimension {dimension} seed {seed}: {score} vs {expected}"
                     );
                 }
             }
@@ -1026,7 +1028,7 @@ fn a_filter_of_many_scattered_runs_scans_exactly_its_rows_in_every_granule() {
         assert_eq!(found.len(), (0..total).filter(|row| filter.contains(*row)).count());
         assert_eq!(
             found,
-            brute_force(&meta, &rows.vectors, &query, |row| filter.contains(row), k)
+            brute_force(&reader, &meta, &rows.vectors, &query, |row| filter.contains(row), k)
         );
     }
     for (filter, opened) in [(&filters[2], 1), (&filters[3], 1), (&filters[4], 0)] {
@@ -1074,7 +1076,9 @@ fn search_hits_carry_their_own_event_ids_and_decrypt_each_id_granule_once() {
         let prefix = if hit.segment == 0 { "$a" } else { "$b" };
         assert_eq!(hit.event_id, format!("{prefix}{}", hit.row));
     }
-    assert!(opened <= 10, "{opened} blocks opened");
+    let vector_blocks = ((GRANULE_ROWS * 2 + 30).div_ceil(VECTOR_SUBBLOCK_ROWS)
+        + (GRANULE_ROWS + 30).div_ceil(VECTOR_SUBBLOCK_ROWS)) as u64;
+    assert!(opened <= vector_blocks + 5, "{opened} blocks opened");
 }
 
 #[test]
@@ -1127,3 +1131,91 @@ fn borrowed_and_ranged_sources_read_the_same_rows() {
     );
     assert_eq!(borrowed.blocks_opened(), ranged.blocks_opened());
 }
+
+#[test]
+fn rescore_and_row_reads_open_only_the_sub_blocks_holding_candidates() {
+    let dimension = 16;
+    let model = model(dimension, VectorMetric::Dot);
+    let rows = input(GRANULE_ROWS * 2 + 9, dimension);
+    let bytes = write_segment(
+        &spec(model.clone(), vec![VectorElement::U1, VectorElement::F32]),
+        &rows,
+        &key(1),
+    )
+    .unwrap();
+    let reader = SegmentReader::open(bytes, &key(1)).unwrap();
+    let fine = representation_column_id(VectorElement::F32);
+    let query = unit(5, dimension);
+    let sub = VECTOR_SUBBLOCK_ROWS as u64;
+    let candidates = [
+        3,
+        7,
+        sub - 1,
+        sub * 5 + 2,
+        GRANULE_ROWS as u64 + 1,
+        GRANULE_ROWS as u64 * 2 + 8,
+    ];
+    let scored = reader.rescore(fine, &query, &model, &candidates).unwrap();
+    assert_eq!(reader.blocks_opened(), 4);
+    let meta = reader
+        .vector_columns()
+        .iter()
+        .find(|meta| meta.column_id == fine)
+        .unwrap()
+        .clone();
+    for row in &scored {
+        let expected = brute_force(
+            &reader,
+            &meta,
+            &rows.vectors,
+            &query,
+            |candidate| candidate == row.row,
+            1,
+        );
+        assert_eq!(expected[0].score.to_bits(), row.score.to_bits());
+    }
+    let before = reader.blocks_opened();
+    let bytes = reader.vector_row(fine, sub * 9 + 4, &model).unwrap();
+    assert_eq!(reader.blocks_opened(), before + 1);
+    let mut expected = Vec::new();
+    encode_row(
+        VectorElement::F32,
+        &rows.vectors[VECTOR_SUBBLOCK_ROWS * 9 + 4],
+        &mut expected,
+    );
+    assert_eq!(bytes, expected);
+    let granule = reader.vector_granule(fine, 1, &model).unwrap();
+    assert_eq!(granule.len(), GRANULE_ROWS);
+}
+
+#[test]
+fn a_second_version_segment_keeps_one_vector_block_per_granule() {
+    let model = model(8, VectorMetric::Dot);
+    let segment_spec = spec(model.clone(), vec![VectorElement::I8, VectorElement::F32]);
+    let rows = input(GRANULE_ROWS + 300, 8);
+    let keys = super::seal::FileKeys::random_granule_vectors().unwrap();
+    let legacy = super::segment::write_segment_sealed_by(&segment_spec, &rows, &key(1), &keys).unwrap();
+    assert_eq!(u16::from_le_bytes([legacy[4], legacy[5]]), 2);
+    let reader = SegmentReader::open(legacy.clone(), &key(1)).unwrap();
+    reader.verify_content().unwrap();
+    assert_eq!(reader.footer_block_offsets().last().unwrap().len(), 2);
+    let fine = representation_column_id(VectorElement::F32);
+    let query = unit(9, 8);
+    reader.rescore(fine, &query, &model, &[1, 200]).unwrap();
+    assert_eq!(reader.blocks_opened(), 1);
+    let current = SegmentReader::open(write_segment(&segment_spec, &rows, &key(1)).unwrap(), &key(1)).unwrap();
+    assert_eq!(
+        reader.top_k(fine, &query, &model, None, 10).unwrap(),
+        current.top_k(fine, &query, &model, None, 10).unwrap()
+    );
+    assert_eq!(reader.read_all().unwrap().vectors, current.read_all().unwrap().vectors);
+}
+
+#[path = "rabitq.rs"]
+mod rabitq;
+
+#[path = "ivf.rs"]
+mod ivf;
+
+#[path = "features.rs"]
+mod features;

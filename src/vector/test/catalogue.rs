@@ -68,3 +68,30 @@ fn a_stored_generation_delta_carries_the_vector_segment_catalogue() {
     let delta = crate::object_store::model::GenerationDelta::between(&checkpoint, &next);
     assert_eq!(delta.apply(checkpoint), next);
 }
+
+#[test]
+fn a_registered_text_index_is_catalogued_swept_when_dropped_and_old_entries_deserialize() {
+    let reference = crate::text::TextIndexRef {
+        blake3: [7; 32],
+        content_hash: [9; 32],
+        doc_count: 3,
+        object_key: crate::text::text_index_object_key(0xC, &[7; 32]),
+        sealed: false,
+        segment_id: 0xC,
+    };
+    let mut manifest = ManifestGeneration::default();
+    register_text_index(&mut manifest, reference.clone());
+    let before = manifest.clone();
+    assert_eq!(
+        manifest.vector_segment(0xC).and_then(|entry| entry.text_index.clone()),
+        Some(reference.clone())
+    );
+    assert!(vector_object_keys(&manifest).contains(&reference.object_key));
+    assert_eq!(drop_text_index(&mut manifest, 0xC), Some(reference.clone()));
+    assert_eq!(
+        dropped_vector_object_keys(&before, &manifest),
+        vec![reference.object_key]
+    );
+    let old: VectorSegmentEntry = serde_json::from_str(r#"{"segment_id":12}"#).expect("old entry");
+    assert!(old.text_index.is_none());
+}

@@ -1512,7 +1512,9 @@ fn a_publication_carries_the_heads_index_artifacts_and_vector_segments_into_the_
     };
     let segment = crate::vector::VectorSegmentEntry {
         deletes: None,
+        index: None,
         segment_id: 0xB,
+        text_index: None,
     };
     let mut published = SimulatedPublishedSet::new();
     published

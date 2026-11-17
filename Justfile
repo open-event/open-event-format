@@ -39,6 +39,9 @@ bench-micro bench="" *filter:
 bench-compare *args="--sizes 10000,100000,1000000 --reps 5 --write-reps 3":
     cd benchmark && cargo run --release --target-dir {{ target }} --bin oe-benchmark -- --out results {{ args }}
 
+bench-vector *args="--sizes 10000,100000 --dims 128,768 --queries 100":
+    cd benchmark && cargo run --release --target-dir {{ target }} --bin oe-vector-bench -- --out results {{ args }}
+
 bench-ops dir=(target / "bench-ops") *args="":
     cd benchmark && cargo run --release --target-dir {{ target }} --bin oe-vs-parquet -- {{ dir }} {{ args }}
 

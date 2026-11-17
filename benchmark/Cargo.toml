@@ -20,6 +20,11 @@ path = "compare/main.rs"
 bench = false
 
 [[bin]]
+name = "oe-vector-bench"
+path = "vector/main.rs"
+bench = false
+
+[[bin]]
 name = "oe-vs-parquet"
 path = "operations/main.rs"
 bench = false
@@ -60,6 +65,11 @@ harness = false
 [[bench]]
 name = "vector"
 path = "micro/vector.rs"
+harness = false
+
+[[bench]]
+name = "bm25"
+path = "micro/bm25.rs"
 harness = false
 
 [lints.rust]
