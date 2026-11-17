@@ -97,7 +97,8 @@ pub fn publish_segment_index(
     Ok(reference)
 }
 
-/// Removes the segment's index reference; search falls back to scanning. The object itself is left for GC.
+/// Removes the segment's index reference; search falls back to scanning. The object is deleted by the object
+/// sweeper (`dropped_vector_object_keys`) once no live generation names it.
 pub fn drop_segment_index(manifest: &mut ManifestGeneration, segment_id: u128) -> Option<SegmentIndexRef> {
     manifest
         .vector_segments
@@ -331,6 +332,33 @@ pub fn search_catalogued_segments_indexed<S: super::segment::SegmentSource>(
     let (hits, mut stats) = super::search::search_segments_indexed(segments, &refs, &index_refs, search, options)?;
     stats.indexes_rejected += rejected;
     Ok((hits, stats))
+}
+
+/// Every vector object a generation names: each segment's partition index and deletes objects.
+pub fn vector_object_keys(generation: &ManifestGeneration) -> Vec<String> {
+    generation
+        .vector_segments
+        .iter()
+        .flat_map(|entry| {
+            entry
+                .index
+                .as_ref()
+                .map(|index| index.object_key.clone())
+                .into_iter()
+                .chain(entry.deletes.as_ref().map(|deletes| deletes.object_key.clone()))
+        })
+        .collect()
+}
+
+/// Vector objects `previous` names and `next` does not: dropped or replaced partition indexes, superseded segment
+/// deletes, and both for segments removed from the catalogue. The object sweeper notes them and deletes them once
+/// the safety window has passed and no live generation names them.
+pub fn dropped_vector_object_keys(previous: &ManifestGeneration, next: &ManifestGeneration) -> Vec<String> {
+    let kept: std::collections::HashSet<String> = vector_object_keys(next).into_iter().collect();
+    vector_object_keys(previous)
+        .into_iter()
+        .filter(|key| !kept.contains(key))
+        .collect()
 }
 
 #[cfg(test)]
