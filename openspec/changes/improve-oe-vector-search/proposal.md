@@ -67,6 +67,16 @@ vectorise.
   `SearchHit`s + a ranked text id list), `RrfParams { k = 60, weights, limit }`. OE's text-token index is a pruning
   filter, not a ranked text search, so the text list comes from the caller. Only the first occurrence in a list
   counts; ties break by best rank, then list order, then event id.
+- BM25 full-text ranking (`oe::text`): a per-segment inverted index artifact (`Bm25Index`, magic `OEBM` v1) over
+  event payload text, tokenised exactly like the text-token pruning index. Sorted front-coded term dictionary,
+  postings in 128-doc blocks (delta + bitpacked doc ids, bitpacked tf, per-block max tf / min doc length), doc
+  lengths, corpus stats; deterministic bytes, keyed BLAKE3 trailer, header binding segment id + content hash, and
+  optional XChaCha20-Poly1305 sealing under a key derived from the wrapping key (deterministic SIV-style nonce).
+  Published content-addressed with `put_if_absent` (`publish_text_index` / `load_text_index`, `TextIndexRef`);
+  droppable like the partition index. `search_bm25` scores BM25 (k1 1.2, b 0.75 configurable) with block-max
+  WAND, honours segment deletion vectors and sums N, total length and document frequencies over all searched
+  segments so scores are comparable (deleted docs still count in stats, as in Lucene). `hybrid_search` feeds
+  vector hits and BM25 hits into `hybrid_rrf`.
 
 ## Impact
 

@@ -67,6 +67,11 @@ name = "vector"
 path = "micro/vector.rs"
 harness = false
 
+[[bench]]
+name = "bm25"
+path = "micro/bm25.rs"
+harness = false
+
 [lints.rust]
 unsafe_code = "deny"
 
