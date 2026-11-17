@@ -11,7 +11,7 @@ queries), p50 and p99 latency in milliseconds, sealed blocks opened and rows rer
 bytes per vector, and segment and index build time, as JSON and a Markdown table under the benchmark results.
 
 An acceptance test run by `cargo test --release` in the benchmark crate, on sizes small enough to finish in about a
-minute, SHALL fail when default settings (`SegmentSpec::new`, `DEFAULT_OVERSAMPLE`, `SearchOptions::default`) give
+minute (including 100,000 × 128 rows, where topics hold hundreds of rows), SHALL fail when default settings (`SegmentSpec::new`, `DEFAULT_OVERSAMPLE`, `SearchOptions::default`) give
 recall@10 below 0.95 on any of these workloads, or when on clustered data (cluster-ordered rows, or time-ordered rows
 after a clustered merge) the indexed search does not open fewer blocks per query than a scan of the same data.
 

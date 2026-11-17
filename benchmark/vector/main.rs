@@ -135,11 +135,8 @@ mod gate {
         check(5_000, 768);
     }
 
-    /// The same gate at 100,000 rows (topics of ~630 rows). Ignored: with `DEFAULT_OVERSAMPLE` (8) the rerank
-    /// patience stops after 80 rows that miss the top 10 and recall@10 is 0.87–0.90 on top-10 queries; patience 32
-    /// or 0 gives 1.000 at about the same latency. Run with `cargo test --release -- --ignored`.
+    /// The same gate at 100,000 rows (topics of ~630 rows, where a fixed rerank patience used to stop early).
     #[test]
-    #[ignore = "defaults give recall@10 below 0.95 at 100k rows (rerank patience), see benchmark README"]
     fn vector_recall_and_blocks_d128_100k() {
         check(100_000, 128);
     }

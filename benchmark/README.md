@@ -68,7 +68,7 @@ force. Run it with `just bench-vector` or:
 cargo run --release --bin oe-vector-bench -- --sizes 10000,100000 --dims 128,768 --queries 100 --out results
 ```
 
-`--large yes` adds 1,000,000 rows; `--oversample N` changes the rerank patience. Results: `results/vector.md` (every
+`--large yes` adds 1,000,000 rows; `--oversample N` changes the rerank patience (minimum run, `k × N`). Results: `results/vector.md` (every
 dataset, configuration and workload) and `results/vector.json`.
 
 - **Data (seeded, deterministic):** unit vectors around ⌈√rows / 2⌉ random topic centres (cosine), 10,000 and
@@ -84,91 +84,99 @@ dataset, configuration and workload) and `results/vector.json`.
 - **Reported:** recall@10, p50/p99 per-query latency (one thread, segment in memory, every opened block decrypted),
   blocks opened and rows reranked per query, segment bytes per vector (+ partition index), and build time (segment
   write, plus clustered merge where used, + index build).
-- **Acceptance gate:** `cargo test --release` (about 15 s) runs 10,000 × 128 and 5,000 × 768 in both orders and a small
-  MaxSim set, and fails if any default-settings recall@10 is below 0.95 or if, on cluster-ordered data or after a
-  clustered merge, the indexed search does not open fewer blocks than a scan (top-10 and range).
+- **Acceptance gate:** `cargo test --release` (about 15 s) runs 10,000 × 128, 100,000 × 128 and 5,000 × 768 in both
+  orders and a small MaxSim set, and fails if any default-settings recall@10 is below 0.95 or if, on cluster-ordered
+  data or after a clustered merge, the indexed search does not open fewer blocks than a scan (top-10 and range).
 
 Top-10 and MaxSim (single thread; full table in `results/vector.md`):
 
 | Dataset | Configuration | Recall@10 | p50 ms | p99 ms | Blocks opened | Rows reranked | Bytes/vector (+ index) | Build ms (segment + index) |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
-| 10000 × 128 time-ordered | exact (f32 brute force) | 1.000 | 0.697 | 1.326 | – | – | 512 | – |
-| 10000 × 128 time-ordered | scan | 0.994 | 2.470 | 2.868 | 152.4 | 186 | 567 | 64 + 0 |
-| 10000 × 128 time-ordered | indexed (IVF) | 0.994 | 2.435 | 4.551 | 152.3 | 186 | 567 + 6 | 64 + 735 |
-| 10000 × 128 time-ordered | clustered merge + scan | 0.994 | 0.478 | 0.637 | 51.0 | 199 | 568 | 859 + 0 |
-| 10000 × 128 time-ordered | clustered merge + indexed | 0.994 | 0.347 | 0.432 | 15.0 | 188 | 568 + 6 | 859 + 728 |
-| 10000 × 128 cluster-ordered | exact (f32 brute force) | 1.000 | 0.708 | 1.081 | – | – | 512 | – |
-| 10000 × 128 cluster-ordered | scan | 0.996 | 0.489 | 0.721 | 53.1 | 195 | 567 | 30 + 0 |
-| 10000 × 128 cluster-ordered | indexed (IVF) | 0.996 | 0.341 | 0.521 | 14.3 | 188 | 567 + 6 | 30 + 716 |
-| 10000 × 768 time-ordered | exact (f32 brute force) | 1.000 | 5.066 | 6.301 | – | – | 3072 | – |
-| 10000 × 768 time-ordered | scan | 0.992 | 12.593 | 14.389 | 152.6 | 183 | 3228 | 171 + 0 |
-| 10000 × 768 time-ordered | indexed (IVF) | 0.992 | 12.011 | 13.601 | 152.5 | 183 | 3228 + 24 | 171 + 5686 |
-| 10000 × 768 time-ordered | clustered merge + scan | 0.992 | 1.250 | 1.446 | 51.0 | 199 | 3228 | 6075 + 0 |
-| 10000 × 768 time-ordered | clustered merge + indexed | 0.992 | 0.888 | 1.050 | 13.5 | 189 | 3228 + 29 | 6075 + 5597 |
-| 10000 × 768 cluster-ordered | exact (f32 brute force) | 1.000 | 4.938 | 6.209 | – | – | 3072 | – |
-| 10000 × 768 cluster-ordered | scan | 0.994 | 1.301 | 1.511 | 51.8 | 203 | 3228 | 178 + 0 |
-| 10000 × 768 cluster-ordered | indexed (IVF) | 0.994 | 0.871 | 1.141 | 13.9 | 188 | 3228 + 28 | 178 + 5774 |
-| multivector 1000 docs / 8185 tokens × 128 | exact (f32 MaxSim) | 1.000 | 2.053 | 2.233 | – | – | 512 | – |
-| multivector 1000 docs / 8185 tokens × 128 | scan | 1.000 | 3.791 | 5.441 | 123.9 | 3996 | 551 | 26 + 0 |
-| multivector 1000 docs / 8185 tokens × 128 | indexed (IVF) | 1.000 | 4.604 | 14.657 | 223.0 | 4492 | 551 + 7 | 26 + 525 |
-| 100000 × 128 time-ordered | exact (f32 brute force) | 1.000 | 7.669 | 10.348 | – | – | 512 | – |
-| 100000 × 128 time-ordered | scan | 0.876 | 11.377 | 14.824 | 1026.2 | 283 | 568 | 331 + 0 |
-| 100000 × 128 time-ordered | indexed (IVF) | 0.876 | 10.360 | 14.482 | 1004.0 | 283 | 568 + 3 | 331 + 22394 |
-| 100000 × 128 time-ordered | clustered merge + scan | 0.876 | 1.224 | 2.930 | 163.0 | 340 | 568 | 22902 + 0 |
-| 100000 × 128 time-ordered | clustered merge + indexed | 0.876 | 0.649 | 1.170 | 25.9 | 307 | 568 + 3 | 22902 + 22707 |
-| 100000 × 128 cluster-ordered | exact (f32 brute force) | 1.000 | 7.383 | 10.391 | – | – | 512 | – |
-| 100000 × 128 cluster-ordered | scan | 0.865 | 1.418 | 2.175 | 169.4 | 329 | 568 | 351 + 0 |
-| 100000 × 128 cluster-ordered | indexed (IVF) | 0.865 | 0.806 | 1.271 | 28.9 | 296 | 568 + 3 | 351 + 22685 |
-| 100000 × 768 time-ordered | exact (f32 brute force) | 1.000 | 64.862 | 77.208 | – | – | 3072 | – |
-| 100000 × 768 time-ordered | scan | 0.885 | 55.391 | 84.488 | 1022.9 | 277 | 3228 | 1782 + 0 |
-| 100000 × 768 time-ordered | indexed (IVF) | 0.885 | 51.760 | 72.465 | 1007.2 | 277 | 3228 + 10 | 1782 + 182711 |
-| 100000 × 768 time-ordered | clustered merge + scan | 0.885 | 3.789 | 4.851 | 163.0 | 334 | 3228 | 186580 + 0 |
-| 100000 × 768 time-ordered | clustered merge + indexed | 0.885 | 1.989 | 2.778 | 22.5 | 316 | 3228 + 9 | 186580 + 180338 |
-| 100000 × 768 cluster-ordered | exact (f32 brute force) | 1.000 | 66.185 | 79.858 | – | – | 3072 | – |
-| 100000 × 768 cluster-ordered | scan | 0.897 | 3.991 | 6.046 | 164.8 | 327 | 3228 | 1755 + 0 |
-| 100000 × 768 cluster-ordered | indexed (IVF) | 0.897 | 2.219 | 3.100 | 21.8 | 310 | 3228 + 9 | 1755 + 182007 |
-| multivector 2000 docs / 16158 tokens × 128 | exact (f32 MaxSim) | 1.000 | 4.049 | 4.864 | – | – | 512 | – |
-| multivector 2000 docs / 16158 tokens × 128 | scan | 1.000 | 8.440 | 9.953 | 264.0 | 16158 | 552 | 53 + 0 |
-| multivector 2000 docs / 16158 tokens × 128 | indexed (IVF) | 1.000 | 13.894 | 19.178 | 644.9 | 17528 | 552 + 5 | 53 + 1523 |
+| 10000 × 128 time-ordered | exact (f32 brute force) | 1.000 | 0.721 | 0.939 | – | – | 512 | – |
+| 10000 × 128 time-ordered | scan | 1.000 | 2.741 | 3.666 | 153.5 | 197 | 567 | 63 + 0 |
+| 10000 × 128 time-ordered | indexed (IVF) | 1.000 | 2.675 | 4.127 | 153.3 | 197 | 567 + 6 | 63 + 47 |
+| 10000 × 128 time-ordered | clustered merge + scan | 1.000 | 0.526 | 0.610 | 50.3 | 206 | 568 | 165 + 0 |
+| 10000 × 128 time-ordered | clustered merge + indexed | 1.000 | 0.399 | 0.482 | 13.3 | 198 | 568 + 6 | 165 + 41 |
+| 10000 × 128 cluster-ordered | exact (f32 brute force) | 1.000 | 0.691 | 0.913 | – | – | 512 | – |
+| 10000 × 128 cluster-ordered | scan | 1.000 | 0.556 | 0.792 | 53.1 | 204 | 567 | 30 + 0 |
+| 10000 × 128 cluster-ordered | indexed (IVF) | 1.000 | 0.406 | 0.648 | 14.4 | 199 | 567 + 6 | 30 + 54 |
+| 10000 × 768 time-ordered | exact (f32 brute force) | 1.000 | 5.092 | 11.115 | – | – | 3072 | – |
+| 10000 × 768 time-ordered | scan | 0.999 | 13.743 | 16.788 | 154.3 | 199 | 3228 | 176 + 0 |
+| 10000 × 768 time-ordered | indexed (IVF) | 0.999 | 12.224 | 16.185 | 154.1 | 199 | 3228 + 24 | 176 + 244 |
+| 10000 × 768 time-ordered | clustered merge + scan | 0.999 | 1.319 | 1.548 | 50.8 | 209 | 3228 | 571 + 0 |
+| 10000 × 768 time-ordered | clustered merge + indexed | 0.999 | 0.887 | 1.056 | 12.6 | 202 | 3228 + 29 | 571 + 254 |
+| 10000 × 768 cluster-ordered | exact (f32 brute force) | 1.000 | 5.060 | 6.371 | – | – | 3072 | – |
+| 10000 × 768 cluster-ordered | scan | 0.999 | 1.327 | 1.552 | 51.8 | 212 | 3228 | 179 + 0 |
+| 10000 × 768 cluster-ordered | indexed (IVF) | 0.999 | 0.913 | 1.102 | 13.4 | 198 | 3228 + 29 | 179 + 223 |
+| multivector 1000 docs / 8185 tokens × 128 | exact (f32 MaxSim) | 1.000 | 2.032 | 4.447 | – | – | 512 | – |
+| multivector 1000 docs / 8185 tokens × 128 | scan | 1.000 | 5.456 | 9.359 | 123.9 | 3996 | 551 | 27 + 0 |
+| multivector 1000 docs / 8185 tokens × 128 | indexed (IVF) | 1.000 | 3.932 | 7.187 | 123.8 | 4244 | 551 + 7 | 27 + 41 |
+| 100000 × 128 time-ordered | exact (f32 brute force) | 1.000 | 7.279 | 10.267 | – | – | 512 | – |
+| 100000 × 128 time-ordered | scan | 0.996 | 17.341 | 25.144 | 1213.1 | 609 | 568 | 418 + 0 |
+| 100000 × 128 time-ordered | indexed (IVF) | 0.996 | 15.512 | 17.355 | 1187.0 | 609 | 568 + 3 | 418 + 498 |
+| 100000 × 128 time-ordered | clustered merge + scan | 0.996 | 1.183 | 1.487 | 156.7 | 631 | 568 | 1396 + 0 |
+| 100000 × 128 time-ordered | clustered merge + indexed | 0.996 | 0.688 | 0.968 | 25.1 | 611 | 568 + 3 | 1396 + 465 |
+| 100000 × 128 cluster-ordered | exact (f32 brute force) | 1.000 | 7.399 | 14.103 | – | – | 512 | – |
+| 100000 × 128 cluster-ordered | scan | 1.000 | 1.278 | 1.609 | 169.4 | 632 | 568 | 355 + 0 |
+| 100000 × 128 cluster-ordered | indexed (IVF) | 1.000 | 0.706 | 0.979 | 27.8 | 614 | 568 + 3 | 355 + 531 |
+| 100000 × 768 time-ordered | exact (f32 brute force) | 1.000 | 64.370 | 73.568 | – | – | 3072 | – |
+| 100000 × 768 time-ordered | scan | 0.997 | 119.124 | 130.926 | 1214.2 | 608 | 3228 | 1831 + 0 |
+| 100000 × 768 time-ordered | indexed (IVF) | 0.997 | 112.520 | 127.741 | 1195.4 | 608 | 3228 + 10 | 1831 + 2572 |
+| 100000 × 768 time-ordered | clustered merge + scan | 0.997 | 3.971 | 5.007 | 167.4 | 630 | 3228 | 6591 + 0 |
+| 100000 × 768 time-ordered | clustered merge + indexed | 0.997 | 2.032 | 2.849 | 20.8 | 615 | 3228 + 9 | 6591 + 2468 |
+| 100000 × 768 cluster-ordered | exact (f32 brute force) | 1.000 | 64.741 | 71.910 | – | – | 3072 | – |
+| 100000 × 768 cluster-ordered | scan | 0.995 | 3.806 | 4.367 | 164.8 | 616 | 3228 | 2176 + 0 |
+| 100000 × 768 cluster-ordered | indexed (IVF) | 0.995 | 1.984 | 2.318 | 21.2 | 600 | 3228 + 9 | 2176 + 2510 |
+| multivector 2000 docs / 16158 tokens × 128 | exact (f32 MaxSim) | 1.000 | 4.058 | 4.466 | – | – | 512 | – |
+| multivector 2000 docs / 16158 tokens × 128 | scan | 1.000 | 9.200 | 13.596 | 264.0 | 16158 | 552 | 51 + 0 |
+| multivector 2000 docs / 16158 tokens × 128 | indexed (IVF) | 1.000 | 10.807 | 14.475 | 264.0 | 17285 | 552 + 5 | 51 + 64 |
 
 100,000 × 768, time-ordered, other workloads:
 
 | Workload | Configuration | Recall@10 | p50 ms | p99 ms | Blocks opened | Rows reranked | Bytes/vector (+ index) | Build ms (segment + index) |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
-| room filter 1% | exact (f32 brute force) | 1.000 | 1.817 | 2.388 | – | – | 3072 | – |
-| room filter 1% | scan | 0.983 | 215.649 | 237.379 | 3177.8 | 1376 | 3228 | 1782 + 0 |
-| room filter 1% | indexed (IVF) | 0.990 | 209.904 | 244.700 | 3118.3 | 1373 | 3228 + 10 | 1782 + 182711 |
-| room filter 1% | clustered merge + scan | 0.983 | 32.323 | 54.124 | 989.1 | 1643 | 3228 | 186580 + 0 |
-| room filter 1% | clustered merge + indexed | 0.990 | 29.622 | 120.062 | 711.5 | 1499 | 3228 + 9 | 186580 + 180338 |
-| room filter 50% | exact (f32 brute force) | 1.000 | 40.076 | 45.308 | – | – | 3072 | – |
-| room filter 50% | scan | 1.000 | 97.063 | 107.298 | 1246.6 | 627 | 3228 | 1782 + 0 |
-| room filter 50% | indexed (IVF) | 1.000 | 90.317 | 105.543 | 1231.9 | 627 | 3228 + 10 | 1782 + 182711 |
-| room filter 50% | clustered merge + scan | 1.000 | 4.151 | 6.868 | 169.8 | 647 | 3228 | 186580 + 0 |
-| room filter 50% | clustered merge + indexed | 1.000 | 2.175 | 3.008 | 24.1 | 634 | 3228 + 9 | 186580 + 180338 |
-| range | exact (f32 brute force) | 1.000 | 64.551 | 81.442 | – | – | 3072 | – |
-| range | scan | 1.000 | 97.616 | 123.507 | 1232.9 | 627 | 3228 | 1782 + 0 |
-| range | indexed (IVF) | 1.000 | 89.001 | 104.660 | 983.9 | 627 | 3228 + 10 | 1782 + 182711 |
-| range | clustered merge + scan | 1.000 | 28.920 | 32.689 | 248.6 | 12757 | 3228 | 186580 + 0 |
-| range | clustered merge + indexed | 1.000 | 2.303 | 3.329 | 16.7 | 707 | 3228 + 9 | 186580 + 180338 |
+| room filter 1% | exact (f32 brute force) | 1.000 | 1.848 | 2.128 | – | – | 3072 | – |
+| room filter 1% | scan | 0.990 | 26.503 | 81.052 | 756.9 | 173 | 3228 | 1831 + 0 |
+| room filter 1% | indexed (IVF) | 0.990 | 29.708 | 86.301 | 677.0 | 135 | 3228 + 10 | 1831 + 2572 |
+| room filter 1% | clustered merge + scan | 0.990 | 22.770 | 72.142 | 682.4 | 176 | 3228 | 6591 + 0 |
+| room filter 1% | clustered merge + indexed | 0.989 | 25.538 | 114.464 | 708.1 | 256 | 3228 + 9 | 6591 + 2468 |
+| room filter 50% | exact (f32 brute force) | 1.000 | 39.701 | 45.676 | – | – | 3072 | – |
+| room filter 50% | scan | 1.000 | 97.999 | 119.832 | 1250.6 | 627 | 3228 | 1831 + 0 |
+| room filter 50% | indexed (IVF) | 1.000 | 92.254 | 107.258 | 1233.1 | 627 | 3228 + 10 | 1831 + 2572 |
+| room filter 50% | clustered merge + scan | 1.000 | 4.818 | 6.038 | 176.7 | 648 | 3228 | 6591 + 0 |
+| room filter 50% | clustered merge + indexed | 1.000 | 2.738 | 3.660 | 26.1 | 633 | 3228 + 9 | 6591 + 2468 |
+| range | exact (f32 brute force) | 1.000 | 64.787 | 76.548 | – | – | 3072 | – |
+| range | scan | 1.000 | 96.058 | 122.679 | 1232.9 | 627 | 3228 | 1831 + 0 |
+| range | indexed (IVF) | 1.000 | 88.530 | 104.026 | 983.9 | 627 | 3228 + 10 | 1831 + 2572 |
+| range | clustered merge + scan | 1.000 | 30.516 | 57.947 | 263.0 | 13747 | 3228 | 6591 + 0 |
+| range | clustered merge + indexed | 1.000 | 2.624 | 5.134 | 13.4 | 627 | 3228 + 9 | 6591 + 2468 |
 
 What the numbers say:
 
-- **Default recall falls below the gate at 100,000 rows.** With topics of ~630 rows, the version 4 rerank patience
-  (`oversample` 8: stop after 80 consecutive reranked rows that miss the top 10) stops early and top-10 recall is
-  0.87–0.90 at both dimensions. Range queries, which ignore the patience, are exact. `--oversample 32` or `0` gives
-  recall 1.000 on 100,000 × 128 with ~600 rows reranked and the same latency (p50 1.3 ms scan, 0.7 ms indexed,
-  cluster order). The 100,000-row gate test is `#[ignore]`d until the default changes.
+- **Default recall clears the gate at every size.** The version 4 rerank stops when the next upper bound falls below
+  the k-th exact score; `oversample` adds a patience that grows with the position of the last top-k improvement
+  (`RERANK_PATIENCE_GROWTH` × that position, at least `k × oversample` rows). Within a ~630-row topic the U1 code
+  cannot order the rows, so a fixed 80-row patience stopped early (recall@10 0.87–0.90 at 100,000 rows); the scaled
+  patience gives 0.995–1.000 with ~610 rows reranked and about the same latency on clustered data (p50 0.7 ms indexed
+  at d = 128, 2.0 ms at d = 768). The 100,000 × 128 gate test now runs by default.
 - **Row order decides the block count.** On time-ordered data the partition index cannot avoid opening almost every
-  block (~1,000 per query at 100,000 rows); after a clustered merge it opens 22–26 and answers top-10 at 768
-  dimensions in 2 ms against 65 ms for brute force over plain f32.
-- **A 1% room filter is the slow case.** Pre-filtering decodes the room column of every granule and still opens
-  700–3,200 blocks per query, slower than brute force over the ~1,000 in-room rows, because room membership is
-  spread across all granules.
-- **MaxSim with the partition index opens more blocks than the scan** (645 vs 264 at 2,000 documents) and is slower:
-  its probe widens over most of a small segment.
+  block (~1,200 per query at 100,000 rows, and reranking a topic then opens a fine block per row: 119 ms at d = 768);
+  after a clustered merge it opens 21–25 and answers top-10 at 768 dimensions in 2 ms against 65 ms for brute force
+  over plain f32. Use `compact_segments` (clustered order by default) for compaction; `merge_segments` keeps rows in
+  order.
+- **Room filters estimate selectivity from a sample.** Min/max string statistics cannot tell a room spread over
+  every granule from one in none, so the adaptive strategy decodes the filter columns of up to 4 granules to estimate
+  the kept fraction and pre-filters below 25%. A 1% room filter at 100,000 × 768 went from 216 ms (3,178 blocks,
+  1,376 rows reranked) to 27 ms (757 blocks, 173 rows). It is still slower than brute force over the ~1,000 in-room
+  rows (1.8 ms, no decryption) because those rows are spread over most sealed blocks; a filter whose rows sit in a few
+  fine blocks (≤ 4 × k) is scored exactly on the fine column without the coarse pass.
+- **MaxSim with the partition index** shares opened blocks across probe rounds and scans once the probe would cover
+  half the segment: 264 blocks like the scan (was 645), p50 10.8 ms against 9.2 ms for the scan at 2,000 documents,
+  and fewer blocks and lower latency than the scan at 1,000 documents.
 - Bytes per vector: 568 at d = 128 and 3,228 at d = 768 for U1 + F32 (F32 alone is 512 / 3,072); a partition
-  index adds 3–10 bytes per vector. Index build (k-means, ⌈√rows⌉ partitions, 10 iterations, one thread) dominates
-  build time at 100,000 rows: 22 s at d = 128, 3 minutes at d = 768.
+  index adds 3–10 bytes per vector. Index build trains k-means (⌈√rows⌉ partitions, 10 iterations) on a seeded sample
+  of 64 rows per partition, then assigns every row once, in parallel and deterministically: 0.5 s at 100,000 × 128
+  and 2.5 s at 100,000 × 768 (was 22 s and 3 minutes); a clustered merge of 100,000 × 768 takes 6.6 s (was 187 s).
 
 ## Operations benchmark
 

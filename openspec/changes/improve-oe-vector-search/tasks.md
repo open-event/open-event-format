@@ -56,18 +56,19 @@
       cosine and L2, blocks opened per query 66 → 16–18, ~8.3 of 85 partitions probed); digest, model, content and
       key mismatches rejected; a dropped or rejected index still answers identically; filters and deletes combine.
 - [x] Filters: byte hash sets over borrowed strings; absent granule stats mean "may match"; adaptive pre/post
-      filtering (`FilterStrategy`, `POST_FILTER_SELECTIVITY` = 0.75) with tests that post, pre and adaptive agree.
+      filtering (`FilterStrategy`, `POST_FILTER_SELECTIVITY`, now 0.25 over a sampled estimate) with tests that post, pre and adaptive agree.
 - [x] Clustered compaction: `merge_segments_clustered` writes live rows grouped by k-means partition (partitions
       chained nearest centroid), event ids and every column moving with their rows. Time-ordered 50 clusters × 160
       rows (d = 64), blocks opened per query: scan 123.5 → 36.1 (Cosine, 30 sub-blocks skipped) / 49.1 (L2);
       indexed 123.4 → 12.4 / 13.4; same answers by event id. Granule timestamp stats get less selective in exchange.
+      `compact_segments` is the compaction entry point and defaults to this order (`merge_segments` keeps rows in
+      order); spec delta `specs/oe-vector-columns`.
 - [x] Probe rounds of one segment share a cache of opened blocks (`PartCache`), so an indexed search never decrypts a
       block twice. 200 natural clusters / 90 partitions (~35 probed Cosine, ~63 L2): indexed opens 62.3 vs scan 66.1
       blocks in cluster order (was 76.9) and the same 94.9 in time order; answers equal.
 - [ ] Still open by nature: with far more natural clusters than partitions the partition radii stay loose, so many
       partitions are probed; and when natural clusters are smaller than a 128-row sub-block, no row order makes
-      sub-blocks homogeneous, so ball skipping does not apply. Filter selectivity is still estimated from min/max
-      granule stats only.
+      sub-blocks homogeneous, so ball skipping does not apply.
 - [x] Index GC: `vector_object_keys` / `dropped_vector_object_keys`; `sweep_dropped_objects` notes dropped or
       replaced partition indexes, superseded segment deletes and both for segments removed from the catalogue, and
       deletes them after the safety window unless a live generation names them.
@@ -102,6 +103,16 @@
       opened, rows reranked, bytes per vector, build time to `benchmark/results/vector.{json,md}`. Gate test in
       `cargo test --release` (10k × 128, 5k × 768, MaxSim): recall@10 ≥ 0.95 and indexed opens fewer blocks than scan
       on clustered data; spec delta `specs/oe-benchmarks-and-acceptance-gates`.
-- [ ] Default recall at 100k rows: top-10 recall@10 is 0.87–0.90 with `DEFAULT_OVERSAMPLE` (8) on topics of ~630 rows
-      (patience 32 or 0 gives 1.000 at the same latency); the 100k gate test is ignored until the default changes.
-      A 1% room filter opens 700–3,200 blocks and reranks far more rows than the room holds.
+- [x] Default recall at 100k rows: the rerank patience grows with the position of the last top-k improvement
+      (`RERANK_PATIENCE_GROWTH` = 2 × that position, at least `k × oversample`), since the U1 code cannot order the
+      rows of a ~630-row topic. Top-10 recall@10 at 100k rows 0.865–0.897 → 0.995–1.000 (~610 rows reranked, same
+      latency on clustered data); the 100k × 128 gate test runs by default (gate ~14 s).
+- [x] Filter selectivity: `sampled_selectivity` decodes the filter columns of up to 4 granules
+      (`SELECTIVITY_SAMPLE_GRANULES`); a filter whose rows fall in ≤ 4 × k fine blocks (and ≤ 4,096 rows) is scored
+      exactly on the fine column. 1% room filter at 100k × 768 time order: 216 ms / 3,178 blocks / 1,376 reranked →
+      27 ms / 757 / 173 (brute force 1.8 ms: the room's rows are spread over most sealed blocks).
+- [x] MaxSim indexed: probe rounds share opened coarse and fine blocks; a probe covering ≥ half the live token rows
+      scans instead (`MAXSIM_SCAN_FRACTION_*`). 2,000 documents: blocks 645 → 264 (= scan), p50 13.9 → 10.8 ms.
+- [x] IVF build: k-means trains on a seeded sample of 64 rows per partition (`KMEANS_SAMPLE_PER_PARTITION`) with a
+      SIMD distance and deterministic parallel assignment, then assigns every row once. 100k × 768 index build
+      182 s → 2.5 s, clustered merge 187 s → 6.6 s.
