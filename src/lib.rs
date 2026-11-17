@@ -35,6 +35,7 @@ pub mod layout;
 pub mod lifecycle;
 pub mod object_store;
 pub mod security;
+pub mod text;
 pub mod typed_id;
 pub mod vector;
 

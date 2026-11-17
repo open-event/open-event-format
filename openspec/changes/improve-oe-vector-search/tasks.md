@@ -86,6 +86,11 @@
       Version 5 header, plain segments stay version 4, filters, deletes, `max_rerank`, invalid input.
 - [x] RRF (`reciprocal_rank_fusion`, `hybrid_rrf`, `RrfParams`, `DEFAULT_RRF_K`) with tests for weights, ties,
       duplicates, limit and determinism.
+- [x] BM25 text ranking (`oe::text`: `Bm25Index`, `search_bm25`, `publish_text_index` / `load_text_index`,
+      `hybrid_search`): scores match a naive reference, block-max WAND equals exhaustive (incl. deletes, multiple
+      segments), global stats equal a single merged segment, deterministic plain and sealed bytes, tamper / wrong
+      key / content mismatch rejected, hybrid end-to-end. Micro bench `benchmark/micro/bm25.rs`.
+- [ ] Not done: the `TextIndexRef` is not yet recorded on the manifest (`ManifestGeneration`); callers hold it.
 - [x] Multivector merge: `merge_segments(_with_deletes)` merges version 5 segments (documents keep their tokens, a
       document with no live token is dropped, metadata travels with it; mixing with plain segments is refused);
       `merge_segments_clustered` groups documents by their mean token's partition. `read_live_documents`.
